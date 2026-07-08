@@ -3,7 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="color-scheme" content="light dark" />
+    <meta name="color-scheme" content="light" />
+    <!--
+      Content-Security-Policy. The `inject-csp` plugin in vite.config.ts replaces
+      the CSP_PLACEHOLDER token below with the strict production policy for the
+      build, and a dev-relaxed policy (inline HMR client + websocket) when
+      serving. See that plugin for the exact policies.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="CSP_PLACEHOLDER" />
     <title>Simple Bitcoin Wallet</title>
   </head>
   <body>

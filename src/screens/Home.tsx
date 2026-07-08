@@ -1,0 +1,125 @@
+import type { JSX } from 'react';
+import { useState } from 'react';
+import { strings } from '../strings';
+import { Chrome } from '../components/Chrome';
+import { Balance } from '../components/Balance';
+import { ActivityRow } from '../components/ActivityRow';
+import type { DisplayUnit } from '../display';
+import type { AccountSnapshot } from '../lib/account';
+import type { LoadStatus } from '../state';
+import type { Network } from '../lib';
+
+/** Home: balance hero, Receive/Send, recent activity preview. */
+export function Home(props: {
+  network: Network;
+  account: AccountSnapshot | null;
+  accountStatus: LoadStatus;
+  btcUsd: number | null;
+  unit: DisplayUnit;
+  onCycleUnit: (u: DisplayUnit) => void;
+  firstVisit: boolean;
+  onReceive: () => void;
+  onSend: () => void;
+  onSeeAll: () => void;
+  onOpenActivity: (txid: string) => void;
+  onSettings: () => void;
+  onRefresh: () => void;
+}): JSX.Element {
+  const [dismissedHint, setDismissedHint] = useState(false);
+  const practice = props.network === 'testnet';
+  const confirmed = props.account?.confirmedSats ?? 0n;
+  const pending = props.account?.pendingSats ?? 0n;
+  const totalSats = confirmed + (pending > 0n ? pending : 0n);
+  const isEmpty = props.accountStatus === 'ready' && totalSats === 0n;
+  const activity = props.account?.activity ?? [];
+  const recent = activity.slice(0, 3);
+
+  return (
+    <Chrome
+      network={props.network}
+      brand
+      right={
+        <button className="topbar__gear" onClick={props.onSettings} aria-label={strings.common.settings}>
+          ⚙
+        </button>
+      }
+    >
+      <div className="screen-body">
+        <Balance
+          confirmedSats={totalSats}
+          btcUsd={props.btcUsd}
+          unit={props.unit}
+          onCycle={(u) => {
+            setDismissedHint(true);
+            props.onCycleUnit(u);
+          }}
+          showHint={props.firstVisit && !dismissedHint}
+          practice={practice}
+          loading={props.accountStatus === 'loading' && props.account === null}
+        />
+
+        <div className="verb-row">
+          <button className="verb" onClick={props.onReceive}>
+            <span className="verb__ico" aria-hidden="true">
+              ↙
+            </span>
+            <span className="verb__title">{strings.home.receive}</span>
+            <span className="verb__sub">{strings.home.receiveSub}</span>
+          </button>
+          <button className="verb" onClick={props.onSend}>
+            <span className="verb__ico" aria-hidden="true">
+              ↗
+            </span>
+            <span className="verb__title">{strings.home.send}</span>
+            <span className="verb__sub">{strings.home.sendSub}</span>
+          </button>
+        </div>
+
+        {props.accountStatus === 'error' ? (
+          <div className="callout nudge">
+            <div className="callout__body">{strings.errors.network}</div>
+            <button
+              className="btn btn--text"
+              style={{ marginTop: 'var(--sp-2)', padding: 0 }}
+              onClick={props.onRefresh}
+            >
+              {strings.common.tryAgain}
+            </button>
+          </div>
+        ) : isEmpty ? (
+          <div className="callout nudge">
+            <div className="callout__title">{strings.home.emptyBalanceHeading}</div>
+            <div className="callout__body">{strings.home.emptyBalanceBody}</div>
+          </div>
+        ) : null}
+
+        {!isEmpty && props.accountStatus !== 'error' ? (
+          <>
+            <div className="act-head">
+              <span className="act-head__title">{strings.home.recentActivity}</span>
+              {activity.length > 0 ? (
+                <button className="act-head__see" onClick={props.onSeeAll}>
+                  {strings.home.seeAll}
+                </button>
+              ) : null}
+            </div>
+            {recent.length === 0 ? (
+              <div className="small">
+                {strings.home.emptyActivity} {strings.home.emptyActivityBody}
+              </div>
+            ) : (
+              recent.map((item) => (
+                <ActivityRow
+                  key={item.txid}
+                  item={item}
+                  btcUsd={props.btcUsd}
+                  onClick={() => props.onOpenActivity(item.txid)}
+                />
+              ))
+            )}
+          </>
+        ) : null}
+      </div>
+    </Chrome>
+  );
+}

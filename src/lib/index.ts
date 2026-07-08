@@ -7,3 +7,4 @@ export * from './tx';
 export * from './api';
 export * from './vault';
 export * from './format';
+export * from './account';
