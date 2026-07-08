@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Simple Bitcoin Wallet — Mockups</title>
+<style>
+  :root {
+    --accent:#F7931A; --accent-press:#E07E0C; --accent-weak:#FDEBD3; --on-accent:#FFFFFF;
+    --testnet:#7C4DFF; --testnet-weak:#ECE6FF;
+    --bg:#FFFFFF; --surface:#FFFFFF; --surface-2:#F6F7F9; --surface-inset:#F0F2F5;
+    --text:#14161A; --text-secondary:#5B616E; --text-muted:#8A909C;
+    --success:#12A150; --success-weak:#E4F6EC; --danger:#D92D20;
+    --warning:#B54708; --warning-bg:#FEF6E7; --warning-border:#F5C86B;
+    --border:#E4E7EC; --border-strong:#CFD4DC;
+    --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --font-mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --radius-sm:8px; --radius-md:12px; --radius-lg:16px; --radius-xl:22px; --radius-pill:999px;
+    --shadow-card:0 1px 2px rgba(20,22,26,.06),0 1px 3px rgba(20,22,26,.05);
+    --shadow-phone:0 30px 60px rgba(20,22,26,.18),0 8px 20px rgba(20,22,26,.10);
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body {
+    font-family:var(--font-sans); color:var(--text);
+    background:#EAECEF; line-height:1.5; -webkit-font-smoothing:antialiased;
+    padding:32px 16px 64px;
+  }
+  .page-head { max-width:1100px; margin:0 auto 28px; text-align:center; }
+  .page-head h1 { font-size:26px; font-weight:700; letter-spacing:-.02em; }
+  .page-head p { color:var(--text-secondary); margin-top:6px; font-size:15px; }
+  .legend { color:var(--text-muted); font-size:13px; margin-top:10px; }
+
+  .gallery {
+    display:flex; flex-wrap:wrap; gap:36px 28px; justify-content:center;
+    max-width:1180px; margin:0 auto;
+  }
+  .device-wrap { display:flex; flex-direction:column; align-items:center; gap:12px; }
+  .device-label { font-size:13px; font-weight:600; color:var(--text-secondary);
+    text-transform:uppercase; letter-spacing:.06em; }
+
+  /* Phone frame */
+  .phone {
+    width:300px; height:640px; background:#0c0d10; border-radius:44px;
+    padding:11px; box-shadow:var(--shadow-phone);
+  }
+  .screen {
+    position:relative; width:100%; height:100%; background:var(--bg);
+    border-radius:34px; overflow:hidden; display:flex; flex-direction:column;
+  }
+  .notch { position:absolute; top:9px; left:50%; transform:translateX(-50%);
+    width:96px; height:20px; background:#0c0d10; border-radius:12px; z-index:20; }
+
+  /* Top bar */
+  .topbar { height:52px; flex:0 0 52px; display:flex; align-items:center;
+    padding:14px 16px 0; font-size:15px; font-weight:600; gap:8px; }
+  .topbar .chev { font-size:24px; color:var(--text); line-height:1; margin-left:-4px;
+    width:32px; }
+  .topbar .title { flex:1; text-align:center; }
+  .topbar .gear { font-size:20px; color:var(--text-secondary); }
+  .topbar .brand { font-weight:700; letter-spacing:-.01em; }
+  .spacer32 { width:32px; }
+
+  /* Practice banner */
+  .practice-banner { background:var(--testnet); color:#fff; padding:8px 14px;
+    font-size:11.5px; font-weight:600; text-align:center; line-height:1.35; }
+
+  /* Body scroll area */
+  .body { flex:1; overflow:hidden; padding:8px 18px 0; display:flex;
+    flex-direction:column; }
+  .grow { flex:1; }
+
+  /* Typography helpers */
+  .h { font-size:23px; font-weight:700; letter-spacing:-.02em; line-height:1.15; }
+  .sub { font-size:13.5px; color:var(--text-secondary); margin-top:8px; }
+  .tiny { font-size:11.5px; color:var(--text-muted); }
+  .lbl { font-size:12px; font-weight:600; color:var(--text-secondary);
+    text-transform:uppercase; letter-spacing:.05em; }
+
+  /* Buttons */
+  .btn { display:flex; align-items:center; justify-content:center; gap:8px;
+    width:100%; min-height:46px; padding:12px 16px; border:none; border-radius:var(--radius-xl);
+    font-family:inherit; font-size:15px; font-weight:600; cursor:default; }
+  .btn.primary { background:var(--accent); color:var(--on-accent); }
+  .btn.secondary { background:var(--surface-inset); color:var(--text); }
+  .btn.textbtn { background:transparent; color:var(--accent); font-weight:600; }
+  .btn.disabled { opacity:.45; }
+  .btn-row { display:flex; gap:10px; }
+  .bottom { padding:14px 0 18px; display:flex; flex-direction:column; gap:9px; }
+
+  /* Word chips (seed) */
+  .words { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:4px; }
+  .word { display:flex; align-items:center; gap:7px; background:var(--surface-inset);
+    border-radius:var(--radius-pill); padding:9px 12px; font-size:13.5px; font-weight:600; }
+  .word .n { color:var(--text-muted); font-size:11px; font-weight:600;
+    min-width:14px; text-align:right; font-variant-numeric:tabular-nums; }
+
+  /* Callout */
+  .callout { background:var(--surface-2); border:1px solid var(--border);
+    border-radius:var(--radius-md); padding:12px 13px; margin-top:12px; }
+  .callout .ct { font-size:13px; font-weight:700; margin-bottom:4px; }
+  .callout .cb { font-size:12px; color:var(--text-secondary); line-height:1.45; }
+
+  /* Warning strip */
+  .warn { background:var(--warning-bg); border:1px solid var(--warning-border);
+    border-radius:var(--radius-md); padding:12px 13px; }
+  .warn .wt { color:var(--warning); font-size:12.5px; line-height:1.45; font-weight:600; }
+  .warn .wt b { font-weight:800; }
+
+  /* Balance */
+  .balance { text-align:center; padding:22px 0 8px; }
+  .balance .bl { font-size:12px; color:var(--text-muted); font-weight:600;
+    text-transform:uppercase; letter-spacing:.06em; }
+  .balance .hero { font-size:42px; font-weight:800; letter-spacing:-.03em;
+    margin-top:6px; line-height:1; }
+  .balance .btc { font-size:15px; color:var(--text-secondary); margin-top:8px; font-weight:500; }
+  .balance .swhint { font-size:10.5px; color:var(--text-muted); margin-top:5px; }
+
+  /* Home receive/send buttons */
+  .verb-row { display:flex; gap:12px; margin:18px 0 8px; }
+  .verb { flex:1; background:var(--surface-2); border:1px solid var(--border);
+    border-radius:var(--radius-lg); padding:16px 8px; display:flex; flex-direction:column;
+    align-items:center; gap:7px; }
+  .verb .ico { width:40px; height:40px; border-radius:50%; background:var(--accent-weak);
+    color:var(--accent-press); display:flex; align-items:center; justify-content:center;
+    font-size:19px; font-weight:700; }
+  .verb .vt { font-size:14px; font-weight:700; }
+  .verb .vs { font-size:11px; color:var(--text-muted); }
+
+  /* Activity list */
+  .act-head { display:flex; justify-content:space-between; align-items:baseline;
+    margin:18px 2px 8px; }
+  .act-head .lbl { text-transform:none; letter-spacing:0; font-size:14px; color:var(--text); }
+  .act-head .see { font-size:13px; color:var(--accent); font-weight:600; }
+  .row { display:flex; align-items:center; gap:11px; padding:9px 2px; }
+  .row .ri { width:34px; height:34px; border-radius:50%; display:flex; align-items:center;
+    justify-content:center; font-size:15px; font-weight:800; flex:0 0 34px; }
+  .row .ri.in { background:var(--success-weak); color:var(--success); }
+  .row .ri.out { background:var(--surface-inset); color:var(--text-secondary); }
+  .row .rt { flex:1; }
+  .row .rt .a { font-size:13.5px; font-weight:600; }
+  .row .rt .b { font-size:11px; color:var(--text-muted); }
+  .row .rv { text-align:right; }
+  .row .rv .a { font-size:13.5px; font-weight:700; }
+  .row .rv .a.pos { color:var(--success); }
+  .row .rv .b { font-size:10.5px; }
+  .row .rv .b.ok { color:var(--success); }
+  .row .rv .b.wait { color:var(--text-muted); }
+
+  /* QR */
+  .qr { width:150px; height:150px; margin:6px auto 12px; border-radius:12px;
+    border:1px solid var(--border); padding:9px; background:#fff; }
+  .qr svg { display:block; width:100%; height:100%; }
+
+  /* Address chunk */
+  .addr { font-family:var(--font-mono); font-size:13px; letter-spacing:.5px;
+    text-align:center; line-height:1.9; word-break:break-word; color:var(--text);
+    background:var(--surface-2); border:1px solid var(--border);
+    border-radius:var(--radius-md); padding:11px 12px; }
+  .addr .sep { color:var(--text-muted); }
+
+  /* Fields */
+  .field { background:var(--surface-inset); border:1px solid var(--border);
+    border-radius:var(--radius-md); padding:12px 13px; font-size:14px;
+    display:flex; align-items:center; gap:8px; }
+  .field .ph { color:var(--text-muted); flex:1; }
+  .field .val { flex:1; font-weight:500; }
+  .field .chip-btn { background:var(--surface); border:1px solid var(--border-strong);
+    border-radius:var(--radius-sm); padding:5px 10px; font-size:12px; font-weight:600;
+    color:var(--text-secondary); }
+  .field.valid { border-color:var(--success); }
+  .valid-note { display:flex; align-items:center; gap:5px; font-size:11.5px;
+    color:var(--success); font-weight:600; margin-top:6px; }
+
+  .amount-big { font-size:34px; font-weight:800; letter-spacing:-.02em; }
+  .amount-conv { font-size:13px; color:var(--text-secondary); margin-top:2px; }
+
+  /* Fee chips */
+  .fees { display:flex; gap:7px; margin-top:8px; }
+  .fee { flex:1; border:1px solid var(--border); border-radius:var(--radius-md);
+    padding:9px 6px; text-align:center; background:var(--surface); }
+  .fee.sel { border-color:var(--accent); background:var(--accent-weak); }
+  .fee .ft { font-size:12.5px; font-weight:700; }
+  .fee .fs { font-size:10px; color:var(--text-muted); margin-top:2px; line-height:1.3; }
+  .fee.sel .fs { color:var(--accent-press); }
+
+  .total-line { font-size:12.5px; color:var(--text-secondary); text-align:center;
+    margin-top:12px; }
+
+  /* Review blocks */
+  .rev-amt { text-align:center; padding:6px 0 12px; }
+  .rev-amt .hero { font-size:36px; font-weight:800; letter-spacing:-.02em; }
+  .rev-amt .btc { font-size:14px; color:var(--text-secondary); margin-top:4px; }
+  .rev-block { margin-top:12px; }
+  .rev-row { display:flex; justify-content:space-between; align-items:baseline;
+    padding:10px 0; border-top:1px solid var(--border); font-size:13.5px; }
+  .rev-row .k { color:var(--text-secondary); }
+  .rev-row .v { font-weight:700; text-align:right; }
+  .rev-row.total .k, .rev-row.total .v { font-size:15px; }
+  .check { display:flex; align-items:center; gap:9px; margin-top:12px; font-size:12.5px;
+    font-weight:600; }
+  .check .box { width:20px; height:20px; border-radius:6px; border:2px solid var(--accent);
+    background:var(--accent); color:#fff; display:flex; align-items:center;
+    justify-content:center; font-size:12px; font-weight:800; flex:0 0 20px; }
+
+  .divider { height:1px; background:var(--border); margin:14px 0; }
+
+  /* scroll hint fade at bottom of body-only screens */
+  .caption { max-width:300px; text-align:center; font-size:12px; color:var(--text-secondary);
+    line-height:1.4; }
+</style>
+</head>
+<body>
+
+<div class="page-head">
+  <h1>Simple Bitcoin Wallet — key screens</h1>
+  <p>High-fidelity static mockups built from the design tokens in <code>docs/DESIGN.md</code>.</p>
+  <div class="legend">Static visual reference — not the real app. Live mode shown in orange; the Home tile also shows Practice (violet) mode.</div>
+</div>
+
+<div class="gallery">
+
+  <!-- ============ WELCOME ============ -->
+  <div class="device-wrap">
+    <div class="device-label">Welcome</div>
+    <div class="phone"><div class="screen"><div class="notch"></div>
+      <div class="topbar"><span class="spacer32"></span><span class="title"></span><span class="spacer32"></span></div>
+      <div class="body">
+        <div class="grow" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;">
+          <div style="width:78px;height:78px;border-radius:24px;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;font-size:40px;font-weight:800;">₿</div>
+          <div style="text-align:center;">
+            <div class="h">Bitcoin, made simple</div>
+            <div class="sub" style="padding:0 6px;">A wallet that lives on your phone. You're in control — no bank, no sign-up, no email.</div>
+          </div>
+        </div>
+        <div class="bottom">
+          <button class="btn primary">Create a new wallet</button>
+          <button class="btn textbtn">I already have a recovery phrase</button>
+          <div class="tiny" style="text-align:center;margin-top:2px;">How this keeps your money safe</div>
+        </div>
+      </div>
+    </div></div>
+    <div class="caption">First contact. Two paths: create fresh, or restore from an existing phrase.</div>
+  </div>
+
+  <!-- ============ SEED BACKUP ============ -->
+  <div class="device-wrap">
+    <div class="device-label">Recovery phrase</div>
+    <div class="phone"><div class="screen"><div class="notch"></div>
+      <div class="topbar"><span class="chev">‹</span><span class="title"></span><span class="spacer32"></span></div>
+      <div class="body">
+        <div class="h">These 12 words are your wallet</div>
+        <div class="sub">Write them down in order and keep them somewhere safe and private. Anyone who has these words can take your bitcoin — and if you lose them, no one can get your bitcoin back. Not even us.</div>
+        <div class="words" style="margin-top:14px;">
+          <div class="word"><span class="n">1</span>ridge</div>
+          <div class="word"><span class="n">2</span>salmon</div>
+          <div class="word"><span class="n">3</span>orbit</div>
+          <div class="word"><span class="n">4</span>velvet</div>
+          <div class="word"><span class="n">5</span>gather</div>
+          <div class="word"><span class="n">6</span>puzzle</div>
+          <div class="word"><span class="n">7</span>lunar</div>
+          <div class="word"><span class="n">8</span>cactus</div>
+          <div class="word"><span class="n">9</span>hollow</div>
+          <div class="word"><span class="n">10</span>marble</div>
+          <div class="word"><span class="n">11</span>tiger</div>
+          <div class="word"><span class="n">12</span>whisper</div>
+        </div>
+        <div class="callout">
+          <div class="ct">Why we can't help you if these are lost</div>
+          <div class="cb">This wallet has no company account behind it. These 12 words are the only key. That's the trade for being truly in control: no one can freeze your money, and no one can recover it for you.</div>
+        </div>
+        <div class="bottom">
+          <button class="btn secondary">Copy the words</button>
+          <button class="btn primary">I've written them down</button>
+        </div>
+      </div>
+    </div></div>
+    <div class="caption">The reveal (shown unblurred here). In the real app it starts blurred behind a “Tap to reveal” shield.</div>
+  </div>
+
+  <!-- ============ HOME (LIVE) ============ -->
+  <div class="device-wrap">
+    <div class="device-label">Home — Live</div>
+    <div class="phone"><div class="screen"><div class="notch"></div>
+      <div class="topbar"><span class="brand">Simple Bitcoin</span><span class="grow"></span><span class="gear">⚙</span></div>
+      <div class="body">
+        <div class="balance">
+          <div class="bl">Your balance</div>
+          <div class="hero">$120.00</div>
+          <div class="btc">0.00189 BTC</div>
+          <div class="swhint">tap to switch</div>
+        </div>
+        <div class="verb-row">
+          <div class="verb"><div class="ico">↙</div><div class="vt">Receive</div><div class="vs">get paid</div></div>
+          <div class="verb"><div class="ico">↗</div><div class="vt">Send</div><div class="vs">pay someone</div></div>
+        </div>
+        <div class="act-head"><span class="lbl">Recent activity</span><span class="see">See all</span></div>
+        <div class="row">
+          <div class="ri in">↙</div>
+          <div class="rt"><div class="a">Received</div><div class="b">2 hours ago</div></div>
+          <div class="rv"><div class="a pos">+$25.00</div><div class="b ok">Confirmed</div></div>
+        </div>
+        <div class="row">
+          <div class="ri out">↗</div>
+          <div class="rt"><div class="a">Sent</div><div class="b">Yesterday</div></div>
+          <div class="rv"><div class="a">-$25.40</div><div class="b ok">Confirmed</div></div>
+        </div>
+        <div class="row">
+          <div class="ri in">↙</div>
+          <div class="rt"><div class="a">Received</div><div class="b">Mar 3</div></div>
+          <div class="rv"><div class="a pos">+$120.00</div><div class="b ok">Confirmed</div></div>
+        </div>
+      </div>
+    </div></div>
+    <div class="caption">USD is the hero number; BTC sits beneath. Tap the balance to cycle USD → BTC → sats.</div>
+  </div>
+
+  <!-- ============ HOME (PRACTICE) ============ -->
+  <div class="device-wrap">
+    <div class="device-label">Home — Practice mode</div>
+    <div class="phone"><div class="screen"><div class="notch"></div>
+      <div class="topbar"><span class="brand">Simple Bitcoin</span><span class="grow"></span><span class="gear">⚙</span></div>
+      <div class="practice-banner">Practice mode — these coins are worthless. Nothing here is real money.</div>
+      <div class="body">
+        <div class="balance">
+          <div class="bl">Your balance</div>
+          <div class="hero" style="color:var(--testnet);">$0.00</div>
+          <div class="btc">0 sats</div>
+        </div>
+        <div class="verb-row">
+          <div class="verb"><div class="ico" style="background:var(--testnet-weak);color:var(--testnet);">↙</div><div class="vt">Receive</div><div class="vs">get paid</div></div>
+          <div class="verb"><div class="ico" style="background:var(--testnet-weak);color:var(--testnet);">↗</div><div class="vt">Send</div><div class="vs">pay someone</div></div>
+        </div>
+        <div class="callout" style="margin-top:16px;">
+          <div class="ct">Your wallet is empty — let's fix that</div>
+          <div class="cb">Tap Receive to show your address, then have someone send you bitcoin. Even a tiny amount is a great first test.</div>
+        </div>
+      </div>
+    </div></div>
+    <div class="caption">Practice mode is unmistakable: persistent banner + the whole accent turns violet.</div>
+  </div>
+
+  <!-- ============ RECEIVE ============ -->
+  <div class="device-wrap">
+    <div class="device-label">Receive</div>
+    <div class="phone"><div class="screen"><div class="notch"></div>
+      <div class="topbar"><span class="chev">‹</span><span class="title">Receive</span><span class="spacer32"></span></div>
+      <div class="body">
+        <div class="h" style="font-size:21px;">Receive bitcoin</div>
+        <div class="sub">Show this QR code, or share your address. Whoever's paying you scans or pastes it.</div>
+        <div class="qr">
+          <svg viewBox="0 0 21 21" shape-rendering="crispEdges" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="QR code for your bitcoin address">
+            <rect width="21" height="21" fill="#fff"/>
+            <g fill="#14161A">
+              <path d="M0 0h7v1H0zM8 0h1v1H8zM10 0h3v1h-3zM14 0h7v1h-7zM0 1h1v1H0zM6 1h1v1H6zM9 1h2v1H9zM12 1h1v1h-1zM14 1h1v1h-1zM20 1h1v1h-1z"/>
+              <path d="M0 2h1v1H0zM2 2h3v1H2zM6 2h1v1H6zM8 2h1v1H8zM10 2h1v1h-1zM12 2h1v1h-1zM14 2h1v1h-1zM16 2h3v1h-3zM20 2h1v1h-1z"/>
+              <path d="M0 3h1v1H0zM2 3h3v1H2zM6 3h1v1H6zM9 3h3v1H9zM14 3h1v1h-1zM16 3h3v1h-3zM20 3h1v1h-1z"/>
+              <path d="M0 4h1v1H0zM2 4h3v1H2zM6 4h1v1H6zM8 4h2v1H8zM11 4h2v1h-2zM14 4h1v1h-1zM16 4h3v1h-3zM20 4h1v1h-1z"/>
+              <path d="M0 5h1v1H0zM6 5h1v1H6zM8 5h1v1H8zM10 5h1v1h-1zM12 5h1v1h-1zM14 5h1v1h-1zM20 5h1v1h-1z"/>
+              <path d="M0 6h7v1H0zM8 6h1v1H8zM10 6h1v1h-1zM12 6h1v1h-1zM14 6h7v1h-7z"/>
+              <path d="M9 7h2v1H9zM12 7h1v1h-1z"/>
+              <path d="M0 8h1v1H0zM2 8h1v1H2zM4 8h5v1H4zM10 8h1v1h-1zM12 8h4v1h-4zM17 8h1v1h-1zM19 8h2v1h-2z"/>
+              <path d="M1 9h2v1H1zM5 9h1v1H5zM7 9h3v1H7zM11 9h1v1h-1zM13 9h1v1h-1zM15 9h1v1h-1zM18 9h2v1h-2z"/>
+              <path d="M0 10h3v1H0zM4 10h1v1H4zM6 10h2v1H6zM9 10h1v1H9zM11 10h3v1h-3zM16 10h2v1h-2zM19 10h1v1h-1z"/>
+              <path d="M1 11h1v1H1zM3 11h4v1H3zM8 11h2v1H8zM12 11h1v1h-1zM14 11h2v1h-2zM17 11h1v1h-1zM20 11h1v1h-1z"/>
+              <path d="M0 12h1v1H0zM2 12h1v1H2zM5 12h3v1H5zM9 12h4v1H9zM14 12h1v1h-1zM16 12h1v1h-1zM18 12h3v1h-3z"/>
+              <path d="M8 13h1v1H8zM10 13h1v1h-1zM12 13h1v1h-1zM14 13h1v1h-1zM17 13h1v1h-1zM19 13h1v1h-1z"/>
+              <path d="M0 14h7v1H0zM8 14h2v1H8zM11 14h1v1h-1zM13 14h1v1h-1zM16 14h1v1h-1zM18 14h1v1h-1zM20 14h1v1h-1z"/>
+              <path d="M0 15h1v1H0zM6 15h1v1H6zM8 15h1v1H8zM10 15h3v1h-3zM14 15h1v1h-1zM16 15h2v1h-2zM20 15h1v1h-1z"/>
+              <path d="M0 16h1v1H0zM2 16h3v1H2zM6 16h1v1H6zM8 16h1v1H8zM10 16h1v1h-1zM12 16h5v1h-5zM18 16h2v1h-2z"/>
+              <path d="M0 17h1v1H0zM2 17h3v1H2zM6 17h1v1H6zM9 17h2v1H9zM13 17h1v1h-1zM15 17h1v1h-1zM17 17h1v1h-1zM19 17h1v1h-1z"/>
+              <path d="M0 18h1v1H0zM2 18h3v1H2zM6 18h1v1H6zM8 18h1v1H8zM11 18h4v1h-4zM16 18h1v1h-1zM18 18h3v1h-3z"/>
+              <path d="M0 19h1v1H0zM6 19h1v1H6zM9 19h1v1H9zM12 19h2v1h-2zM15 19h1v1h-1zM17 19h1v1h-1z"/>
+              <path d="M0 20h7v1H0zM8 20h3v1H8zM12 20h1v1h-1zM14 20h2v1h-2zM17 20h1v1h-1zM19 20h2v1h-2z"/>
+            </g>
+          </svg>
+        </div>
+        <div class="addr">bc1q<span class="sep"> · </span>x9k2<span class="sep"> · </span>8fj3<span class="sep"> · </span>p4m7<span class="sep"> · </span>r2n8<span class="sep"> · </span>q7z0</div>
+        <div class="bottom">
+          <button class="btn primary">Copy address</button>
+          <button class="btn secondary">Share</button>
+          <div class="tiny" style="text-align:center;line-height:1.4;">It's safe to share this address. It can only be used to send you money — no one can take anything with it.</div>
+        </div>
+      </div>
+    </div></div>
+    <div class="caption">Address shown in readable 4-character groups. The text is the source of truth; the QR is a convenience.</div>
+  </div>
+
+  <!-- ============ SEND (compose) ============ -->
+  <div class="device-wrap">
+    <div class="device-label">Send</div>
+    <div class="phone"><div class="screen"><div class="notch"></div>
+      <div class="topbar"><span class="chev">‹</span><span class="title">Send</span><span class="spacer32"></span></div>
+      <div class="body">
+        <div class="h" style="font-size:21px;">Send bitcoin</div>
+
+        <div style="margin-top:14px;">
+          <div class="lbl">Send to</div>
+          <div class="field valid" style="margin-top:6px;">
+            <span class="val" style="font-family:var(--font-mono);font-size:12.5px;">bc1q·k4m2·9fh1·…·t8p0</span>
+            <span class="chip-btn">Paste</span>
+            <span class="chip-btn">Scan</span>
+          </div>
+          <div class="valid-note">✓ Address looks valid.</div>
+        </div>
+
+        <div style="margin-top:14px;">
+          <div class="lbl">Amount</div>
+          <div class="field" style="align-items:baseline;margin-top:6px;">
+            <span class="amount-big" style="flex:1;">$25.00</span>
+            <span class="chip-btn">USD ⇄ BTC</span>
+            <span class="chip-btn">Max</span>
+          </div>
+          <div class="amount-conv">≈ 0.00039 BTC</div>
+        </div>
+
+        <div style="margin-top:14px;">
+          <div class="lbl">Network fee</div>
+          <div class="tiny" style="margin-top:3px;">A small amount goes to the bitcoin network to process your payment.</div>
+          <div class="fees">
+            <div class="fee sel"><div class="ft">Standard</div><div class="fs">~30 min<br>≈ $0.40</div></div>
+            <div class="fee"><div class="ft">Faster</div><div class="fs">~10 min<br>≈ $0.90</div></div>
+            <div class="fee"><div class="ft">Economy</div><div class="fs">few hrs<br>≈ $0.15</div></div>
+          </div>
+          <div class="total-line">You'll send <b>$25.00</b> + $0.40 fee = <b>$25.40</b> total</div>
+        </div>
+
+        <div class="bottom" style="margin-top:auto;">
+          <button class="btn primary">Review</button>
+        </div>
+      </div>
+    </div></div>
+    <div class="caption">Amount is entered in USD by default with live BTC underneath. The button says “Review”, never “Send”.</div>
+  </div>
+
+  <!-- ============ SEND REVIEW ============ -->
+  <div class="device-wrap">
+    <div class="device-label">Send — review</div>
+    <div class="phone"><div class="screen"><div class="notch"></div>
+      <div class="topbar"><span class="chev">‹</span><span class="title">Review</span><span class="spacer32"></span></div>
+      <div class="body">
+        <div class="h" style="font-size:20px;">Check this before you send</div>
+
+        <div class="rev-amt">
+          <div class="hero">$25.00</div>
+          <div class="btc">0.00039 BTC</div>
+        </div>
+
+        <div class="lbl">Going to this address</div>
+        <div class="addr" style="margin-top:6px;">bc1q<span class="sep"> · </span>k4m2<span class="sep"> · </span>9fh1<span class="sep"> · </span>x7v3<span class="sep"> · </span>b5c8<span class="sep"> · </span>t8p0</div>
+
+        <div class="rev-block">
+          <div class="rev-row"><span class="k">Network fee</span><span class="v">$0.40 · ~30 min</span></div>
+          <div class="rev-row total"><span class="k">Total leaving your wallet</span><span class="v">$25.40<br><span style="font-weight:500;color:var(--text-secondary);font-size:12px;">0.00040 BTC</span></span></div>
+        </div>
+
+        <div class="warn" style="margin-top:12px;">
+          <div class="wt"><b>Sending bitcoin cannot be undone.</b> If the address is wrong, your money is gone for good. Take a moment to compare the address above with the one you were given.</div>
+        </div>
+
+        <div class="check"><span class="box">✓</span> I've checked the address.</div>
+
+        <div class="bottom">
+          <button class="btn primary">Send now</button>
+          <button class="btn textbtn">Go back and edit</button>
+        </div>
+      </div>
+    </div></div>
+    <div class="caption">The safety gate: big amount, chunked address, fee, total, the irreversibility line, and a required “I've checked the address” tick.</div>
+  </div>
+
+</div>
+</body>
+</html>
