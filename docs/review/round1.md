@@ -188,3 +188,76 @@ could recognize as wrong.
 
 _Tests referenced above were written with a `.review.test.ts` suffix, executed, and
 deleted; no source files were modified._
+
+---
+
+# Round 2 — Re-audit of fixes
+
+**SHIP-BLOCKING ISSUES: 1 / new findings: 1**
+
+Re-ran every original exploit against the new code (deleted the throwaway tests
+after). `npm test` = 92 passing, `tsc --noEmit` clean, `npm run build` clean, prod
+CSP still `script-src 'self'`. Eight of nine fixes are genuinely closed. The F1 fee
+guard is sound at the engine layer but its **25%-of-amount** rule is too aggressive
+and now blocks legitimate small sends at honest fee rates, surfacing as the F4
+"recheck" dead-end — a new ship-blocking regression (F10).
+
+## Per-finding verdicts
+
+- **F1 — CLOSED (with regression → F10).** `FeeTooHighError` in `tx.ts` rejects rate
+  > 500 sat/vB, fee > 25% (of amount+fee / of total-input for sendMax), or > 1,000,000
+  sats absolute; `allowHighFee` overrides. `getFeeEstimates` clamps to `[1,500]`;
+  `feeRateForTier` clamps again. Verified: the original sendMax-drain at 5000 sat/vB
+  now throws; a 600k-sat sweep at the max in-window rate (500) still builds. Escape
+  hatch is *not* wired to any UI (good — can't be abused; but also no recovery path,
+  see F10).
+- **F2 — CLOSED.** Every mempool.space field validated on ingest → typed
+  `ApiResponseError`: 21M-BTC cap, integers-only, 64-hex txids, array size caps, price
+  bounds. Verified: fabricated 21M+ balance and non-integer UTXO value both rejected
+  cleanly (no raw `BigInt()` crash); hostile fee clamped.
+- **F3 — CLOSED.** `password.ts`: min 10 chars, common-password rejection, 5-band
+  meter wired into `SetPassword.tsx` gating submit. Heuristic + small common-list, but
+  a reasonable, testable improvement.
+- **F4 — CLOSED.** `reviewNumbers` returns a discriminated union; `Review.tsx` renders
+  a no-amounts, no-Send blocking state on `ok:false`. (Minor: the `sent` screen now
+  shows `$0.00` if its post-broadcast dry-run fails — cosmetic, money already sent.)
+- **F5 — CLOSED.** `Reveal.tsx` clears the copied seed after 30 s and on unmount, only
+  if the clipboard still holds it (won't clobber later copies). Sound.
+- **F6 — CLOSED (as scoped).** Growing delay after ≥3 fails, capped 5 s, in a ref;
+  explicitly documented as a casual-guesser speed-bump only (resets on reload). Fine
+  for the stated scope.
+- **F7 — CLOSED.** `changeAddress ?? recipient` removed — `getMnemonicBuild` throws if
+  no wallet change address (fail-closed); `probePasskeyPrf` now requires
+  `{userInitiated:true}` and best-effort signals the credential for pruning.
+- **F8 — CLOSED.** Gap limit 20 / max index 200.
+- **F9 — CLOSED.** `Home.tsx` shows net balance plus explicit "on its way out/in"
+  pending lines.
+
+## New findings
+
+### F10 — [SEV-High] Fee-fraction guard blocks legitimate small sends, with a misleading dead-end  *(SHIP-BLOCKING)*
+
+- **Where:** `src/lib/tx.ts:357-367` (25% guard: `feeSats > (amount+fee)×0.25`);
+  `src/screens/Send.tsx:89-107` (compose validates only dust + over-balance — no fee-
+  fraction awareness); `src/App.tsx:303-322` (dry-run `catch` → `{ok:false}`);
+  `src/screens/Review.tsx:54-72` + `strings.review.recheckBody`.
+- **Scenario (verified):** The guard passes only when `fee ≤ amount/3`. At an honest,
+  in-window **30 sat/vB**, a ~4,230-sat fee means any send below ~12,700 sats (~$8–13)
+  is rejected; during congestion (120 sat/vB) a normal **20,000-sat (~$20) send** is
+  rejected. Send.tsx has no idea, so the user composes fine, taps Review, and hits the
+  F4 blocking screen — whose copy says *"your available balance may have changed… enter
+  the payment again"*. Re-entering the same small amount loops forever; there is no fee
+  explanation, no cheaper-tier hint, and `allowHighFee` is exposed nowhere. This breaks
+  the exact "even a tiny amount is a great first test" flow the app's own empty state
+  promotes.
+- **Fix:** Move the fee-vs-amount check into Send compose with clear copy ("the network
+  fee is large relative to this small amount") and an explicit, informed confirm that
+  wires `allowHighFee: true` through `signAndBroadcast`/`getMnemonicBuild`; and/or
+  compare small-send fees against an absolute sat threshold rather than a pure ratio.
+  At minimum, fix `recheckBody` to name the real cause instead of blaming the balance.
+- **Residual (same guard):** the `MAX_FEE_ABSOLUTE_SATS` (1M) + 25% rule could also
+  block a legitimate many-UTXO consolidation at a high honest rate — rare for beginners,
+  but the same escape-hatch gap applies.
+
+_Round-2 tests used the `.review.test.ts` suffix, were executed, and were deleted; no
+source files were modified._
