@@ -243,6 +243,99 @@ describe('buildAndSignTx — fee sanity cap (F1)', () => {
     expect(res.feeSats).toBeGreaterThan(20_000n / 4n);
   });
 
+  // --- F10: allowHighFee bypasses ONLY the percentage rule ------------------
+
+  it('F10: a legitimate small send at an honest rate is blocked without consent, allowed with it', () => {
+    // The reviewer's F10 scenario: a small (~$8–13) send at an honest, in-window
+    // 30 sat/vB. fee ≈ ceil(141 × 30) = 4,230 sats > 25% of a 10,000-sat send.
+    const params = {
+      mnemonic: ABANDON,
+      network: 'mainnet' as const,
+      utxos: utxos(),
+      recipient: RECIPIENT,
+      amountSats: 10_000n,
+      feeRateSatVb: 30,
+      changeAddress: CHANGE,
+    };
+    // Without informed consent: the percentage rule blocks it.
+    expect(() => buildAndSignTx(params)).toThrow(FeeTooHighError);
+    // With informed consent ("Send anyway"): it builds and signs fine.
+    const res = buildAndSignTx({ ...params, allowHighFee: true });
+    expect(res.totalInputSats).toBe(10_000n + res.changeSats + res.feeSats);
+  });
+
+  it('F10: the hostile 5000 sat/vB sendMax drain stays blocked EVEN WITH allowHighFee', () => {
+    const balance: WalletUtxo[] = [
+      { txid: 'e'.repeat(64), vout: 0, value: 600_000n, path: addr0.path, address: addr0.address },
+    ];
+    expect(() =>
+      buildAndSignTx({
+        mnemonic: ABANDON,
+        network: 'mainnet',
+        utxos: balance,
+        recipient: RECIPIENT,
+        amountSats: 0n,
+        feeRateSatVb: 5000,
+        changeAddress: CHANGE,
+        sendMax: true,
+        allowHighFee: true, // the override must NOT unlock a hostile rate
+      }),
+    ).toThrow(FeeTooHighError);
+  });
+
+  it('F10: the 1,000,000-sat absolute fee ceiling stays hard EVEN WITH allowHighFee', () => {
+    // 30 inputs at the max in-window rate (500 sat/vB): vsize ≈ 11 + 30×68 + 31
+    // = 2,082 vB → fee ≈ 1,041,000 sats. That fee is only ~0.35% of the 3-BTC
+    // input total (percentage rule passes), so only the absolute ceiling fires —
+    // and it must fire regardless of allowHighFee.
+    const many: WalletUtxo[] = [];
+    for (let i = 0; i < 30; i++) {
+      many.push({
+        txid: i.toString(16).padStart(64, '0'),
+        vout: 0,
+        value: 10_000_000n,
+        path: addr0.path,
+        address: addr0.address,
+      });
+    }
+    expect(() =>
+      buildAndSignTx({
+        mnemonic: ABANDON,
+        network: 'mainnet',
+        utxos: many,
+        recipient: RECIPIENT,
+        amountSats: 0n,
+        feeRateSatVb: 500,
+        changeAddress: CHANGE,
+        sendMax: true,
+        allowHighFee: true,
+      }),
+    ).toThrow(FeeTooHighError);
+  });
+
+  it('F10: Review dry-run numbers under allowHighFee match the signed tx exactly', () => {
+    // The Review screen dry-runs buildAndSignTx with the same params the
+    // broadcast build uses. Deterministic signing (RFC6979) means the fee,
+    // txid, and accounting must be identical between the two calls.
+    const params = {
+      mnemonic: ABANDON,
+      network: 'mainnet' as const,
+      utxos: utxos(),
+      recipient: RECIPIENT,
+      amountSats: 10_000n,
+      feeRateSatVb: 30,
+      changeAddress: CHANGE,
+      allowHighFee: true,
+    };
+    const dryRun = buildAndSignTx(params);
+    const broadcastBuild = buildAndSignTx(params);
+    expect(broadcastBuild.txid).toBe(dryRun.txid);
+    expect(broadcastBuild.txHex).toBe(dryRun.txHex);
+    expect(broadcastBuild.feeSats).toBe(dryRun.feeSats);
+    expect(broadcastBuild.totalInputSats).toBe(dryRun.totalInputSats);
+    expect(broadcastBuild.changeSats).toBe(dryRun.changeSats);
+  });
+
   it('still accepts an ordinary in-range fee (no false positive)', () => {
     const res = buildAndSignTx({
       mnemonic: ABANDON,

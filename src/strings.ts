@@ -158,6 +158,12 @@ export const strings = {
     sendMax: 'Send max',
     dust: (min: string): string => `That's too small to send. Try at least ${min}.`,
     scanUnsupported: 'Scanning needs a camera. Paste the address instead.',
+    // Informed-consent notice when the network fee is a big share of a small
+    // amount (F10). Shown inline on compose, with the real numbers.
+    highFeeNotice: (fee: string, pct: string): string =>
+      `Heads up: the network fee for this amount is about ${fee} — that's ${pct}% of what you're sending. Small amounts cost proportionally more to send.`,
+    highFeeOptions: 'You can pick a slower fee speed, change the amount, or send it anyway.',
+    sendAnyway: 'Send anyway',
   },
 
   review: {
@@ -179,11 +185,14 @@ export const strings = {
     failHeading: "We couldn't send that just now",
     failBody:
       'Your bitcoin is safe and still in your wallet — nothing was sent. This is usually a connection problem. Check your internet and try again.',
-    // Dry-run failure: the amounts couldn't be worked out (e.g. the balance
-    // changed while you were here). Block sending; send them back to re-check.
+    // Dry-run failure: the amounts couldn't be worked out. Block sending; send
+    // them back to re-check. Two honest variants (F10): only a genuine build
+    // failure blames the balance; a fee-guard trip explains the fee instead.
     recheckHeading: "Let's double-check this payment",
     recheckBody:
       "We couldn't work out the fee and total just now — your available balance may have changed. Go back and enter the payment again so the numbers are right before you send.",
+    recheckFeeBody:
+      "The network fee would take an unusually big bite out of this payment. Go back to adjust the amount or pick a different fee speed — you can still choose to send it anyway from there.",
     recheckGoBack: 'Go back and re-check',
   },
 

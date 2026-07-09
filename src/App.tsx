@@ -17,6 +17,7 @@ import {
   vaultExists,
   getVaultNetwork,
   buildAndSignTx,
+  FeeTooHighError,
   type Network,
 } from './lib';
 import {
@@ -299,9 +300,11 @@ export default function App(): JSX.Element {
   // params the confirm step will use (idempotent). On ANY failure we return an
   // `ok: false` result so Review blocks sending and shows a "recheck this
   // payment" state — never fabricated $0-fee numbers on the last-chance money
-  // screen (F4).
+  // screen (F4). The failure reason is discriminated so the copy is honest
+  // (F10): a fee-guard trip explains the fee, everything else explains that the
+  // available balance may have changed.
   function reviewNumbers(pending: PendingSend): ReviewNumbers {
-    if (!state.account) return { ok: false };
+    if (!state.account) return { ok: false, reason: 'stale' };
     try {
       const built = getMnemonicBuild(pending);
       const amountSats = pending.sendMax
@@ -313,11 +316,13 @@ export default function App(): JSX.Element {
         feeSats: built.feeSats,
         totalSats: amountSats + built.feeSats,
       };
-    } catch {
-      // The UTXO set may have changed under a 30s poll (InsufficientFunds), the
-      // fee may have tripped the sanity guard (FeeTooHighError), etc. Whatever
-      // the cause, we must not render numbers we can't stand behind.
-      return { ok: false };
+    } catch (err) {
+      // The UTXO set may have changed under a 30s poll (InsufficientFunds), or
+      // the fee tripped the sanity guard (FeeTooHighError — normally caught at
+      // compose time, but the compose estimate can differ slightly from the
+      // real build). Name the real cause; never render numbers we can't stand
+      // behind.
+      return { ok: false, reason: err instanceof FeeTooHighError ? 'fee-too-high' : 'stale' };
     }
   }
 
@@ -340,6 +345,7 @@ export default function App(): JSX.Element {
       feeRateSatVb: pending.feeRateSatVb,
       changeAddress,
       sendMax: pending.sendMax,
+      allowHighFee: pending.allowHighFee,
     });
   }
 
@@ -354,6 +360,7 @@ export default function App(): JSX.Element {
       feeRateSatVb: pending.feeRateSatVb,
       changeAddress: state.account.changeAddress,
       sendMax: pending.sendMax,
+      allowHighFee: pending.allowHighFee,
     });
     dispatch({ type: 'sendBroadcast', txid });
     // Refresh so the pending tx shows up in activity.
@@ -543,7 +550,9 @@ export default function App(): JSX.Element {
       }
 
       case 'sent': {
-        const nums = state.pendingSend ? reviewNumbers(state.pendingSend) : { ok: false as const };
+        const nums = state.pendingSend
+          ? reviewNumbers(state.pendingSend)
+          : ({ ok: false, reason: 'stale' } as const);
         const amt = nums.ok ? nums.amountSats : 0n;
         return (
           <Sent

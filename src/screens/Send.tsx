@@ -3,11 +3,13 @@ import { useMemo, useState } from 'react';
 import { strings } from '../strings';
 import { Chrome } from '../components/Chrome';
 import { Toast } from '../components/ui';
-import { fmtBtc, fmtUsd, usdToSats } from '../display';
+import { fmtBtc, fmtSats, fmtUsd, usdToSats } from '../display';
 import {
   DUST_LIMIT_SATS,
   InvalidRecipientError,
+  MAX_FEE_FRACTION,
   btcStringToSats,
+  estimateFeeSats,
   scriptForAddress,
   satsToUsdString,
   type FeeEstimates,
@@ -82,8 +84,35 @@ export function Send(props: {
     return strings.send.convUsd(fmtUsd(amountSats, props.btcUsd));
   }, [amountSats, entryUnit, props.btcUsd]);
 
-  // Estimated fee in sats/USD for the running total.
-  const feeSats = BigInt(Math.ceil(TYPICAL_VSIZE * feeRate));
+  // Estimate how many inputs the engine's largest-first selection would use, so
+  // the compose-time fee estimate tracks the real build closely (F10). Mirrors
+  // selectCoins: accumulate descending values until amount + the fee for the
+  // current input count (with change) is covered. Any residual mismatch at the
+  // no-change/dust boundary is caught honestly at Review.
+  const estInputs = useMemo<number>(() => {
+    const utxos = props.account.utxos;
+    if (utxos.length === 0) return 1;
+    if (sendMax) return utxos.length; // sendMax sweeps every UTXO
+    if (amountSats === null || amountSats <= 0n) return 1;
+    const sorted = [...utxos].sort((a, b) => (a.value < b.value ? 1 : a.value > b.value ? -1 : 0));
+    let total = 0n;
+    let n = 0;
+    for (const u of sorted) {
+      n++;
+      total += u.value;
+      if (total >= amountSats + estimateFeeSats(n, 2, feeRate)) break;
+    }
+    return n;
+  }, [sendMax, amountSats, props.account.utxos, feeRate]);
+
+  // Sum of every UTXO — what the engine compares a sendMax fee against.
+  const totalUtxoSats = useMemo<bigint>(
+    () => props.account.utxos.reduce((sum, u) => sum + u.value, 0n),
+    [props.account.utxos],
+  );
+
+  // Estimated fee for the selected tier, using the engine's own vsize math.
+  const feeSats = estimateFeeSats(estInputs, sendMax ? 1 : 2, feeRate);
   const feeUsd = props.btcUsd === null ? null : satsToUsdString(feeSats, props.btcUsd);
 
   // Validation for enabling Review + inline errors.
@@ -104,7 +133,22 @@ export function Send(props: {
   const amountReady = sendMax
     ? spendableSats > feeSats + DUST_LIMIT_SATS
     : amountSats !== null && amountSats >= DUST_LIMIT_SATS && amountError === null;
-  const canReview = addressReady && amountReady && props.fees !== null;
+
+  // F10 informed consent: would this payment trip the engine's fee-vs-amount
+  // percentage rule? Mirrors buildAndSignTx exactly — fee compared against
+  // amount + fee for a normal send, or the total swept input for Send Max. When
+  // true, the normal Review button is held back and an inline notice with the
+  // real numbers plus a "Send anyway" option (allowHighFee) is shown instead.
+  const fractionCeiling = (comparedTo: bigint): bigint =>
+    (comparedTo * BigInt(Math.round(MAX_FEE_FRACTION * 1000))) / 1000n;
+  const highFee: boolean = (() => {
+    if (props.fees === null || !amountReady) return false;
+    if (sendMax) return feeSats > fractionCeiling(totalUtxoSats);
+    if (amountSats === null) return false;
+    return feeSats > fractionCeiling(amountSats + feeSats);
+  })();
+
+  const canReview = addressReady && amountReady && props.fees !== null && !highFee;
 
   async function paste(): Promise<void> {
     try {
@@ -120,14 +164,22 @@ export function Send(props: {
     setAmountText('');
   }
 
-  function review(): void {
-    if (!canReview) return;
+  /**
+   * Proceeds to Review. `allowHighFee` is true only via the explicit
+   * "Send anyway" action shown with the high-fee notice (F10); the flag rides
+   * the PendingSend through the Review dry-run and the broadcast build so all
+   * three use identical params. It never bypasses the engine's hard limits.
+   */
+  function review(allowHighFee: boolean): void {
+    if (!(addressReady && amountReady && props.fees !== null)) return;
+    if (highFee && !allowHighFee) return;
     const pending: PendingSend = {
       recipient: address.trim(),
       amountSats: sendMax ? spendableSats : (amountSats ?? 0n),
       feeRateSatVb: feeRate,
       feeTier: tier,
       sendMax,
+      allowHighFee,
     };
     props.onReview(pending);
   }
@@ -145,6 +197,12 @@ export function Send(props: {
       : 0n
     : (amountSats ?? 0n);
   const totalSats = sendMax ? spendableSats : previewAmountSats + feeSats;
+
+  // Real numbers for the high-fee notice: the fee (in USD, or sats when the
+  // price is unavailable) and what share of the sent amount it represents.
+  const highFeeFeeStr = props.btcUsd !== null ? fmtUsd(feeSats, props.btcUsd) : fmtSats(feeSats);
+  const highFeePct =
+    previewAmountSats > 0n ? Number((feeSats * 100n) / previewAmountSats) : 0;
 
   return (
     <Chrome network={props.network} onBack={props.onBack} title={strings.send.title}>
@@ -291,8 +349,29 @@ export function Send(props: {
           ) : null}
         </div>
 
+        {/* --- High-fee informed consent (F10) --- */}
+        {highFee ? (
+          <div className="warn" role="alert">
+            <div className="warn__text">
+              {strings.send.highFeeNotice(highFeeFeeStr, String(highFeePct))}{' '}
+              {strings.send.highFeeOptions}
+            </div>
+            <button
+              className="btn btn--secondary btn--block"
+              style={{ marginTop: 'var(--sp-3)' }}
+              onClick={() => review(true)}
+            >
+              {strings.send.sendAnyway}
+            </button>
+          </div>
+        ) : null}
+
         <div className="bottom-actions">
-          <button className="btn btn--primary btn--block" onClick={review} disabled={!canReview}>
+          <button
+            className="btn btn--primary btn--block"
+            onClick={() => review(false)}
+            disabled={!canReview}
+          >
             {strings.send.review}
           </button>
         </div>

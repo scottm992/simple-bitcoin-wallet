@@ -83,6 +83,7 @@ describe('reducer — screen state machine', () => {
       feeRateSatVb: 3,
       feeTier: 'standard' as const,
       sendMax: false,
+      allowHighFee: false,
     };
     let s: AppState = reducer(initialState, { type: 'unlocked' });
     s = reducer(s, { type: 'composeSend', pending });

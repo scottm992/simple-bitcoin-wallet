@@ -38,14 +38,18 @@ the mnemonic in at call time and let it go out of scope.
 - `BuiltTx { txHex; txid; feeSats: bigint; vsize: number; totalInputSats: bigint; changeSats: bigint }`
 - `DUST_LIMIT_SATS = 546n`
 
-**Fee-sanity constants (F1)**: `MAX_FEE_RATE_SAT_VB = 500`, `MAX_FEE_FRACTION = 0.25`, `MAX_FEE_ABSOLUTE_SATS = 1_000_000n`.
+**Fee-sanity constants (F1/F10)**: `MAX_FEE_RATE_SAT_VB = 500` (HARD), `MAX_FEE_ABSOLUTE_SATS = 1_000_000n` (HARD), `MAX_FEE_FRACTION = 0.25` (informed-consent).
 
 **Errors**: `InsufficientFundsError` (`.available`, `.required`), `InvalidRecipientError`, `InvalidTxParamsError`, `FeeTooHighError` (`.feeSats`, `.feeRateSatVb`, `.comparedToSats`).
 
-`buildAndSignTx` rejects (with `FeeTooHighError`) a fee rate above `MAX_FEE_RATE_SAT_VB`, or a computed fee above `MAX_FEE_FRACTION` of the amount being sent (total input for `sendMax`) or above `MAX_FEE_ABSOLUTE_SATS`, unless `allowHighFee: true` is set after an explicit informed confirmation.
+`buildAndSignTx` rejects (with `FeeTooHighError`):
+- a fee rate above `MAX_FEE_RATE_SAT_VB` — **hard, never bypassable**;
+- a computed fee above `MAX_FEE_ABSOLUTE_SATS` — **hard, never bypassable**;
+- a computed fee above `MAX_FEE_FRACTION` of the amount being sent (amount + fee for a normal send; total input for `sendMax`) — bypassable **only** via `allowHighFee: true`, which the UI sets exclusively after the user confirms the real fee numbers on the compose screen ("Send anyway", F10).
 
 **Functions**
 - `buildAndSignTx(params: BuildTxParams): BuiltTx` — validates recipient for the network, runs largest-first coin selection with fee iteration, folds dust change into the fee, supports `sendMax`. Signs P2WPKH inputs, finalizes, returns hex + txid.
+- `estimateFeeSats(numInputs, numOutputs, feeRateSatVb): bigint` — fee estimate using the same vsize math as coin selection; used by the compose screen to pre-check the fee-vs-amount ratio (F10) so the user is warned before Review.
 - `scriptForAddress(address: string, network: Network): Uint8Array` — output script for a destination; accepts bech32/bech32m/base58, rejects wrong-network bech32.
 
 ---

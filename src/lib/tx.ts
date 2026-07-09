@@ -16,25 +16,29 @@ import type { Network } from './wallet';
 export const DUST_LIMIT_SATS = 546n;
 
 /**
- * Hard ceiling on the fee rate (sat/vByte) the signer will accept. A sane rate
+ * HARD ceiling on the fee rate (sat/vByte) the signer will accept. A sane rate
  * is ~1–50 sat/vB even in congestion; anything above this is treated as a
- * bad/hostile estimate and rejected unless {@link BuildTxParams.allowHighFee}.
+ * bad/hostile estimate and rejected unconditionally. NOT overridable via
+ * {@link BuildTxParams.allowHighFee} (F10: the override is for legitimate small
+ * sends, never for hostile rates).
  */
 export const MAX_FEE_RATE_SAT_VB = 500;
 
 /**
- * The largest share of the spent inputs the fee may consume before the build is
- * rejected (as a guard against a fee that dwarfs the payment). For a Send Max
- * this is checked against the total input; for a normal send, against
- * amount + fee. Overridable via {@link BuildTxParams.allowHighFee}.
+ * The largest share of the spent value the fee may consume before the build is
+ * rejected (a guard against a fee that dwarfs the payment). For a Send Max this
+ * is checked against the total input; for a normal send, against amount + fee.
+ * This is the ONE guard {@link BuildTxParams.allowHighFee} can bypass: a small
+ * send legitimately carries a proportionally large fee, so the UI collects an
+ * informed confirmation at compose time and sets the flag (F10).
  */
 export const MAX_FEE_FRACTION = 0.25;
 
 /**
- * Absolute ceiling on the fee, in satoshis, applied independently of the
- * fraction guard so a large-value send can't quietly burn an unbounded amount.
- * 1,000,000 sats (0.01 BTC) is far above any legitimate single-tx fee.
- * Overridable via {@link BuildTxParams.allowHighFee}.
+ * HARD absolute ceiling on the fee, in satoshis, applied independently of the
+ * fraction guard so no build can quietly burn an unbounded amount. 1,000,000
+ * sats (0.01 BTC) is far above any legitimate single-tx fee. NOT overridable
+ * via {@link BuildTxParams.allowHighFee} (F10).
  */
 export const MAX_FEE_ABSOLUTE_SATS = 1_000_000n;
 
@@ -76,9 +80,12 @@ export interface BuildTxParams {
   /** When true, sweep all UTXOs to the recipient with no change output. */
   readonly sendMax?: boolean;
   /**
-   * Explicit opt-out of the fee-sanity guards ({@link FeeTooHighError}). Only
-   * set this when a fully-informed user has deliberately confirmed an unusually
-   * high fee. Defaults to false: a fee that looks hostile/buggy is rejected.
+   * Informed-consent opt-out of the {@link MAX_FEE_FRACTION} percentage rule
+   * ONLY (F10) — for legitimate small sends where the fee is naturally a large
+   * share of the amount. Set exclusively after the user has explicitly
+   * confirmed the real fee numbers at compose time. The hard limits —
+   * {@link MAX_FEE_RATE_SAT_VB} and {@link MAX_FEE_ABSOLUTE_SATS} — are NEVER
+   * bypassed by this flag. Defaults to false.
    */
   readonly allowHighFee?: boolean;
 }
@@ -130,11 +137,12 @@ export class InvalidTxParamsError extends Error {
 }
 
 /**
- * Thrown when the fee rate or the computed absolute fee exceeds the sanity
- * bounds ({@link MAX_FEE_RATE_SAT_VB} / {@link MAX_FEE_FRACTION} /
- * {@link MAX_FEE_ABSOLUTE_SATS}) and {@link BuildTxParams.allowHighFee} was not
- * set. This is the engine-level backstop against a bad/hostile fee estimate
- * draining the wallet (see F1). Carries the numbers so the UI can explain them.
+ * Thrown when the fee trips a sanity bound: the hard {@link MAX_FEE_RATE_SAT_VB}
+ * rate cap or hard {@link MAX_FEE_ABSOLUTE_SATS} ceiling (never bypassable), or
+ * the {@link MAX_FEE_FRACTION} percentage rule (bypassable only via an informed
+ * {@link BuildTxParams.allowHighFee}). This is the engine-level backstop against
+ * a bad/hostile fee estimate draining the wallet (F1/F10). Carries the numbers
+ * so the UI can explain them.
  */
 export class FeeTooHighError extends Error {
   /** The computed fee, in satoshis. */
@@ -225,6 +233,17 @@ function feeForVsize(vsize: number, feeRateSatVb: number): bigint {
 }
 
 /**
+ * Estimates the fee (sats) for a P2WPKH tx with the given input/output counts
+ * at a fee rate, using the same vsize math as coin selection. Exported so the
+ * compose screen can pre-check the fee-vs-amount ratio with the SAME numbers
+ * the engine will use, and warn the user before Review instead of hitting the
+ * engine guard cold (F10).
+ */
+export function estimateFeeSats(numInputs: number, numOutputs: number, feeRateSatVb: number): bigint {
+  return feeForVsize(estimateVsize(numInputs, numOutputs), feeRateSatVb);
+}
+
+/**
  * Selects UTXOs (largest first) to cover `amountSats` plus the fee, iterating
  * the fee estimate as inputs are added.
  * @returns The selected UTXOs, the total selected value, and the final fee for
@@ -286,8 +305,9 @@ function selectCoins(
  * @param params - See {@link BuildTxParams}.
  * @returns The signed transaction and its accounting ({@link BuiltTx}).
  * @throws {InvalidTxParamsError} On non-positive fee rate or amount.
- * @throws {FeeTooHighError} When the fee rate or computed fee exceeds the sanity
- *   bounds and `allowHighFee` is not set (F1 backstop).
+ * @throws {FeeTooHighError} When the fee rate/absolute fee exceeds a HARD limit
+ *   (never bypassable), or the fee exceeds the percentage rule without an
+ *   informed `allowHighFee` (F1/F10).
  * @throws {InvalidRecipientError} On a bad or wrong-network recipient.
  * @throws {InsufficientFundsError} When funds cannot cover amount + fee.
  */
@@ -301,7 +321,8 @@ export function buildAndSignTx(params: BuildTxParams): BuiltTx {
   }
   // F1 defence-in-depth (engine layer): reject an implausibly high fee RATE
   // before we ever build/sign, so a bad/hostile estimate can't drain funds.
-  if (!allowHighFee && feeRateSatVb > MAX_FEE_RATE_SAT_VB) {
+  // HARD limit — allowHighFee does NOT bypass this (F10).
+  if (feeRateSatVb > MAX_FEE_RATE_SAT_VB) {
     throw new FeeTooHighError(
       `Fee rate ${feeRateSatVb} sat/vB exceeds the ${MAX_FEE_RATE_SAT_VB} sat/vB safety limit`,
       0n,
@@ -349,25 +370,30 @@ export function buildAndSignTx(params: BuildTxParams): BuiltTx {
     sendAmount = amountSats;
   }
 
-  // F1 defence-in-depth (engine layer): even with an in-range rate, reject a
-  // computed fee that dwarfs the payment or exceeds an absolute ceiling. For a
-  // Send Max there is no separate amount, so we compare against the total input;
-  // for a normal send, against the value actually leaving the wallet
-  // (amount + fee). Both are overridable via allowHighFee.
+  // F1 defence-in-depth (engine layer): even with an in-range rate, bound the
+  // computed fee. For a Send Max there is no separate amount, so we compare
+  // against the total input; for a normal send, against the value actually
+  // leaving the wallet (amount + fee).
+  const comparedTo = sendMax ? totalInput : sendAmount + feeSats;
+
+  // HARD absolute ceiling — allowHighFee does NOT bypass this (F10).
+  if (feeSats > MAX_FEE_ABSOLUTE_SATS) {
+    throw new FeeTooHighError(
+      `Fee ${feeSats} sats exceeds the absolute ${MAX_FEE_ABSOLUTE_SATS}-sat safety limit`,
+      feeSats,
+      feeRateSatVb,
+      comparedTo,
+    );
+  }
+
+  // Percentage rule — the ONLY guard allowHighFee bypasses (F10): a legitimate
+  // small send naturally carries a proportionally large fee, and the UI collects
+  // an explicit informed confirmation before setting the flag.
   if (!allowHighFee) {
-    const comparedTo = sendMax ? totalInput : sendAmount + feeSats;
     const fractionCeiling = (comparedTo * BigInt(Math.round(MAX_FEE_FRACTION * 1000))) / 1000n;
     if (feeSats > fractionCeiling) {
       throw new FeeTooHighError(
         `Fee ${feeSats} sats exceeds ${Math.round(MAX_FEE_FRACTION * 100)}% of the amount being sent`,
-        feeSats,
-        feeRateSatVb,
-        comparedTo,
-      );
-    }
-    if (feeSats > MAX_FEE_ABSOLUTE_SATS) {
-      throw new FeeTooHighError(
-        `Fee ${feeSats} sats exceeds the absolute ${MAX_FEE_ABSOLUTE_SATS}-sat safety limit`,
         feeSats,
         feeRateSatVb,
         comparedTo,

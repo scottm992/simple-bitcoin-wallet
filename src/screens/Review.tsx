@@ -9,12 +9,14 @@ import type { FeeTier, PendingSend } from '../state';
 
 /**
  * The result of the Review dry-run build. `ok: false` means the build could not
- * be completed (e.g. the UTXO set changed under a poll, or the fee tripped the
- * sanity guard) so Review must block sending rather than show fake numbers (F4).
+ * be completed, so Review must block sending rather than show fake numbers (F4).
+ * The reason keeps the copy honest (F10): `'fee-too-high'` when the engine's fee
+ * guard tripped, `'stale'` for everything else (e.g. the UTXO set changed under
+ * a poll between compose and review).
  */
 export type ReviewNumbers =
   | { ok: true; amountSats: bigint; feeSats: bigint; totalSats: bigint }
-  | { ok: false };
+  | { ok: false; reason: 'fee-too-high' | 'stale' };
 
 /** Fee-time label for the review row, matching the compose chips. */
 function tierTime(tier: FeeTier): string {
@@ -50,8 +52,14 @@ export function Review(props: {
   const [toast, setToast] = useState<string | null>(null);
 
   // F4: a failed dry-run blocks the whole screen. Render a recheck state with no
-  // fabricated numbers and no way to send.
+  // fabricated numbers and no way to send. The copy names the real cause (F10):
+  // only a genuine build failure blames the balance; a fee-guard trip explains
+  // the fee instead.
   if (!props.numbers.ok) {
+    const body =
+      props.numbers.reason === 'fee-too-high'
+        ? strings.review.recheckFeeBody
+        : strings.review.recheckBody;
     return (
       <Chrome network={props.network} onBack={props.onBack} title={strings.review.title}>
         <div className="screen-body">
@@ -59,7 +67,7 @@ export function Review(props: {
             {strings.review.recheckHeading}
           </h1>
           <div className="warn">
-            <div className="warn__text">{strings.review.recheckBody}</div>
+            <div className="warn__text">{body}</div>
           </div>
           <div className="bottom-actions">
             <button className="btn btn--primary btn--block" onClick={props.onBack}>

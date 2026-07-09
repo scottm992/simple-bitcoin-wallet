@@ -93,6 +93,9 @@ export async function signAndBroadcast(params: {
   feeRateSatVb: number;
   changeAddress: string;
   sendMax: boolean;
+  /** User's informed consent to a large fee-vs-amount ratio (F10). Only bypasses
+   * the engine's percentage rule — never the hard rate/absolute limits. */
+  allowHighFee: boolean;
 }): Promise<string> {
   const mnemonic = getMnemonic();
   const built = buildAndSignTx({
@@ -104,6 +107,7 @@ export async function signAndBroadcast(params: {
     feeRateSatVb: params.feeRateSatVb,
     changeAddress: params.changeAddress,
     sendMax: params.sendMax,
+    allowHighFee: params.allowHighFee,
   });
   return broadcastTx(params.network, built.txHex);
 }

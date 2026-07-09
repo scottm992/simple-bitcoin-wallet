@@ -37,6 +37,7 @@ const PENDING: PendingSend = {
   feeRateSatVb: 10,
   feeTier: 'standard',
   sendMax: false,
+  allowHighFee: false,
 };
 
 function findButton(text: string): HTMLButtonElement | null {
@@ -54,7 +55,7 @@ describe('Review — dry-run failure blocks sending (F4)', () => {
         <Review
           network="mainnet"
           pending={PENDING}
-          numbers={{ ok: false }}
+          numbers={{ ok: false, reason: 'stale' }}
           btcUsd={60_000}
           onConfirm={async () => {
             throw new Error('should never be called in a blocked state');
@@ -95,5 +96,47 @@ describe('Review — dry-run failure blocks sending (F4)', () => {
     expect(send).not.toBeNull();
     expect(send!.disabled).toBe(false);
     expect(container.textContent).toContain(strings.review.totalLabel);
+  });
+});
+
+describe('Review — blocked-state copy names the real cause (F10)', () => {
+  it("a stale/UTXO failure shows the 'balance may have changed' copy, not the fee copy", async () => {
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <Review
+          network="mainnet"
+          pending={PENDING}
+          numbers={{ ok: false, reason: 'stale' }}
+          btcUsd={60_000}
+          onConfirm={async () => {}}
+          onBack={() => {}}
+        />,
+      );
+    });
+    expect(container.textContent).toContain(strings.review.recheckBody);
+    expect(container.textContent).not.toContain(strings.review.recheckFeeBody);
+  });
+
+  it('a fee-guard trip shows the honest fee explanation, never blaming the balance', async () => {
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <Review
+          network="mainnet"
+          pending={PENDING}
+          numbers={{ ok: false, reason: 'fee-too-high' }}
+          btcUsd={60_000}
+          onConfirm={async () => {}}
+          onBack={() => {}}
+        />,
+      );
+    });
+    expect(container.textContent).toContain(strings.review.recheckFeeBody);
+    // The misleading "balance may have changed" line must NOT appear here.
+    expect(container.textContent).not.toContain(strings.review.recheckBody);
+    // Still fully blocked: no Send button, no fabricated numbers.
+    expect(findButton(strings.review.sendNow)).toBeNull();
+    expect(container.textContent).not.toContain(strings.review.totalLabel);
   });
 });

@@ -40,6 +40,13 @@ export interface PendingSend {
   readonly feeRateSatVb: number;
   readonly feeTier: FeeTier;
   readonly sendMax: boolean;
+  /**
+   * True only when the user explicitly confirmed an unusually large
+   * fee-vs-amount ratio on the compose screen ("Send anyway", F10). Threaded
+   * through the Review dry-run and the broadcast build so both use identical
+   * params. Never bypasses the engine's hard fee-rate / absolute-fee limits.
+   */
+  readonly allowHighFee: boolean;
 }
 
 /** Loading status for network-backed data. */
