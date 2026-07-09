@@ -225,7 +225,7 @@ export const strings = {
     failed: 'Failed',
     empty: 'Nothing here yet.',
     emptyBody: 'Your payments will show up here once you send or receive.',
-    loadError: "Couldn't load your activity. Check your connection and pull to refresh.",
+    loadError: "Couldn't load your activity. Check your connection and try again.",
     // Detail sheet.
     detailFee: 'Network fee',
     viewExplorer: 'View on the block explorer',

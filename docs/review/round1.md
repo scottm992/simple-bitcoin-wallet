@@ -489,3 +489,196 @@ green in the suite after the change.
 
 _Round-6 tests used the `.review.test.tsx` suffix, were executed, and were deleted; no source
 files were modified._
+
+---
+
+# Round 7 — PWA packaging (manifest + service worker + standalone shell)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 1 (Info)**
+
+`npm test` = 146 passing (incl. the change's 12 new sw/manifest tests), `tsc --noEmit` clean,
+`npm run build` clean. Built `dist/index.html` CSP is byte-for-byte the strict policy —
+`script-src 'self'`, no weakening; `dist/` contains `sw.js` + `manifest.webmanifest` copied
+verbatim from `public/` (diff-verified) plus all four icons, and every reference (assets,
+manifest, apple-touch-icon) is relative. Beyond the unit gates I drove the SW's REAL event
+wiring in a throwaway harness (stub `self`/`caches`/`fetch` injected as scope params — the
+handlers run unmodified) and verified the built app live under `vite preview`: the SW
+registers at the correct scope with `updateViaCache: 'imports'`, controls the page on first
+visit, and `sbw-cache-v1` contains only same-origin entries.
+
+## Per-area verdicts
+
+- **a. Stale-HTML pinning — SOUND.** Navigations are network-first and the cache is
+  consulted ONLY when `fetch()` *rejects* (offline/DNS): an online 5xx is returned to the
+  user, never a stale cached shell (verified in the harness — 503-with-stale-copy returns
+  the 503, caches nothing). A 304 (`ok:false`) is likewise returned uncached and can't
+  clobber a cached 200 — and in practice the SW never sees raw 304s for navigations
+  (conditional revalidation happens in the HTTP-cache layer below `fetch`, which surfaces
+  the freshened 200). `ignoreSearch` applies only inside the offline-fallback `match`, and
+  it ignores the query string, never the path — no wrong-document match. GitHub Pages'
+  `max-age=600` allows up to 10 minutes of ordinary HTTP-cache staleness, but that window
+  is identical with and without the SW (the SW's `fetch(request)` rides the same HTTP
+  cache) — the SW adds zero pinning on top. SW-update path: `register()` uses the default
+  `updateViaCache: 'imports'` (confirmed live), so the sw.js update check itself always
+  bypasses the HTTP cache, and there are no `importScripts`; a client can never run a
+  weeks-old SW because of Pages' max-age. Deploy-recoverability holds: push again → every
+  online client gets the new HTML on next navigation (≤ the pre-existing 10-min HTTP-cache
+  window).
+- **b. API-traffic non-interference — SOUND.** `decideStrategy` returns `'passthrough'`
+  for every non-GET and every cross-origin URL *before* any other logic, and passthrough
+  means the handler returns without `respondWith` — the browser behaves exactly as with no
+  SW. Verified in the harness: mempool.space GET, mempool.space POST (broadcast),
+  same-origin POST, `data:` and extension URLs all produce no `respondWith` and **zero
+  SW-issued fetches**; a request whose property getters throw is caught by the handler's
+  try/catch and falls through (rule 5). Redirect edges: a same-origin navigation that
+  redirects yields an `opaqueredirect`/`cors`-type response — returned, never cached;
+  either way no retry, no duplicate. Live confirmation: after real app usage,
+  `sbw-cache-v1` holds only same-origin shell/manifest/asset entries — no mempool.space
+  URL can ever appear. Added request volume: the SW itself issues no requests beyond the
+  1:1 pass-through; the only new traffic anywhere is the sw.js registration/update checks
+  against GitHub Pages — nothing touches the mempool.space burst budget.
+- **c. Cache poisoning / integrity — SOUND (one Info nit, F14).** The
+  `ok && type === 'basic'` guard blocks redirected-cross-origin (`cors`), `opaque`, and
+  error responses from ever being stored (harness-verified). A 206 Partial Content *passes*
+  the guard (`ok` is true for 206 — the code comment is wrong about that) and reaches
+  `cache.put`, where the Cache API spec itself rejects partial responses, so no partial is
+  ever stored — but the rejection is unhandled (F14). Attacker-controlled same-origin path:
+  the origin is `scottm992.github.io`, which other repos of the same account could share
+  under different paths — but the SW's scope confines it to `/simple-bitcoin-wallet/`
+  clients, the app never requests other paths, and content there is controlled by the same
+  account (compromise of which is game-over regardless). `cache.put` failure (quota, 206,
+  `Vary: *`) cannot break a page load: the put is fire-and-forget and the response has
+  already been returned — verified by feeding put a never-settling thenable (an awaited put
+  would have hung the harness; it didn't).
+- **d. Cache growth — ACCEPTABLE as-is (info-level trade-off, no pruning now).**
+  Reproduced live: two builds' hashed assets coexist in `sbw-cache-v1` (6 entries). One
+  build is ~420 kB (400 kB JS + 19 kB CSS), growth is linear only in deploys a client
+  actually loads, entries are same-origin content-hashed files that can never be served
+  stale, and browser cache quota is orders of magnitude larger. Pruning logic would add
+  complexity (and new failure modes) to money-adjacent plumbing for zero security gain.
+  Requirement going forward: **bump `CACHE_NAME` whenever sw.js behavior changes**, which
+  prunes everything via the activate handler (harness-verified: only `sbw-cache-*` names
+  other than the current one are deleted; other apps' caches untouched). A bounded prune
+  can ride the v1.2 trust-hardening pass if desired.
+- **e. clients.claim() + no-skipWaiting — SOUND.** No `skipWaiting` anywhere (grep-verified),
+  so a controlling SW is never swapped mid-session. The subtle case — a page that loads
+  while a new SW sits waiting runs the *new* deploy's HTML/JS under the *old* controlling
+  SW — is skew-free by construction: the SW is content-agnostic (network-first HTML,
+  cache-first assets keyed by full content-hashed URL), so any SW version serves correct
+  bytes for any page version, in both directions. `claim()` only affects
+  previously-uncontrolled pages (very first install, or post-hard-reload), where the claimed
+  page and the claiming SW are the same deploy or the cache is empty → network. No
+  version-skew window found.
+- **f. Registration — SOUND.** `import.meta.env.PROD` gates dev out entirely (HMR unaffected);
+  `BASE_URL` is `'./'` under `base: './'`, so `'./sw.js'` resolves against the document URL →
+  `/simple-bitcoin-wallet/sw.js`, and the default scope is the script's directory → exactly
+  the app subpath (live-verified at preview root). `register()` is idempotent for the same
+  URL+scope, so the load-listener can't double-register; failure is swallowed and the app
+  is identical without the SW (registration is additive only). No wrong-scope path found.
+- **g. Pull-to-refresh + safe-area CSS — SOUND.** `overscroll-behavior-y: none` suppresses
+  only overscroll *chaining/refresh gestures*, never scrolling itself; the document doesn't
+  scroll in this layout anyway (all scrolling lives in `.screen-body { overflow-y: auto }`,
+  which keeps scrolling normally — its `contain` just stops chain-out at the edges, which is
+  precisely the anti-reload intent: a reload wipes the memory-only session and locks the
+  wallet). `padding-top: var(--safe-top)` is `env(safe-area-inset-top, 0px)` → exactly 0 in
+  any normal browser (no-op), real inset only in notched standalone.
+- **h. Activity "Try again" — SOUND.** It reuses the *same* `refreshAll` callback Home and
+  Receive already pass (`App.tsx:575/606/677`) — no new semantics. Rapid-tap churn is
+  structurally suppressed: the first tap dispatches `accountLoading`, which synchronously
+  flips `accountStatus` to `'loading'` and unmounts the error callout (and its button) on
+  the same render — there is no second tap to give. Even absent that, each `refresh()`
+  aborts the prior run (cancelling its in-flight requests, keeping concurrency at
+  POLL_CONCURRENCY) and the F13 `externallyAborted` silencing plus single-flight
+  `busy`/`pollBusy` gates are untouched by this diff — F12/F13 invariants hold as shipped
+  in Round 6.
+- **i. Test harness (sw.test.ts) — SOUND.** The stub `self` has no `addEventListener`, so
+  the event-wiring block never executes: no listeners, and the I/O helpers (`networkFirst`/
+  `cacheFirst`) are defined but never invoked — `caches`/`fetch` are only referenced inside
+  their bodies, so no I/O can occur in the test process. Confirmed the converse too: with
+  `module` undefined (the real-SW condition) the export block is a no-op — evaluated the
+  file that way in my own harness without error. `new Function` evaluates only the repo's
+  own `public/sw.js` via Vite `?raw`; no external input.
+- **j. make-placeholder-icons.mjs — SOUND (one provenance note).** Imports only
+  `node:zlib`/`node:fs`/`node:path`/`node:url`; zero network; writes exactly the four
+  documented files, with paths anchored to the script's own location (cwd-independent), all
+  under `public/`. The hand-rolled PNG encoder is correct (verified by decoding the output:
+  valid IHDR/IDAT/IEND, filter-0 scanlines, every pixel `#F7931A`, correct dimensions;
+  `deflateSync` produces the zlib-wrapped stream PNG requires). Output is deterministic
+  (identical hashes across runs). **Note/disclosure:** the placeholder PNGs sitting in the
+  tree at review time did NOT byte-match the script's output (the two 512s even differed
+  from each other); executing the script during this audit — required to audit it —
+  overwrote them with its canonical deterministic output, which is what the tree now holds.
+  Same filenames/dimensions, still valid solid-orange placeholders; functionally nothing
+  changed, and the designer's real icons replace these before commit anyway. **Icon plan
+  verdict:** committing hand-authored SVG masters to a repo-root non-served folder
+  (`assets-src/`, not `public/`) is fine — verified the build output contains only
+  `public/` copies + bundled assets, so nothing under `assets-src/` ships (Vite's dev
+  server can serve root files, but that's dev-only and the SVGs are non-secret). Keep the
+  final PNG filenames identical and note in the folder README which SVG each PNG was
+  rendered from, so the shipped binaries keep auditable provenance.
+- **k. index.html metas + manifest — SOUND.** The CSP meta is untouched and the built policy
+  is unchanged (verified). No `worker-src` is declared, so the SW script falls back to
+  `script-src 'self'` — only our own origin can ever be a service worker. New tags are all
+  same-origin relative references (`./manifest.webmanifest`, `./apple-touch-icon.png`) —
+  subpath-safe and no external fetches; `manifest-src` falls back to `default-src 'self'`.
+  The manifest's `id`/`start_url`/`scope` are all `'./'`, resolved against the manifest URL
+  → exactly the app root on the Pages subpath (and the shipped test locks a leading-`/`
+  regression out). `display: standalone`, no `url_handlers`/`protocol_handlers`/share
+  targets — nothing that widens the surface, nothing leaks. Duplicated brand color
+  (theme-color meta vs manifest) is explicitly commented as one-source-in-manifest;
+  `apple-mobile-web-app-capable` is the legacy-but-still-honored iOS meta — harmless.
+
+## New findings
+
+### F14 — [SEV-Info] `cache.put` is fire-and-forget with no `.catch` — unhandled rejections; and the "partial ... never stored" comment is wrong about *why*
+
+- **Where:** `public/sw.js:109` (`networkFirst`) and `:134` (`cacheFirst`) —
+  `cache.put(request, response.clone());` with the returned promise discarded; the comment
+  at `:106-107` claims partial responses are excluded by the guard.
+- **Scenario (verified in a throwaway harness):** a 206 Partial Content response has
+  `ok === true` and `type === 'basic'`, so it passes the guard and reaches `cache.put`; only
+  the Cache API's own spec behavior (reject on 206, reject on `Vary: *`, reject on quota
+  exhaustion) prevents storage. Because the put promise is discarded (confirmed: nothing is
+  ever chained on it), each such failure surfaces as an unhandled promise rejection inside
+  the SW — console noise, and on some browsers an error-report event, but **no functional
+  impact**: the response has already been returned to the page, and a hanging/rejecting put
+  cannot delay or break any load (verified by feeding put a never-settling thenable).
+  Availability and integrity are both preserved; this is hygiene plus an inaccurate
+  comment in a file whose header promises every line is audit-grade.
+- **Fix:** append `.catch(function () {})` to both `cache.put` calls (with a one-line
+  comment: quota/206/Vary rejections are expected and safely ignored), and correct the
+  `:106` comment — partials are excluded by the Cache API's put rules, not by `response.ok`.
+
+_Round-7 throwaway tests used the `.review.test.ts` suffix, were executed, and were deleted;
+no source files were modified. (Executing `scripts/make-placeholder-icons.mjs` to audit it
+regenerated the four placeholder PNGs under `public/` — see area j's disclosure; those
+binaries were declared out of scope and are replaced by the designer's icons before commit.)_
+
+---
+
+# Round 7 closure — F14 re-check
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 0**
+
+## F14 — CLOSED
+
+- **Fix verified in place and complete.** Both `cache.put` calls now carry
+  `.catch(function () {})` (`public/sw.js:116`, `:143`); harness re-run (same stub
+  `self`/`caches`/`fetch` technique as Round 7, throwaway deleted): a put that genuinely
+  rejects (quota / 206 / `Vary: *`) is swallowed with no unhandled rejection reported by
+  vitest, and the response is still returned to the page in both `networkFirst` and
+  `cacheFirst`. These were the only fire-and-forget cache operations in the file — the
+  activate handler's `caches.delete` chain is consumed by `event.waitUntil`, and every
+  `open`/`match` promise is chained.
+- **Corrected comment is accurate** (`sw.js:106-111`): `response.ok` excludes non-2xx,
+  `type === 'basic'` excludes cross-origin/opaque, and a 206 passes `ok` with storage
+  refused by the Cache API itself — matching spec behavior as verified in Round 7.
+- **No CACHE_NAME bump — correct call.** Nothing has shipped, so no deployed client holds
+  a cache created by pre-fix worker code; and the fix changes only rejection *handling*,
+  not what gets stored, so cache contents are identical either way. `sbw-cache-v1` as the
+  first live version is right.
+- Gates re-confirmed by me: `tsc --noEmit` clean, `npm test` = 146 passing,
+  `npm run build` clean.
+
+_The F14 closure test used the `.review.test.ts` suffix, was executed, and was deleted; no
+source files were modified._

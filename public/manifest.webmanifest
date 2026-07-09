@@ -1,0 +1,16 @@
+{
+  "name": "Simple Bitcoin Wallet",
+  "short_name": "Bitcoin",
+  "description": "A dead-simple Bitcoin wallet that runs entirely in your browser. Your keys never leave your device.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "theme_color": "#F7931A",
+  "background_color": "#FFFFFF",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

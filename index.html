@@ -2,6 +2,9 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!-- viewport-fit=cover lets content use the full screen in iOS standalone;
+         safe-area insets (see theme.css --safe-top / --safe-bottom) keep the app
+         chrome clear of the notch and home indicator. -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="light" />
     <!--
@@ -11,6 +14,20 @@
       serving. See that plugin for the exact policies.
     -->
     <meta http-equiv="Content-Security-Policy" content="CSP_PLACEHOLDER" />
+
+    <!-- PWA. Brand colors (theme_color / background_color) live in ONE place:
+         public/manifest.webmanifest. The theme-color meta below mirrors that
+         manifest value for browser UI; keep the two in sync when the designer
+         picks final colors. -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <meta name="theme-color" content="#F7931A" />
+    <!-- iOS add-to-home-screen / standalone. status-bar-style "default" keeps
+         dark status-bar text, readable over the app's white top bar. -->
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Bitcoin" />
+
     <title>Simple Bitcoin Wallet</title>
   </head>
   <body>

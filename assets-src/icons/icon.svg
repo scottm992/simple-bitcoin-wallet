@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- OPTICAL-CENTERING CANDIDATE of icon.svg (letterform identical, position
+       only). icon.svg centres the ink bounding box on (256,256); this variant
+       adds a measured optical correction: +3.5px right (half-way blend between
+       bbox centre 256.0 and ink centroid 249.1 at 512 — the heavy left spine
+       pulls perceived position left) and -2px up (ink is vertically balanced,
+       so this is the standard optical lift: the perceived centre of a square
+       tile sits slightly above its geometric centre). Net transform on the
+       original traced footprint: translate(0 17.5) instead of the master's
+       translate(-3.5 19.5). -->
+
+  <!-- Full-bleed flat background -->
+  <rect x="0" y="0" width="512" height="512" fill="#F7931A"/>
+
+  <g transform="translate(0 17.5)" fill="#FFFFFF" fill-rule="evenodd">
+    <!-- four slim stubs: two above the cap, two below
+         (each overlaps its bar so the union is seamless) -->
+    <rect x="214" y="104" width="28" height="32"/>
+    <rect x="256" y="104" width="28" height="32"/>
+    <rect x="214" y="334" width="28" height="36"/>
+    <rect x="256" y="334" width="28" height="36"/>
+    <!-- letter body: one outer contour (spine + both bowls, pinched waist)
+         plus two D-shaped counter holes -->
+    <path d="M174 130 H284
+             C308 130 341 150 341 178
+             C341 200 330 218 303 227
+             C325 232 345 250 345 276
+             C345 305 332 328 284 338
+             H174 Z
+             M237 172 H255 C269 172 277 179 277 191
+             C277 204 269 211 255 211 H237 Z
+             M237 253 H256 C270 253 278 261 278 275
+             C278 289 270 296 256 296 H237 Z"/>
+  </g>
+</svg>

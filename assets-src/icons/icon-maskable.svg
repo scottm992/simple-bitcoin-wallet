@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- OPTICAL-CENTERING CANDIDATE of icon-maskable.svg (letterform identical,
+       position only). Same optical correction as icon-optical.svg (+3.5 right,
+       -2 up vs the bbox-centred master, i.e. inner translate(0 17.5)), applied
+       innermost, then scaled 0.9 about the icon centre (256,256). Farthest ink
+       point ~127px from centre, well inside the safe circle (r = 40% = 205px).
+       Background stays full-bleed flat orange for the platform mask. -->
+
+  <!-- Full-bleed flat background -->
+  <rect x="0" y="0" width="512" height="512" fill="#F7931A"/>
+
+  <g transform="translate(256 256) scale(0.9) translate(-256 -256) translate(0 17.5)"
+     fill="#FFFFFF" fill-rule="evenodd">
+    <rect x="214" y="104" width="28" height="32"/>
+    <rect x="256" y="104" width="28" height="32"/>
+    <rect x="214" y="334" width="28" height="36"/>
+    <rect x="256" y="334" width="28" height="36"/>
+    <path d="M174 130 H284
+             C308 130 341 150 341 178
+             C341 200 330 218 303 227
+             C325 232 345 250 345 276
+             C345 305 332 328 284 338
+             H174 Z
+             M237 172 H255 C269 172 277 179 277 191
+             C277 204 269 211 255 211 H237 Z
+             M237 253 H256 C270 253 278 261 278 275
+             C278 289 270 296 256 296 H237 Z"/>
+  </g>
+</svg>

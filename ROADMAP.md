@@ -5,9 +5,11 @@ by value-for-effort within each phase; nothing here is committed work.
 
 ## v1.1 — Feels like a real app (near-term, small pieces)
 
-- **PWA packaging** — web app manifest, proper app icon, service worker for
-  the app shell. Makes "Add to Home Screen" launch full-screen with an icon
-  instead of a Safari tab. No wallet-logic changes; low risk.
+- **PWA packaging** — ✅ **shipped 2026-07-09** (security review round 7,
+  F14 closed). Web app manifest, hand-traced ₿ icon (`assets-src/icons/`),
+  hand-rolled zero-dependency service worker (network-first HTML, cache-first
+  hashed assets, cross-origin untouched), iOS standalone safe-areas, and
+  browser pull-to-refresh suppression (an accidental reload locked the wallet).
 - **Speed up a stuck payment (RBF)** — pending outgoing transactions get a
   "Speed up" button that rebuilds with a higher fee (BIP125). Closes the
   biggest known functional gap: today a low-fee send can sit unconfirmed

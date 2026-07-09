@@ -13,8 +13,11 @@ A dead-simple, beginner-friendly Bitcoin wallet that runs entirely in your brows
 - **Mainnet by default, testnet toggle** for practicing with worthless coins
 - **Password-encrypted storage**, with optional Face ID / passkey unlock on
   supported devices (WebAuthn PRF)
+- **Add it to your Home Screen** — installs like a real app (PWA): its own
+  icon, full-screen launch, and the app shell opens even offline (checking
+  your balance still needs a connection)
 
-> ⚠️ **Status: new software.** The code has been through a six-round adversarial
+> ⚠️ **Status: new software.** The code has been through a seven-round adversarial
 > security audit (see `docs/review/`) with all findings resolved, but it is young
 > and lightly road-tested. Start in **Practice mode**, then use small amounts you
 > can afford to lose. Known limitations: the app trusts mempool.space for chain

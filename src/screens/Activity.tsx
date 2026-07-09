@@ -29,6 +29,7 @@ export function Activity(props: {
   status: LoadStatus;
   btcUsd: number | null;
   onBack: () => void;
+  onRefresh: () => void;
 }): JSX.Element {
   const [selected, setSelected] = useState<ActivityItem | null>(null);
 
@@ -47,7 +48,16 @@ export function Activity(props: {
         <h1 className="h1">{strings.activity.heading}</h1>
 
         {props.status === 'error' ? (
-          <p className="sub">{strings.activity.loadError}</p>
+          <div className="callout nudge">
+            <div className="callout__body">{strings.activity.loadError}</div>
+            <button
+              className="btn btn--text"
+              style={{ marginTop: 'var(--sp-2)', padding: 0 }}
+              onClick={props.onRefresh}
+            >
+              {strings.common.tryAgain}
+            </button>
+          </div>
         ) : props.items.length === 0 ? (
           <div className="callout nudge">
             <div className="callout__title">{strings.activity.empty}</div>

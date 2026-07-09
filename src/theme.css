@@ -88,6 +88,7 @@
   --max-width:     440px;
   --touch-min:     44px;
   --safe-bottom:   env(safe-area-inset-bottom, 0px);
+  --safe-top:      env(safe-area-inset-top, 0px);
 }
 
 /* Practice mode: repoint the accent so the whole app looks different */
@@ -101,6 +102,12 @@
 /* ---- Reset-ish base ---- */
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; }
+/* Suppress the browser's swipe-down pull-to-refresh at the document level: a page
+   reload wipes the memory-only session and locks the wallet, so an accidental
+   overscroll must never trigger it. Set on html AND body since the gesture is
+   owned by the document scroller. Does not affect in-app scrolling — that lives
+   in .screen-body's overflow-y:auto, which still scrolls normally. */
+html { overscroll-behavior-y: none; }
 body {
   margin: 0;
   font-family: var(--font-sans);
@@ -109,13 +116,18 @@ body {
   color: var(--text);
   background: var(--surface-2);
   -webkit-font-smoothing: antialiased;
+  overscroll-behavior-y: none;
 }
 
-/* App is a phone-width column centered on desktop. */
+/* App is a phone-width column centered on desktop. `--safe-top` keeps the top
+   bar / Practice banner clear of the iOS notch in standalone mode (viewport-fit=
+   cover). In a browser the inset is 0px, so this is a no-op there. Bottom insets
+   are handled per-component via --safe-bottom (bottom actions, sheets, toast). */
 .app {
   max-width: var(--max-width);
   min-height: 100%;
   margin: 0 auto;
+  padding-top: var(--safe-top);
   background: var(--bg);
   display: flex;
   flex-direction: column;
@@ -169,6 +181,9 @@ body {
   flex-direction: column;
   padding: var(--sp-4) var(--sp-5) 0;
   overflow-y: auto;
+  /* Contain overscroll so reaching the top/bottom of the Activity list (or any
+     scrollable screen) doesn't chain out to a document-level pull-to-refresh. */
+  overscroll-behavior-y: contain;
 }
 .grow { flex: 1; }
 .center-col {

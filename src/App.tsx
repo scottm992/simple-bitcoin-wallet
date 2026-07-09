@@ -674,6 +674,7 @@ export default function App(): JSX.Element {
             status={state.accountStatus}
             btcUsd={state.btcUsd}
             onBack={goHome}
+            onRefresh={() => void refreshAll()}
           />
         );
 
