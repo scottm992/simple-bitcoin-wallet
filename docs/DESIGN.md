@@ -9,6 +9,14 @@ new. We never talk down to them, and we never assume they know a word like
 "seed", "gas", "UTXO", or "confirmation". Where a plain-English phrase exists, we
 use it.
 
+> **Status (2026-07-09):** this is the original v1.0 spec, kept for rationale,
+> copy voice, and design tokens. The shipped app has moved past it in places —
+> the security audit (`docs/review/round1.md`, F1–F13) added UI this spec does
+> not describe (the high-fee consent notice on Send, the "Checking for
+> updates…" balance cue, the plain-English Face ID explainer sheet), and a few
+> details below were corrected to match the shipped app. Where this document
+> and the app disagree, **the code and `src/strings.ts` are the truth.**
+
 ---
 
 ## 1. Design principles
@@ -266,11 +274,14 @@ Copy:
   wallet if someone else gets your device. It's separate from your 12 words.
 - `Password` (field, obscured, with a show/hide eye)
 - `Confirm password` (field, obscured)
-- Strength hint (live, under the first field): **Use at least 8 characters.** →
-  when met: **Looks good.**
+- Strength hint (live, under the first field): a 5-band strength meter
+  (F3 — see `src/password.ts`). Empty state: **Use at least 10 characters. A few
+  words strung together is easiest to remember.**
 - *(Face ID available):* toggle row —
   **Unlock with Face ID** — Skip typing your password on this phone. *(subtext)*
-- **[Set password]** (primary; disabled until both fields match and length ≥ 8)
+- **[Set password]** (primary; disabled until both fields match and the
+  password passes the meter: ≥ 10 characters and not a well-known common
+  password — F3)
 
 Important clarifying line (small, under the button):
 > Your password only unlocks this app on this phone. It can't recover your wallet
@@ -278,7 +289,7 @@ Important clarifying line (small, under the button):
 
 Errors:
 - Fields don't match: **These don't match yet.** (inline under confirm field)
-- Too short: **A little longer, please — at least 8 characters.**
+- Too short: **A little longer, please — at least 10 characters.**
 
 ---
 
@@ -351,7 +362,9 @@ Only worthless practice coins work here.**
 One screen to compose; the *review* is where safety lives.
 
 Layout:
-1. **To** — address field with a **Paste** button and a **Scan QR** button.
+1. **To** — address field with a **Paste** button. *(The originally spec'd
+   **Scan QR** button was not built for v1.0 — Send is paste-only today; camera
+   scanning is a v1.1 roadmap item.)*
 2. **Amount** — big amount field defaulting to USD entry; live BTC conversion
    under it; a **Max** button.
 3. **Network fee** — a simple three-choice selector (not sat/vByte).
@@ -363,7 +376,8 @@ Copy:
 - **H:** Send bitcoin
 - **To** label: **Send to**
   - `Paste an address` (field placeholder)
-  - **[Paste]** / **[Scan]** buttons inside/next to the field
+  - **[Paste]** button inside/next to the field *(no **[Scan]** in v1.0 —
+    see note above)*
   - On valid address: a green check + **Address looks valid.**
 - **Amount** label: **Amount**
   - Field shows `$0.00` and accepts USD by default; a small **BTC/USD** switch

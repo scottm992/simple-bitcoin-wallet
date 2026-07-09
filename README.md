@@ -14,7 +14,7 @@ A dead-simple, beginner-friendly Bitcoin wallet that runs entirely in your brows
 - **Password-encrypted storage**, with optional Face ID / passkey unlock on
   supported devices (WebAuthn PRF)
 
-> ⚠️ **Status: new software.** The code has been through a four-round adversarial
+> ⚠️ **Status: new software.** The code has been through a six-round adversarial
 > security audit (see `docs/review/`) with all findings resolved, but it is young
 > and lightly road-tested. Start in **Practice mode**, then use small amounts you
 > can afford to lose. Known limitations: the app trusts mempool.space for chain

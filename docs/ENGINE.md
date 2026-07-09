@@ -1,6 +1,7 @@
 # Wallet Engine API Reference
 
-Terse reference for every exported symbol under `src/lib/`. Import from the
+Terse reference for every exported symbol under `src/lib/`, plus the discovery
+orchestration layer in `src/actions.ts` (last section). Import from the
 barrel: `import { … } from '../lib'` (or the specific module). All satoshi
 amounts are `bigint`. No function keeps private keys in long-lived state — pass
 the mnemonic in at call time and let it go out of scope.
@@ -122,3 +123,48 @@ remains a fallback. Secrets are never logged or placed in errors.
 - `btcStringToSats(btc: string): bigint` — strict parse; rejects > 8 decimals / malformed (`InvalidAmountError`).
 - `satsToUsdString(sats: bigint, btcUsdPrice: number, opts?: { withSymbol?: boolean }): string`
 - `chunkAddress(value: string, groupSize=4): string` — space-separated groups for the review screen.
+
+---
+
+## `src/actions.ts` — discovery orchestration (outside `lib/`)
+
+The coordination layer between the engine and the UI. Its shape is dictated by
+one field-discovered constraint: **mempool.space throttles request bursts by
+stalling connections until client timeout — it returns no error.** So discovery
+is single-flight, budget-limited, and deadline-bounded. Any change touching
+discovery must preserve this pattern (see review rounds 5–6, F12/F13).
+
+**Constants**: `FAST_GAP_LIMIT = 5` (phase 1), `FULL_GAP_LIMIT = 20` (phase 2,
+BIP44/F8), `DISCOVERY_DEADLINE_MS = 20_000`, `POLL_CONCURRENCY = 4`.
+
+- `startDiscovery({ network, onSnapshot, onError, deadlineMs? }): DiscoveryHandle`
+  — one two-phase run. **Phase 1** (first paint): fast gap-5 scan anchored at the
+  cached high-water marks. **Phase 2** (correctness): extends to the full gap-20
+  scan from index 0, reusing every phase-1 response via a run-scoped `ScanCache`
+  (only the window extension costs new requests). `onSnapshot(snapshot, complete)`
+  fires per phase — `complete` is `false` for phase 1, `true` for phase 2 (F12;
+  the UI keeps a "Checking for updates…" cue while only an incomplete snapshot is
+  on screen). The run settles deterministically at the deadline: a landed phase-1
+  result is kept; with no result at all, `onError` fires — the skeleton is never
+  open-ended. `DiscoveryHandle { done: Promise<void>; abort(): void }` — `abort()`
+  cancels every in-flight request and silences the run: a superseded run never
+  dispatches a snapshot or an error, even if a phase had already resolved with its
+  continuation still queued (F13).
+- `pollAccount(network, account, signal?): Promise<boolean>` — the cheap 30-second
+  poll. Re-checks ONLY known-used addresses plus the two tips (budget: a fresh
+  wallet costs 2 requests), never a rescan; `true` ⇒ caller should full-refresh.
+- `DiscoveryController` — the single-flight coordinator; one instance app-wide
+  (`App.tsx` `discoveryRef`). `refresh(params)` aborts any in-flight run and starts
+  fresh. `pollTick(params)` is skipped entirely (zero requests) while a run or a
+  prior poll is in flight — 30s ticks can never pile bursts onto a slow crawl; when
+  the on-screen snapshot is incomplete it self-heals by requesting a full refresh
+  instead of polling (F12). `abort()` on lock/unmount/network switch — on a network
+  switch, call it synchronously BEFORE dispatching `setNetwork` (F13). `busy: boolean`.
+- `loadAccount(network)` — one full single-phase discovery (no deadline/phases).
+- Also here: `loadPrice()` (null on failure — offline-tolerant), `loadFees(network)`,
+  `feeRateForTier(fees, tier)` — second independent clamp into
+  `[MIN_ACCEPTED_FEE_RATE, MAX_ACCEPTED_FEE_RATE]` (F1), and
+  `signAndBroadcast(params)` — reads the mnemonic at call time, never returns it;
+  idempotent on retry (same UTXO set + params ⇒ same signed tx; mempool.space
+  treats re-broadcast of an accepted tx as success). `allowHighFee` bypasses only
+  the 25% consent rule, never the hard rate/absolute caps (F10).
