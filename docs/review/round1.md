@@ -319,3 +319,45 @@ The main dead-end is fixed and the hard limits are genuinely hard:
 
 _Round-3 tests used the `.review.test.ts` suffix, were executed, and were deleted; no source
 files were modified._
+
+---
+
+# Round 4 — Re-audit of the F11 fix
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 0**
+
+`npm test` = 113 passing, `tsc --noEmit` clean, `npm run build` clean, prod CSP still
+`script-src 'self'`. Throwaway tests deleted; no source modified.
+
+## F11 — CLOSED
+
+Drift is eliminated by construction, and the blocked state is no longer a dead end:
+
+- **One selection code path (verified).** New `estimateSendFee()` (`tx.ts:329`) dry-runs
+  the engine's own `selectCoins`/sendMax logic — dust-fold included — and computes
+  `needsHighFeeConsent` with the shared `feeFractionCeiling`. `buildAndSignTx` now
+  *consumes that same result* (`tx.ts:433`, using `sel.feeSats`/`sel.needsHighFeeConsent`),
+  and `Send.tsx` reads `feeSelection.needsHighFeeConsent` from the identical call
+  (`Send.tsx:92-138`). The parallel `estimateFeeSats` reimplementation is gone.
+- **My Round-3 scenario is fixed (verified).** 17,500-sat UTXO / 13,000 send / 30 sat/vB:
+  `estimateSendFee` now reports the exact dust-folded fee (4,500) *and*
+  `needsHighFeeConsent: true`, so compose shows the "Send anyway" notice — no silent loop.
+- **Property sweep (verified).** Across the dust-fold boundary (amounts 546→19,000 at
+  1 & 30 sat/vB, exercising both the dust-fold and consent paths) and across sendMax
+  balances (3k→1M at 1/30/200/500 sat/vB): `estimateSendFee.feeSats` equals the built
+  fee exactly, and `needsHighFeeConsent` matches whether the no-consent build throws —
+  in every case.
+- **Review recovery works and hard blocks stay honest (verified).** If a `fee-too-high`
+  block ever reaches Review (e.g. a UTXO set that shifts under the 30s poll between compose
+  and review), the blocked state carries the real `FeeTooHighError` numbers and offers a
+  working "Send anyway" → `onAcceptHighFee` re-composes with `allowHighFee` and the full
+  Review gate (numbers + address checkbox + Send now) still applies (`Review.tsx:67-105`,
+  `App.tsx:557-567`). It is marked recoverable only when the percentage rule tripped and
+  the fee is within the hard limits; a hard-limit block (rate cap or > 1,000,000-sat
+  absolute) shows honest no-recovery copy with no bait button.
+- **Hard caps still hold with `allowHighFee` (verified).** 5000 sat/vB sendMax and the
+  30-input/500 sat/vB absolute-ceiling case both still throw `FeeTooHighError` with the
+  flag set.
+
+_Round-4 tests used the `.review.test.ts` suffix, were executed, and were deleted; no
+source files were modified._
