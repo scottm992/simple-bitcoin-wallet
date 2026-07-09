@@ -441,3 +441,51 @@ tests (deleted). The restructure is well-built; two low-severity display/edge ga
 
 _Round-5 tests used the `.review.test.ts` suffix, were executed, and were deleted; no source
 files were modified._
+
+---
+
+# Round 6 — Re-audit of the F12 / F13 fixes (final confirm)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 0**
+
+`npm test` = 134 passing, `tsc --noEmit` clean, `npm run build` clean, prod CSP still
+`script-src 'self'`, no `console.*` in source. Both fixes verified; no regressions.
+
+## F12 — CLOSED
+
+- **Completeness is threaded end-to-end.** `onSnapshot(snapshot, complete)` marks phase-1
+  `false` / phase-2 `true` (`actions.ts:108,142,150`); the reducer stores `accountComplete`
+  and every reset path (`unlocked`/`locked`/`setNetwork`, initial) sets it `true`
+  (`state.ts`); Home shows a muted "Checking for updates…" cue only while
+  `account !== null && !accountComplete` (`Home.tsx`).
+- **Self-heals and can't stick (verified).** A deadline that cuts phase-2 keeps the
+  incomplete phase-1 result with no error; the next `pollTick` sees `accountComplete: false`
+  and requests a full refresh *without issuing any poll request of its own*
+  (`actions.ts:258-263`), which completes to a `complete:true` snapshot and clears the cue.
+  Independently confirmed the self-heal branch fires `onChanged` with zero network calls, and
+  that a `complete:true` snapshot does NOT take the self-heal branch (so the cue clears and
+  the retry loop stops). The team's fake-timer test walks the whole incomplete→heal→complete
+  chain; the cue persists only while the balance genuinely is incomplete (honest), and clears
+  the moment a full scan lands.
+
+## F13 — CLOSED
+
+- **Eager abort + reducer blanking + post-resolution guard.** `switchNetwork` now calls
+  `discoveryRef.current?.abort()` *before* dispatching `setNetwork`, which blanks the account
+  synchronously in the reducer (`App.tsx:324-328`, `state.ts setNetwork`). Crucially,
+  `startDiscovery` now re-checks `externallyAborted` *after each phase's await, before
+  dispatching* (`actions.ts:139,148`), closing the exact queued-microtask window I flagged:
+  a phase-1 that has already resolved (continuation queued) is dropped silently if the run
+  was aborted on the same frame. The team's `manual`-resolver test reproduces precisely that
+  race (resolve phase-1, then abort synchronously) and asserts no `onSnapshot`/`onError` — it
+  passes. Verified `setNetwork` blanks the account and `abort()` leaves the controller
+  not-busy so the fresh run starts clean.
+
+## Round-5 properties — still hold
+
+Single-flight (poll skipped while a run is busy), the deterministic deadline→error path when
+no snapshot exists, and abort threading (no retry after abort, pool settles) are all still
+green in the suite after the change.
+
+_Round-6 tests used the `.review.test.tsx` suffix, were executed, and were deleted; no source
+files were modified._
