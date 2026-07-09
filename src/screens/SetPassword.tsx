@@ -2,7 +2,7 @@ import type { JSX } from 'react';
 import { useState } from 'react';
 import { strings } from '../strings';
 import { Chrome } from '../components/Chrome';
-import { PasswordInput } from '../components/ui';
+import { PasswordInput, Sheet } from '../components/ui';
 import { assessPassword, type PasswordStrength } from '../password';
 import type { Network } from '../lib';
 
@@ -37,6 +37,9 @@ export function SetPassword(props: {
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [faceId, setFaceId] = useState(false);
+  // Bug B: turning Face ID ON first shows a plain-English explainer (the system
+  // sheet will say "passkey" — Apple's jargon — so we translate it first).
+  const [faceIdExplainer, setFaceIdExplainer] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -125,7 +128,10 @@ export function SetPassword(props: {
               role="switch"
               aria-checked={faceId}
               aria-label={strings.password.faceIdToggle}
-              onClick={() => setFaceId((f) => !f)}
+              onClick={() => {
+                if (faceId) setFaceId(false);
+                else setFaceIdExplainer(true); // explain before enabling (Bug B)
+              }}
             >
               <span className="toggle__knob" />
             </button>
@@ -143,6 +149,27 @@ export function SetPassword(props: {
           </p>
         </div>
       </div>
+
+      {faceIdExplainer ? (
+        <Sheet onScrim={() => setFaceIdExplainer(false)}>
+          <h2 className="sheet__title">{strings.faceId.explainHeading}</h2>
+          <p className="sheet__body">{strings.faceId.explainBody}</p>
+          <div className="sheet__actions">
+            <button
+              className="btn btn--primary btn--block"
+              onClick={() => {
+                setFaceId(true);
+                setFaceIdExplainer(false);
+              }}
+            >
+              {strings.faceId.explainContinue}
+            </button>
+            <button className="btn btn--text btn--block" onClick={() => setFaceIdExplainer(false)}>
+              {strings.faceId.explainNotNow}
+            </button>
+          </div>
+        </Sheet>
+      ) : null}
     </Chrome>
   );
 }

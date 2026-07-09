@@ -74,6 +74,13 @@ export interface Vault {
    * address at the right index when account discovery is unavailable.
    */
   readonly lastReceiveIndex?: Partial<Record<Network, number>>;
+  /**
+   * Last-known highest USED index per chain, per network (not secret). Later
+   * discovery scans anchor their gap window at these high-water marks, so a
+   * fast first-paint scan can never terminate below funds a previous scan
+   * already found.
+   */
+  readonly lastHighWater?: Partial<Record<Network, { receive: number; change: number }>>;
 }
 
 /** Thrown when the supplied password fails GCM authentication. */
@@ -226,6 +233,33 @@ export function setCachedReceiveIndex(network: Network, index: number): void {
   const vault = readVault();
   if (!vault) return;
   writeVault({ ...vault, lastReceiveIndex: { ...vault.lastReceiveIndex, [network]: index } });
+}
+
+/**
+ * Returns the cached per-chain high-water marks (highest used index) for a
+ * network, or null when none recorded. Not secret — indices, not keys.
+ */
+export function getCachedHighWater(network: Network): { receive: number; change: number } | null {
+  const vault = readVault();
+  const hw = vault?.lastHighWater?.[network];
+  if (!hw) return null;
+  const ok = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n >= -1;
+  return ok(hw.receive) && ok(hw.change) ? { receive: hw.receive, change: hw.change } : null;
+}
+
+/**
+ * Records the per-chain high-water marks for a network alongside the vault
+ * (non-secret). Silently no-ops without a vault or on bogus values.
+ */
+export function setCachedHighWater(
+  network: Network,
+  marks: { receive: number; change: number },
+): void {
+  if (!Number.isInteger(marks.receive) || !Number.isInteger(marks.change)) return;
+  if (marks.receive < -1 || marks.change < -1) return;
+  const vault = readVault();
+  if (!vault) return;
+  writeVault({ ...vault, lastHighWater: { ...vault.lastHighWater, [network]: marks } });
 }
 
 // ---------------------------------------------------------------------------

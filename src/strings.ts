@@ -295,6 +295,16 @@ export const strings = {
     emptyHelper: 'Enter all 12 words to continue.',
   },
 
+  // Shown before we trigger the system passkey sheet (SetPassword toggle and
+  // Settings enable), so Apple's "passkey" jargon never lands cold (Bug B).
+  faceId: {
+    explainHeading: 'Turn on Face ID unlock',
+    explainBody:
+      "Your phone will ask to save a passkey. That's just Apple's name for signing in with Face ID — it stays in your iCloud Keychain, and your 12 words are never shared.",
+    explainContinue: 'Continue',
+    explainNotNow: 'Not now',
+  },
+
   banner: {
     practice:
       "Practice mode — these coins are worthless. You're testing safely. Nothing here is real money.",

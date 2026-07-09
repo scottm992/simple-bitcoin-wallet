@@ -1,19 +1,22 @@
 import type { JSX } from 'react';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { strings } from '../strings';
 import { Chrome } from '../components/Chrome';
 import { PasswordInput, Sheet } from '../components/ui';
 import type { Network } from '../lib';
 
 /**
- * Unlock (returning user). Password field, plus a Face ID button when passkey
- * unlock is enabled. The password lives only in local state and is handed to the
- * unlock callback (which calls vault.unlockVault). On success the parent stores
- * the mnemonic in session.ts; this screen never sees it.
+ * Unlock (returning user). The password field is ALWAYS visible. When Face ID
+ * unlock is enabled (and the device supports it), the Face ID prompt is
+ * auto-triggered exactly once on mount — never in a loop — with the password
+ * path right below as the obvious fallback. A failed/cancelled Face ID attempt
+ * falls back to the password silently: no scary error (Bug B). On success the
+ * parent stores the mnemonic in session.ts; this screen never sees it.
  */
 export function Unlock(props: {
   network: Network;
   passkeyEnabled: boolean;
+  passkeySupported: boolean;
   onUnlockPassword: (password: string) => Promise<boolean>;
   onUnlockPasskey: () => Promise<boolean>;
   onRestore: () => void;
@@ -22,7 +25,10 @@ export function Unlock(props: {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showForgot, setShowForgot] = useState(false);
-  const [usePasswordFallback, setUsePasswordFallback] = useState(!props.passkeyEnabled);
+
+  // Face ID is offered only when it's both enabled for this vault AND the
+  // device actually supports platform authenticators (feature detection).
+  const faceId = props.passkeyEnabled && props.passkeySupported;
 
   async function tryPassword(): Promise<void> {
     if (password.length === 0 || busy) return;
@@ -41,11 +47,21 @@ export function Unlock(props: {
     setError(null);
     const ok = await props.onUnlockPasskey();
     if (!ok) {
-      setError(strings.unlock.faceIdFailed);
-      setUsePasswordFallback(true);
+      // Cancelled or failed: fall back to the password silently — the field is
+      // right below, and Face ID can be retried with the button (Bug B).
       setBusy(false);
     }
   }
+
+  // Auto-trigger Face ID exactly once on mount. The ref guard makes this
+  // single-shot even under StrictMode's double-effect and across re-renders.
+  const autoTriedRef = useRef(false);
+  useEffect(() => {
+    if (!faceId || autoTriedRef.current) return;
+    autoTriedRef.current = true;
+    void tryPasskey();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <Chrome network={props.network} brand>
@@ -58,51 +74,34 @@ export function Unlock(props: {
         </div>
 
         <div style={{ marginTop: 'var(--sp-8)' }}>
-          {props.passkeyEnabled && !usePasswordFallback ? (
-            <>
-              <button
-                className="btn btn--primary btn--block"
-                onClick={tryPasskey}
-                disabled={busy}
-              >
-                {strings.unlock.useFaceId}
-              </button>
-              <button
-                className="btn btn--text btn--block"
-                onClick={() => setUsePasswordFallback(true)}
-              >
-                {strings.unlock.usePassword}
-              </button>
-            </>
-          ) : (
-            <>
-              <label className="label" htmlFor="unlock-pw">
-                {strings.unlock.passwordLabel}
-              </label>
-              <div id="unlock-pw">
-                <PasswordInput
-                  value={password}
-                  onChange={setPassword}
-                  autoComplete="current-password"
-                  ariaLabel={strings.unlock.passwordLabel}
-                  invalid={error !== null}
-                  autoFocus
-                  onEnter={tryPassword}
-                />
-              </div>
-              {error ? <p className="error-text">{error}</p> : null}
-            </>
-          )}
+          <label className="label" htmlFor="unlock-pw">
+            {strings.unlock.passwordLabel}
+          </label>
+          <div id="unlock-pw">
+            <PasswordInput
+              value={password}
+              onChange={setPassword}
+              autoComplete="current-password"
+              ariaLabel={strings.unlock.passwordLabel}
+              invalid={error !== null}
+              autoFocus={!faceId}
+              onEnter={tryPassword}
+            />
+          </div>
+          {error ? <p className="error-text">{error}</p> : null}
         </div>
 
         <div className="bottom-actions">
-          {usePasswordFallback || !props.passkeyEnabled ? (
-            <button
-              className="btn btn--primary btn--block"
-              onClick={tryPassword}
-              disabled={busy || password.length === 0}
-            >
-              {strings.unlock.unlock}
+          <button
+            className="btn btn--primary btn--block"
+            onClick={tryPassword}
+            disabled={busy || password.length === 0}
+          >
+            {strings.unlock.unlock}
+          </button>
+          {faceId ? (
+            <button className="btn btn--secondary btn--block" onClick={tryPasskey} disabled={busy}>
+              {strings.unlock.useFaceId}
             </button>
           ) : null}
           <button className="btn btn--text btn--block" onClick={() => setShowForgot(true)}>

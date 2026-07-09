@@ -27,9 +27,31 @@ import type { WalletUtxo } from './tx';
  * singleton directly.
  */
 export interface AccountApi {
-  getAddressStats(network: Network, address: string): Promise<AddressStats>;
-  getUtxos(network: Network, address: string): Promise<ApiUtxo[]>;
-  getAddressTxs(network: Network, address: string): Promise<AddressTx[]>;
+  getAddressStats(network: Network, address: string, signal?: AbortSignal): Promise<AddressStats>;
+  getUtxos(network: Network, address: string, signal?: AbortSignal): Promise<ApiUtxo[]>;
+  getAddressTxs(network: Network, address: string, signal?: AbortSignal): Promise<AddressTx[]>;
+}
+
+/**
+ * A run-scoped response cache shared between the fast phase-1 scan and the full
+ * phase-2 scan of one discovery run, so phase 2 only pays for the EXTENSION of
+ * the scan window rather than re-fetching everything phase 1 already saw.
+ */
+export interface ScanCache {
+  readonly stats: Map<string, AddressStats>;
+  readonly utxos: Map<string, ApiUtxo[]>;
+  readonly txs: Map<string, AddressTx[]>;
+}
+
+/** Creates an empty {@link ScanCache} for one discovery run. */
+export function createScanCache(): ScanCache {
+  return { stats: new Map(), utxos: new Map(), txs: new Map() };
+}
+
+/** Known highest USED index per chain from a previous scan (-1 = none known). */
+export interface ChainHighWater {
+  readonly receive: number;
+  readonly change: number;
 }
 
 /**
@@ -56,6 +78,17 @@ export interface DiscoveryOptions {
   readonly concurrency: number;
   /** Cap on merged activity items returned. Default 25. */
   readonly activityLimit: number;
+  /**
+   * Known highest used index per chain from a previous scan. Indices up to the
+   * mark are always scanned (their balances are needed regardless), and the
+   * gap-limit window counts from there — so a fast (small-gap) scan can never
+   * terminate before reaching funds that were already known to exist.
+   */
+  readonly highWater?: ChainHighWater;
+  /** Aborts the whole discovery run (threaded into every request). */
+  readonly signal?: AbortSignal;
+  /** Run-scoped response cache shared between phases (see {@link ScanCache}). */
+  readonly cache?: ScanCache;
 }
 
 /** Default discovery options. Gap limit follows the BIP44 standard (F8). */
@@ -99,6 +132,10 @@ export interface AccountSnapshot {
   readonly activity: readonly ActivityItem[];
   /** Every address discovered as used (either chain), for reference/debugging. */
   readonly usedAddresses: readonly string[];
+  /** Highest used receive (chain-0) index found, -1 when none. Cached as a high-water mark. */
+  readonly receiveHighWater: number;
+  /** Highest used change (chain-1) index found, -1 when none. Cached as a high-water mark. */
+  readonly changeHighWater: number;
 }
 
 /**
@@ -115,17 +152,25 @@ export class AccountDiscoveryError extends Error {
   }
 }
 
-/** Runs `worker` over `items` with at most `concurrency` in flight, preserving order. */
-async function mapWithConcurrency<T, R>(
+/**
+ * Runs `worker` over `items` with at most `concurrency` in flight, preserving
+ * order. Settles deterministically: a rejected worker rejects the aggregate via
+ * `Promise.all` (which holds a handler on every runner, so no rejection is ever
+ * left stranded/unhandled), and an aborted signal stops runners from picking up
+ * further items. There is no path on which the returned promise never settles.
+ */
+export async function mapWithConcurrency<T, R>(
   items: readonly T[],
   concurrency: number,
   worker: (item: T, index: number) => Promise<R>,
+  signal?: AbortSignal,
 ): Promise<R[]> {
   const results = new Array<R>(items.length);
   let next = 0;
   const limit = Math.max(1, Math.min(concurrency, items.length || 1));
   async function runner(): Promise<void> {
     for (;;) {
+      if (signal?.aborted) throw new AccountDiscoveryError(new Error('aborted'));
       const i = next++;
       if (i >= items.length) return;
       const item = items[i];
@@ -153,8 +198,11 @@ interface ScannedAddress {
 /**
  * Scans one chain (receive or change) with a gap limit: derive addresses in
  * batches, look up each address's stats, and stop once `gapLimit` consecutive
- * never-used addresses are seen (or `maxIndex` is reached). Returns the used
- * addresses found, plus the index of the first unused address (THE next address).
+ * never-used addresses are seen (or `maxIndex` is reached). Indices up to a
+ * known high-water mark are always scanned regardless of the gap counter, so a
+ * small-gap fast scan can never terminate below funds a previous scan already
+ * found. Returns the used addresses, the first-unused index (THE next address),
+ * and the highest used index seen (-1 when none) for high-water caching.
  */
 async function scanChain(
   network: Network,
@@ -162,25 +210,38 @@ async function scanChain(
   derive: AddressDeriver,
   api: AccountApi,
   opts: DiscoveryOptions,
-): Promise<{ used: ScannedAddress[]; nextUnusedIndex: number; nextUnusedAddress: string }> {
+  highWater: number,
+): Promise<{
+  used: ScannedAddress[];
+  nextUnusedIndex: number;
+  nextUnusedAddress: string;
+  highestUsedIndex: number;
+}> {
   const used: ScannedAddress[] = [];
   let consecutiveUnused = 0;
   let nextUnusedIndex = 0;
   let nextUnusedAddress = derive(chain, 0).address;
   let firstUnusedRecorded = false;
+  let highestUsedIndex = -1;
 
   let index = 0;
-  while (index <= opts.maxIndex && consecutiveUnused < opts.gapLimit) {
-    // Derive a batch, but never scan past maxIndex or past the gap.
-    const remainingByGap = opts.gapLimit - consecutiveUnused;
+  while (index <= opts.maxIndex && (consecutiveUnused < opts.gapLimit || index <= highWater)) {
+    // Derive a batch, but never scan past maxIndex; below the high-water mark
+    // the gap counter must not shrink the batch (those indices are scanned
+    // unconditionally — their balances are needed regardless).
+    const remainingByGap =
+      index <= highWater ? opts.concurrency : opts.gapLimit - consecutiveUnused;
     const remainingByCap = opts.maxIndex - index + 1;
     const batchSize = Math.max(1, Math.min(opts.concurrency, remainingByGap, remainingByCap));
 
     const batch: DerivedAddress[] = [];
     for (let k = 0; k < batchSize; k++) batch.push(derive(chain, index + k));
 
-    const statsList = await mapWithConcurrency(batch, opts.concurrency, (d) =>
-      api.getAddressStats(network, d.address),
+    const statsList = await mapWithConcurrency(
+      batch,
+      opts.concurrency,
+      (d) => api.getAddressStats(network, d.address, opts.signal),
+      opts.signal,
     );
 
     for (let k = 0; k < batch.length; k++) {
@@ -190,6 +251,7 @@ async function scanChain(
       if (isUsed(stats)) {
         used.push({ derived, stats });
         consecutiveUnused = 0;
+        highestUsedIndex = index + k;
       } else {
         if (!firstUnusedRecorded) {
           nextUnusedIndex = index + k;
@@ -197,7 +259,7 @@ async function scanChain(
           firstUnusedRecorded = true;
         }
         consecutiveUnused++;
-        if (consecutiveUnused >= opts.gapLimit) break;
+        if (consecutiveUnused >= opts.gapLimit && index + k > highWater) break;
       }
     }
     index += batch.length;
@@ -211,7 +273,7 @@ async function scanChain(
     nextUnusedAddress = derive(chain, nextIdx).address;
   }
 
-  return { used, nextUnusedIndex, nextUnusedAddress };
+  return { used, nextUnusedIndex, nextUnusedAddress, highestUsedIndex };
 }
 
 /**
@@ -233,14 +295,15 @@ export async function discoverAccount(
   options: Partial<DiscoveryOptions> = {},
 ): Promise<AccountSnapshot> {
   const opts: DiscoveryOptions = { ...DEFAULT_DISCOVERY_OPTIONS, ...options };
+  const cachedApi = opts.cache ? withScanCache(api, opts.cache) : api;
 
   let receive: Awaited<ReturnType<typeof scanChain>>;
   let change: Awaited<ReturnType<typeof scanChain>>;
   try {
     // Chains are independent; scan them concurrently.
     [receive, change] = await Promise.all([
-      scanChain(network, 0, derive, api, opts),
-      scanChain(network, 1, derive, api, opts),
+      scanChain(network, 0, derive, cachedApi, opts, opts.highWater?.receive ?? -1),
+      scanChain(network, 1, derive, cachedApi, opts, opts.highWater?.change ?? -1),
     ]);
   } catch (err) {
     throw new AccountDiscoveryError(err);
@@ -262,13 +325,19 @@ export async function discoverAccount(
   try {
     const usedDerived = usedScanned.map((s) => s.derived);
 
-    const utxoLists = await mapWithConcurrency(usedDerived, opts.concurrency, (d) =>
-      api.getUtxos(network, d.address),
+    const utxoLists = await mapWithConcurrency(
+      usedDerived,
+      opts.concurrency,
+      (d) => cachedApi.getUtxos(network, d.address, opts.signal),
+      opts.signal,
     );
     utxos = collectUtxos(usedDerived, utxoLists);
 
-    const txLists = await mapWithConcurrency(usedDerived, opts.concurrency, (d) =>
-      api.getAddressTxs(network, d.address),
+    const txLists = await mapWithConcurrency(
+      usedDerived,
+      opts.concurrency,
+      (d) => cachedApi.getAddressTxs(network, d.address, opts.signal),
+      opts.signal,
     );
     activity = mergeActivity(txLists, opts.activityLimit);
   } catch (err) {
@@ -284,6 +353,38 @@ export async function discoverAccount(
     changeAddress: change.nextUnusedAddress,
     activity,
     usedAddresses: usedScanned.map((s) => s.derived.address),
+    receiveHighWater: receive.highestUsedIndex,
+    changeHighWater: change.highestUsedIndex,
+  };
+}
+
+/**
+ * Wraps an {@link AccountApi} with a run-scoped cache so the second (full)
+ * phase of a discovery run never re-fetches what the first (fast) phase saw.
+ */
+function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
+  return {
+    getAddressStats: async (network, address, signal) => {
+      const hit = cache.stats.get(address);
+      if (hit !== undefined) return hit;
+      const value = await api.getAddressStats(network, address, signal);
+      cache.stats.set(address, value);
+      return value;
+    },
+    getUtxos: async (network, address, signal) => {
+      const hit = cache.utxos.get(address);
+      if (hit !== undefined) return hit;
+      const value = await api.getUtxos(network, address, signal);
+      cache.utxos.set(address, value);
+      return value;
+    },
+    getAddressTxs: async (network, address, signal) => {
+      const hit = cache.txs.get(address);
+      if (hit !== undefined) return hit;
+      const value = await api.getAddressTxs(network, address, signal);
+      cache.txs.set(address, value);
+      return value;
+    },
   };
 }
 

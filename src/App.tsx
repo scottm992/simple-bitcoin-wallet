@@ -13,7 +13,6 @@ import {
   getCachedReceiveIndex,
   isPasskeyEnabled,
   isPasskeySupported,
-  setCachedReceiveIndex,
   setVaultNetwork,
   unlockVault,
   unlockWithPasskey,
@@ -31,7 +30,8 @@ import {
   getMnemonic,
   isUnlocked,
 } from './session';
-import { loadAccount, loadFees, loadPrice, signAndBroadcast } from './actions';
+import { DiscoveryController, loadFees, loadPrice, signAndBroadcast } from './actions';
+import type { AccountSnapshot } from './lib/account';
 import type { DisplayUnit } from './display';
 
 import { Welcome } from './screens/Welcome';
@@ -91,6 +91,21 @@ export default function App(): JSX.Element {
   // Which activity txid to auto-open when navigating from Home (optional).
   const [explainerOpen, setExplainerOpen] = useState(false);
 
+  // Bug A: single-flight discovery coordinator (at most one run in flight;
+  // cheap poll ticks are skipped while anything runs). Lives in a ref so the
+  // same instance survives re-renders.
+  const discoveryRef = useRef<DiscoveryController | null>(null);
+  function discovery(): DiscoveryController {
+    discoveryRef.current ??= new DiscoveryController();
+    return discoveryRef.current;
+  }
+  // Latest account snapshot, mirrored into a ref so the poll interval closure
+  // always sees the current value without resetting its cadence.
+  const accountRef = useRef<AccountSnapshot | null>(null);
+  useEffect(() => {
+    accountRef.current = state.account;
+  }, [state.account]);
+
   // ---- Boot: detect existing vault, install session guards ----------------
   useEffect(() => {
     const network = getVaultNetwork() ?? 'mainnet';
@@ -104,9 +119,11 @@ export default function App(): JSX.Element {
     });
     const teardown = installSessionGuards();
     const unsub = onLock(() => {
-      // Wipe any in-flight draft secrets and route to Unlock.
+      // Wipe any in-flight draft secrets, stop any in-flight discovery, and
+      // route to Unlock.
       draftWordsRef.current = null;
       restorePhraseRef.current = null;
+      discoveryRef.current?.abort();
       clearSettingsReveal();
       dispatch({ type: 'locked' });
     });
@@ -122,26 +139,27 @@ export default function App(): JSX.Element {
   }, [state.network]);
 
   // ---- Data loading: account, price, fees --------------------------------
-  const refreshAll = useCallback(async () => {
+  // Full (two-phase) discovery. Used ONLY on: unlock, network switch, manual
+  // Try again / refresh, and after a broadcast. Single-flight: a new call
+  // aborts any in-flight run and starts fresh (Bug A). The run itself is
+  // deadline-bounded, so accountStatus can never sit on 'loading' forever.
+  const refreshAll = useCallback(() => {
     if (!isUnlocked()) return;
     const network = state.network;
     dispatch({ type: 'accountLoading' });
-    // Price + fees are independent and non-blocking.
+    // Price + fees are independent, cheap single requests.
     void loadPrice().then((btcUsd) => dispatch({ type: 'priceLoaded', btcUsd }));
     void loadFees(network)
       .then((feeEstimates) => dispatch({ type: 'feesLoaded', feeEstimates }))
       .catch(() => {
         /* fees unavailable; Send disables Review until present */
       });
-    try {
-      const account = await loadAccount(network);
-      // Remember the next-unused receive index (non-secret) so Receive can
-      // derive the right address locally if a later discovery is unavailable.
-      setCachedReceiveIndex(network, account.receiveIndex);
-      dispatch({ type: 'accountLoaded', account });
-    } catch {
-      dispatch({ type: 'accountError' });
-    }
+    discovery().refresh({
+      network,
+      onSnapshot: (account) => dispatch({ type: 'accountLoaded', account }),
+      onError: () => dispatch({ type: 'accountError' }),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.network]);
 
   // Load whenever we're on a wallet screen and unlocked.
@@ -154,20 +172,36 @@ export default function App(): JSX.Element {
 
   useEffect(() => {
     if (onWalletScreen && isUnlocked() && state.accountStatus === 'loading' && state.account === null) {
-      void refreshAll();
+      refreshAll();
     }
   }, [onWalletScreen, state.accountStatus, state.account, refreshAll]);
 
-  // Poll every 30s while unlocked + visible.
+  // Cheap poll every 30s while unlocked + visible (Bug A): NEVER a full rescan.
+  // Re-checks only the known-used addresses plus the receive/change tips (a
+  // fresh wallet costs 2 requests) and refreshes fees/price. Skipped entirely
+  // while a discovery run is in flight. A detected on-chain change triggers one
+  // full discovery.
   useEffect(() => {
     if (!onWalletScreen) return;
     const id = setInterval(() => {
-      if (isUnlocked() && document.visibilityState === 'visible') {
-        void refreshAll();
-      }
+      if (!isUnlocked() || document.visibilityState !== 'visible') return;
+      if (discovery().busy) return; // a full run is already crawling: skip
+      void loadPrice().then((btcUsd) => dispatch({ type: 'priceLoaded', btcUsd }));
+      void loadFees(state.network)
+        .then((feeEstimates) => dispatch({ type: 'feesLoaded', feeEstimates }))
+        .catch(() => {
+          /* fees unavailable; retried next tick */
+        });
+      const account = accountRef.current;
+      if (!account) return; // nothing known: wait for a manual Try again
+      discovery().pollTick({
+        network: state.network,
+        account,
+        onChanged: () => refreshAll(),
+      });
     }, 30_000);
     return () => clearInterval(id);
-  }, [onWalletScreen, refreshAll]);
+  }, [onWalletScreen, state.network, refreshAll]);
 
   // ---- Navigation helpers -------------------------------------------------
   const goHome = useCallback(() => dispatch({ type: 'navigate', screen: 'home' }), []);
@@ -504,6 +538,7 @@ export default function App(): JSX.Element {
           <Unlock
             network={network}
             passkeyEnabled={state.passkeyEnabled}
+            passkeySupported={state.passkeySupported}
             onUnlockPassword={unlockPassword}
             onUnlockPasskey={unlockPasskey}
             onRestore={startRestore}

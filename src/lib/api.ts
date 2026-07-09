@@ -13,6 +13,14 @@ import { MAX_SUPPLY_SATS } from './format';
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 /**
+ * Timeout for address-discovery GETs (stats / utxos / txs). Deliberately short:
+ * mempool.space stalls burst traffic until the client gives up, so a long
+ * timeout turns a throttled burst into minutes of dead air. 8s per request,
+ * with one short-backoff retry, keeps a stalled lane from wedging a scan.
+ */
+const DISCOVERY_TIMEOUT_MS = 8_000;
+
+/**
  * Fee-rate sanity window (sat/vByte) applied to untrusted estimates from
  * mempool.space (F1). A legitimate rate is ~1–50 even in heavy congestion; we
  * accept a generous ceiling but clamp anything outside `[MIN, MAX]` so a
@@ -165,25 +173,67 @@ export interface AddressTx {
   readonly netSats: bigint;
 }
 
-/** Performs a single fetch bounded by an AbortController timeout. */
-async function fetchOnce(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+/** Per-request options for GETs: an abort signal and a timeout override. */
+interface GetOpts {
+  readonly signal?: AbortSignal | undefined;
+  readonly timeoutMs?: number;
+}
+
+/**
+ * Performs a single fetch bounded by an AbortController timeout, additionally
+ * aborted when the caller's `signal` fires (so an in-flight discovery run can
+ * be cancelled as a whole).
+ */
+async function fetchOnce(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const onAbort = (): void => controller.abort();
+  if (signal?.aborted) controller.abort();
+  signal?.addEventListener('abort', onAbort);
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } catch (err) {
     throw new ApiNetworkError('Network request failed', err);
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
   }
 }
 
-/** GET a URL as text, with one retry on transport failure. */
-async function getText(url: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<string> {
+/** A short sleep used between retry attempts; resolves early if aborted. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(t);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    signal?.addEventListener('abort', done);
+  });
+}
+
+/**
+ * GET a URL as text, with one retry on transport failure after a short,
+ * jittered backoff (300–800 ms) — enough to step out of a throttled burst
+ * without piling on. Never retries API rejections, and never retries once the
+ * caller's signal has aborted.
+ */
+async function getText(url: string, opts: GetOpts = {}): Promise<string> {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   let lastErr: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      await sleep(300 + Math.floor(Math.random() * 500), opts.signal);
+    }
+    if (opts.signal?.aborted) break;
     try {
-      const res = await fetchOnce(url, { method: 'GET' }, timeoutMs);
+      const res = await fetchOnce(url, { method: 'GET' }, timeoutMs, opts.signal);
       const body = await res.text();
       if (!res.ok) {
         throw new ApiResponseError(res.status, body);
@@ -193,14 +243,15 @@ async function getText(url: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<str
       // Retry only transport failures, never API rejections.
       if (err instanceof ApiResponseError) throw err;
       lastErr = err;
+      if (opts.signal?.aborted) break;
     }
   }
   throw lastErr instanceof Error ? lastErr : new ApiNetworkError('Network request failed', lastErr);
 }
 
 /** GET a URL and parse it as JSON. */
-async function getJson<T>(url: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
-  const text = await getText(url, timeoutMs);
+async function getJson<T>(url: string, opts: GetOpts = {}): Promise<T> {
+  const text = await getText(url, opts);
   try {
     return JSON.parse(text) as T;
   } catch (err) {
@@ -216,8 +267,15 @@ async function getJson<T>(url: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<
  * @param network - The active network.
  * @param address - The address to query.
  */
-export async function getAddressStats(network: Network, address: string): Promise<AddressStats> {
-  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}`);
+export async function getAddressStats(
+  network: Network,
+  address: string,
+  signal?: AbortSignal,
+): Promise<AddressStats> {
+  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}`, {
+    signal,
+    timeoutMs: DISCOVERY_TIMEOUT_MS,
+  });
   const obj = asObject(raw, 'address stats');
   const chain = asObject(obj['chain_stats'], 'chain_stats');
   const mem = asObject(obj['mempool_stats'], 'mempool_stats');
@@ -241,8 +299,15 @@ export async function getAddressStats(network: Network, address: string): Promis
  * @param network - The active network.
  * @param address - The address to query.
  */
-export async function getUtxos(network: Network, address: string): Promise<ApiUtxo[]> {
-  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/utxo`);
+export async function getUtxos(
+  network: Network,
+  address: string,
+  signal?: AbortSignal,
+): Promise<ApiUtxo[]> {
+  const raw = await getJson<unknown>(
+    `${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/utxo`,
+    { signal, timeoutMs: DISCOVERY_TIMEOUT_MS },
+  );
   const arr = asArray(raw, 'utxo list');
   return arr.map((entry) => {
     const u = asObject(entry, 'utxo');
@@ -319,8 +384,15 @@ export async function broadcastTx(network: Network, txHex: string): Promise<stri
  * @param network - The active network.
  * @param address - The address to query.
  */
-export async function getAddressTxs(network: Network, address: string): Promise<AddressTx[]> {
-  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/txs`);
+export async function getAddressTxs(
+  network: Network,
+  address: string,
+  signal?: AbortSignal,
+): Promise<AddressTx[]> {
+  const raw = await getJson<unknown>(
+    `${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/txs`,
+    { signal, timeoutMs: DISCOVERY_TIMEOUT_MS },
+  );
   const arr = asArray(raw, 'tx list');
   return arr.map((entry) => {
     const tx = asObject(entry, 'tx');

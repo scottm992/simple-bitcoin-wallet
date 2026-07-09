@@ -55,6 +55,8 @@ function makeAccount(values: readonly bigint[]): AccountSnapshot {
     changeAddress: 'bc1qchange',
     activity: [],
     usedAddresses: [],
+    receiveHighWater: -1,
+    changeHighWater: -1,
   };
 }
 

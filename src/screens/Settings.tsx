@@ -7,7 +7,7 @@ import type { Network } from '../lib';
 
 const APP_VERSION = '1.0.0';
 
-type SettingsSheet = 'none' | 'reauth' | 'switch' | 'delete' | 'safety';
+type SettingsSheet = 'none' | 'reauth' | 'switch' | 'delete' | 'safety' | 'faceid';
 
 /**
  * Settings: lock, show phrase (password re-entry), Face ID toggle, network
@@ -95,7 +95,12 @@ export function Settings(props: {
                 role="switch"
                 aria-checked={props.passkeyEnabled}
                 aria-label={strings.password.faceIdToggle}
-                onClick={toggleFaceId}
+                onClick={() => {
+                  // Bug B: explain the system "passkey" sheet in plain English
+                  // BEFORE triggering it. Disabling needs no explainer.
+                  if (props.passkeyEnabled) void toggleFaceId();
+                  else setSheet('faceid');
+                }}
                 disabled={faceIdBusy}
               >
                 <span className="toggle__knob" />
@@ -177,6 +182,28 @@ export function Settings(props: {
             </button>
             <button className="btn btn--text btn--block" onClick={closeSheet}>
               {strings.common.cancel}
+            </button>
+          </div>
+        </Sheet>
+      ) : null}
+
+      {/* Face ID explainer sheet (Bug B): shown before the system passkey sheet. */}
+      {sheet === 'faceid' ? (
+        <Sheet onScrim={closeSheet}>
+          <h2 className="sheet__title">{strings.faceId.explainHeading}</h2>
+          <p className="sheet__body">{strings.faceId.explainBody}</p>
+          <div className="sheet__actions">
+            <button
+              className="btn btn--primary btn--block"
+              onClick={() => {
+                closeSheet();
+                void toggleFaceId();
+              }}
+            >
+              {strings.faceId.explainContinue}
+            </button>
+            <button className="btn btn--text btn--block" onClick={closeSheet}>
+              {strings.faceId.explainNotNow}
             </button>
           </div>
         </Sheet>

@@ -57,7 +57,7 @@ the mnemonic in at call time and let it go out of scope.
 
 ## `api.ts` — mempool.space REST client
 
-Every call takes `network: Network` first. GETs retry once on transport failure; broadcast never retries. 15s timeout.
+Every call takes `network: Network` first. GETs retry once on transport failure after a short jittered backoff (300–800 ms); broadcast never retries. Discovery GETs (stats/utxos/txs) use an 8s timeout and accept an optional `AbortSignal` so a whole discovery run can be cancelled; other calls use 15s.
 
 **Types**
 - `AddressStats { confirmedSats; pendingSats; fundedSats; spentSats }` (all `bigint`)
@@ -73,11 +73,11 @@ Every call takes `network: Network` first. GETs retry once on transport failure;
 
 **Functions**
 - `apiBaseUrl(network): string`
-- `getAddressStats(network, address): Promise<AddressStats>`
-- `getUtxos(network, address): Promise<ApiUtxo[]>`
+- `getAddressStats(network, address, signal?): Promise<AddressStats>`
+- `getUtxos(network, address, signal?): Promise<ApiUtxo[]>`
 - `getFeeEstimates(network): Promise<FeeEstimates>`
 - `broadcastTx(network, txHex): Promise<string>` — returns txid; surfaces API error text.
-- `getAddressTxs(network, address): Promise<AddressTx[]>`
+- `getAddressTxs(network, address, signal?): Promise<AddressTx[]>`
 - `getBtcUsdPrice(): Promise<number>` — always mainnet `/v1/prices`.
 
 ---
@@ -101,6 +101,7 @@ remains a fallback. Secrets are never logged or placed in errors.
 - `vaultExists(): boolean`; `deleteVault(): void`
 - `getVaultNetwork(): Network | null`; `setVaultNetwork(network): void`
 - `getCachedReceiveIndex(network): number | null`; `setCachedReceiveIndex(network, index): void` — non-secret last-known next-unused receive index per network, stored alongside the vault. Lets Receive derive a correct address locally when discovery is unavailable (fall back to index 0 if never recorded).
+- `getCachedHighWater(network): { receive; change } | null`; `setCachedHighWater(network, marks): void` — non-secret per-chain highest-used-index marks; later discovery scans anchor their gap window here so a fast first-paint scan can't terminate below known funds.
 
 **Passkey functions** (all fail gracefully with typed errors)
 - `isPasskeySupported(): boolean` — cheap, side-effect-free capability check (use this by default).
