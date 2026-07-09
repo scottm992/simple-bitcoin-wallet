@@ -261,3 +261,61 @@ and now blocks legitimate small sends at honest fee rates, surfacing as the F4
 
 _Round-2 tests used the `.review.test.ts` suffix, were executed, and were deleted; no
 source files were modified._
+
+---
+
+# Round 3 — Re-audit of the F10 fix
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 1 (Medium)**
+
+`npm test` = 105 passing, `tsc --noEmit` clean, `npm run build` clean, prod CSP still
+`script-src 'self'`. Verified every requested scenario against the new code (throwaway
+tests deleted).
+
+## F10 — PARTIALLY CLOSED
+
+The main dead-end is fixed and the hard limits are genuinely hard:
+
+- **Small-send consent path works (verified).** A $12 send (3,000 sats) at an honest
+  30 sat/vB, and a $20 send at 120 sat/vB, both trip the compose-time notice
+  (`highFee`), show real numbers + a "Send anyway", and `buildAndSignTx(... allowHighFee:true)`
+  then builds and signs — no loop. `allowHighFee` rides `PendingSend` through the Review
+  dry-run *and* the broadcast build (`App.tsx:348,363` → `actions.ts:110`), so all three
+  use identical params.
+- **Hard caps are not bypassable (verified).** The original 5000 sat/vB sendMax drain
+  still throws `FeeTooHighError` *with `allowHighFee:true`* (rate cap moved above the
+  `allowHighFee` gate, `tx.ts:325`); the 1,000,000-sat absolute ceiling likewise throws
+  with the flag set (30-input sweep at 500 sat/vB, `tx.ts:380`). Only the 25% rule is
+  consent-gated.
+- **Consent can't be set silently.** `review(true)` is reachable only from the
+  "Send anyway" button, which renders only when `highFee` is true (with the notice). A
+  fresh `PendingSend` is built on every compose from live state, so `allowHighFee` never
+  leaks across sends, tier/amount/recipient edits, or a back-navigation (Send remounts
+  with empty local state).
+- **Blocked-state copy is now honest** — `'fee-too-high'` vs `'stale'` reasons
+  (`Review.tsx:58-79`).
+
+### F11 — [SEV-Medium] Compose fee estimate vs. build fee diverge at the dust-fold boundary → the F10 loop returns
+
+- **Where:** `Send.tsx:92-149` (compose `estInputs`/`highFee` uses a 2-output estimate)
+  vs `tx.ts:273-288` (`selectCoins` folds a sub-dust change into the fee, 1 output);
+  `App.tsx:319-326` (`FeeTooHighError` → `{ok:false}`); `Review.tsx:58-79`.
+- **Scenario (verified):** Single 17,500-sat UTXO, send 13,000 at an honest 30 sat/vB.
+  Compose estimates the 2-output fee (4,230) → `highFee` is **false** → the normal Review
+  button shows, **no** "Send anyway", `allowHighFee` stays false. But the real build finds
+  the change (270 sats) is dust, folds it, and the actual fee becomes 4,500 → crosses 25%
+  → `buildAndSignTx` throws `FeeTooHighError`. Review shows the blocked `'fee-too-high'`
+  screen, whose copy says *"you can still choose to send it anyway from there"* — yet going
+  back to Send shows no Send-anyway (compose still says not-high-fee). The user loops on a
+  narrow but realistic band of small amounts (~$8-13 at standard fees), with misleading
+  copy and no path. Not fund-loss — it fails safe (blocks) — but it is the exact F10 dead-end,
+  re-narrowed to the dust boundary.
+- **Fix:** Make the compose pre-check use the same dust-fold logic as `selectCoins`
+  (compute the real selected-input fee incl. the no-change/fold branch), OR when the Review
+  dry-run throws `FeeTooHighError` on a build the user did NOT consent to, surface the
+  consent "Send anyway" from the Review blocked-state itself rather than bouncing them to a
+  Send screen that won't offer it. A minor related nit: the compose notice shows the 2-output
+  estimate, which can differ from the Review's actual fee by up to ~dust.
+
+_Round-3 tests used the `.review.test.ts` suffix, were executed, and were deleted; no source
+files were modified._
