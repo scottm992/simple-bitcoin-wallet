@@ -361,3 +361,83 @@ Drift is eliminated by construction, and the blocked state is no longer a dead e
 
 _Round-4 tests used the `.review.test.ts` suffix, were executed, and were deleted; no
 source files were modified._
+
+---
+
+# Round 5 — Re-audit of the network overhaul (Bug A single-flight/two-phase; Bug B Face ID jargon)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 2 (both Low)**
+
+`npm test` = 128 passing, `tsc --noEmit` clean, `npm run build` clean, prod CSP still
+`script-src 'self'`, no `console.*` in source. Verified each risk area with throwaway
+tests (deleted). The restructure is well-built; two low-severity display/edge gaps.
+
+## Per-area verdicts
+
+- **1. Funds-display correctness — SOUND (one Low, F12).** The *final* (phase-2) scan
+  always starts at index 0 with the BIP44 gap-20, so a stale, missing, or ahead-of-reality
+  cached high-water mark can never hide funds — it only forces extra scanning and
+  self-corrects the persisted mark (verified: gap-band funds found; a mark of 50/10,000
+  with funds at index 3 still finds them and rewrites the mark to 3; index-0 funds found
+  under a high mark). Marks are per-network keyed, so no practice/live cache mixup. The
+  run-scoped `ScanCache` returns identical per-address data across phases (no double-fetch).
+- **2. Races — SOUND.** Superseded runs are safe: a mid-flight abort rejects (no dispatch),
+  and an already-resolved phase-1 dispatches *before* the abort (older data, immediately
+  replaced by the new run); `onError` is gated by `externallyAborted`, so a superseded run
+  never flips the UI to error (matches the team's own test). Lock aborts the run and, being
+  external, suppresses both `onError` and any post-lock `onSnapshot`; the snapshot carries no
+  secrets. Single-flight (`busy`/`current`/`pollBusy`) prevents a poll from ever starting a
+  second full run.
+- **3. Deadline interplay — SOUND.** Phase-1 dispatches `accountLoaded` (status `ready`)
+  immediately, so there is no open-ended skeleton and no "updating" state that can stick:
+  deadline during phase-1 → error; during phase-2 → keep phase-1. (Flip side is F12.)
+- **4. Abort threading (api.ts) — SOUND.** No retry once the signal aborts; the retry
+  backoff `sleep` resolves early on abort; aborted requests surface as swallowed
+  `ApiNetworkError` inside the superseded run (never a user-facing error); the concurrency
+  pool always settles (verified: pre-aborted signal rejects promptly; a hanging run rejects
+  on abort).
+- **5. sendMax / UTXO snapshot — SOUND.** The Review dry-run and the broadcast both build
+  from the *same current* `state.account`, so they can't diverge. A sendMax fired during a
+  phase-1 partial sweeps only the partial UTXO set (leaves any gap-band UTXOs behind — not a
+  loss, recovered on the next scan); folded into F12.
+- **6. Unlock auto-passkey / Bug B — SOUND.** `autoTriedRef` makes the auto-trigger
+  single-shot (StrictMode-safe); cancel/fail falls back silently to the always-visible
+  password field; the passkey path doesn't touch the F6 wrong-password throttle. Bug B: a
+  plain-English explainer sheet precedes the system "passkey" prompt in both SetPassword and
+  Settings, opt-in only.
+
+## New findings
+
+### F12 — [SEV-Low] An understated phase-1 balance can be presented as final ('ready') with no "updating" cue
+
+- **Where:** `actions.ts:126-148` (phase-1 `onSnapshot` then phase-2; on any throw with
+  `gotSnapshot` the phase-1 result is kept), `App.tsx:159` (`onSnapshot → accountLoaded`,
+  status `ready`); `state.ts` has no partial/updating status.
+- **Scenario (verified):** funds at a receive index in the gap-6..gap-20 band (uncommon but
+  real — address gaps, or a seed used elsewhere) make phase-1 (gap-5) report a *lower*
+  balance; if phase-2 is then cut off (the 20s deadline on a throttled network — exactly
+  Bug A's condition, or a lock/network-switch in the ~1-2s window), the understated phase-1
+  balance stays on screen as a settled `ready` value with no error and no "still checking"
+  indicator. Direction is safe (understated, never inflated; the send dry-run uses the same
+  partial set so no bad tx), and it self-heals on the next full refresh — but the user gets
+  no cue to retry.
+- **Fix:** carry a `complete`/phase flag on the snapshot (or a distinct status) so phase-1
+  renders a subtle "still checking your balance…" until phase-2 confirms, and if a run ends
+  without phase-2 completing, show a gentle "balance may be incomplete — tap to refresh"
+  affordance instead of a bare `ready`.
+
+### F13 — [SEV-Low/Info] Network switch doesn't eagerly abort the prior run — a stale-network balance can flash
+
+- **Where:** `App.tsx switchNetwork` (dispatches `setNetwork` + navigate home but does not
+  call `discoveryRef.current?.abort()`); the new run only starts later via the wallet-screen
+  effect's `refreshAll`.
+- **Scenario:** if an in-flight run for the *old* network resolves a phase-1 in the frame
+  between `setNetwork` (which clears the account) and the effect's `refresh()` (which aborts
+  it), it can paint the previous network's balance briefly before the new run supersedes —
+  a transient Live-balance-under-Practice (or vice-versa) flash. Display-only, self-correcting,
+  no persistent cross-network corruption (marks/data are per-network).
+- **Fix:** call `discoveryRef.current?.abort()` synchronously inside `switchNetwork` (and
+  ideally kick `refreshAll` there) so the old run can't dispatch after the switch.
+
+_Round-5 tests used the `.review.test.ts` suffix, were executed, and were deleted; no source
+files were modified._
