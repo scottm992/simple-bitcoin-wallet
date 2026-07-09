@@ -49,7 +49,8 @@ the mnemonic in at call time and let it go out of scope.
 
 **Functions**
 - `buildAndSignTx(params: BuildTxParams): BuiltTx` — validates recipient for the network, runs largest-first coin selection with fee iteration, folds dust change into the fee, supports `sendMax`. Signs P2WPKH inputs, finalizes, returns hex + txid.
-- `estimateFeeSats(numInputs, numOutputs, feeRateSatVb): bigint` — fee estimate using the same vsize math as coin selection; used by the compose screen to pre-check the fee-vs-amount ratio (F10) so the user is warned before Review.
+- `estimateSendFee({ utxos, amountSats, feeRateSatVb, sendMax? }): FeeSelection` — dry-runs the engine's OWN coin selection (dust-fold and sendMax sweep included) with no key material; returns the exact fee/change/inputs the build will use plus `needsHighFeeConsent` (whether the `MAX_FEE_FRACTION` rule would trip). `buildAndSignTx` consumes this same function, so a compose pre-check built on it can never drift from the build (F11). Replaces the former `estimateFeeSats` (removed — it was a parallel 2-output estimate that diverged at the dust-fold boundary).
+  - `FeeSelection { selected; numInputs; totalInputSats; feeSats; changeSats; hasChange; sendAmountSats; needsHighFeeConsent }`
 - `scriptForAddress(address: string, network: Network): Uint8Array` — output script for a destination; accepts bech32/bech32m/base58, rejects wrong-network bech32.
 
 ---

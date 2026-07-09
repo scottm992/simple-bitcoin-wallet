@@ -7,12 +7,12 @@ import { fmtBtc, fmtSats, fmtUsd, usdToSats } from '../display';
 import {
   DUST_LIMIT_SATS,
   InvalidRecipientError,
-  MAX_FEE_FRACTION,
   btcStringToSats,
-  estimateFeeSats,
+  estimateSendFee,
   scriptForAddress,
   satsToUsdString,
   type FeeEstimates,
+  type FeeSelection,
   type Network,
 } from '../lib';
 import { feeRateForTier } from '../actions';
@@ -84,35 +84,29 @@ export function Send(props: {
     return strings.send.convUsd(fmtUsd(amountSats, props.btcUsd));
   }, [amountSats, entryUnit, props.btcUsd]);
 
-  // Estimate how many inputs the engine's largest-first selection would use, so
-  // the compose-time fee estimate tracks the real build closely (F10). Mirrors
-  // selectCoins: accumulate descending values until amount + the fee for the
-  // current input count (with change) is covered. Any residual mismatch at the
-  // no-change/dust boundary is caught honestly at Review.
-  const estInputs = useMemo<number>(() => {
+  // Exact dry-run of the engine's coin selection for the current compose state
+  // (F11): the SAME code path buildAndSignTx uses — dust-fold, sendMax sweep,
+  // and the consent flag included — so the compose fee and the high-fee
+  // pre-check can never drift from the real build. Null when no selection is
+  // possible yet (no amount, or insufficient funds — handled by other errors).
+  const feeSelection = useMemo<FeeSelection | null>(() => {
     const utxos = props.account.utxos;
-    if (utxos.length === 0) return 1;
-    if (sendMax) return utxos.length; // sendMax sweeps every UTXO
-    if (amountSats === null || amountSats <= 0n) return 1;
-    const sorted = [...utxos].sort((a, b) => (a.value < b.value ? 1 : a.value > b.value ? -1 : 0));
-    let total = 0n;
-    let n = 0;
-    for (const u of sorted) {
-      n++;
-      total += u.value;
-      if (total >= amountSats + estimateFeeSats(n, 2, feeRate)) break;
+    if (utxos.length === 0) return null;
+    try {
+      if (sendMax) {
+        return estimateSendFee({ utxos, amountSats: 0n, feeRateSatVb: feeRate, sendMax: true });
+      }
+      if (amountSats === null || amountSats <= 0n) return null;
+      return estimateSendFee({ utxos, amountSats, feeRateSatVb: feeRate });
+    } catch {
+      // InsufficientFunds → surfaced via the over-balance / too-small errors.
+      return null;
     }
-    return n;
-  }, [sendMax, amountSats, props.account.utxos, feeRate]);
+  }, [sendMax, amountSats, feeRate, props.account.utxos]);
 
-  // Sum of every UTXO — what the engine compares a sendMax fee against.
-  const totalUtxoSats = useMemo<bigint>(
-    () => props.account.utxos.reduce((sum, u) => sum + u.value, 0n),
-    [props.account.utxos],
-  );
-
-  // Estimated fee for the selected tier, using the engine's own vsize math.
-  const feeSats = estimateFeeSats(estInputs, sendMax ? 1 : 2, feeRate);
+  // Fee for the selected tier: the exact engine fee when a selection exists,
+  // else a typical-size placeholder for display before an amount is entered.
+  const feeSats = feeSelection?.feeSats ?? BigInt(Math.ceil(TYPICAL_VSIZE * feeRate));
   const feeUsd = props.btcUsd === null ? null : satsToUsdString(feeSats, props.btcUsd);
 
   // Validation for enabling Review + inline errors.
@@ -134,19 +128,14 @@ export function Send(props: {
     ? spendableSats > feeSats + DUST_LIMIT_SATS
     : amountSats !== null && amountSats >= DUST_LIMIT_SATS && amountError === null;
 
-  // F10 informed consent: would this payment trip the engine's fee-vs-amount
-  // percentage rule? Mirrors buildAndSignTx exactly — fee compared against
-  // amount + fee for a normal send, or the total swept input for Send Max. When
-  // true, the normal Review button is held back and an inline notice with the
-  // real numbers plus a "Send anyway" option (allowHighFee) is shown instead.
-  const fractionCeiling = (comparedTo: bigint): bigint =>
-    (comparedTo * BigInt(Math.round(MAX_FEE_FRACTION * 1000))) / 1000n;
-  const highFee: boolean = (() => {
-    if (props.fees === null || !amountReady) return false;
-    if (sendMax) return feeSats > fractionCeiling(totalUtxoSats);
-    if (amountSats === null) return false;
-    return feeSats > fractionCeiling(amountSats + feeSats);
-  })();
+  // F10 informed consent: will the build trip the fee-vs-amount percentage
+  // rule? The flag comes straight from the engine's own dry-run selection
+  // (F11), so it is exact — including the dust-fold band that a 2-output
+  // estimate used to miss. When true, the normal Review button is held back and
+  // an inline notice with the real numbers plus a "Send anyway" option
+  // (allowHighFee) is shown instead.
+  const highFee: boolean =
+    props.fees !== null && amountReady && feeSelection !== null && feeSelection.needsHighFeeConsent;
 
   const canReview = addressReady && amountReady && props.fees !== null && !highFee;
 

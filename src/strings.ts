@@ -186,13 +186,16 @@ export const strings = {
     failBody:
       'Your bitcoin is safe and still in your wallet — nothing was sent. This is usually a connection problem. Check your internet and try again.',
     // Dry-run failure: the amounts couldn't be worked out. Block sending; send
-    // them back to re-check. Two honest variants (F10): only a genuine build
-    // failure blames the balance; a fee-guard trip explains the fee instead.
+    // them back to re-check. Honest variants (F10/F11): only a genuine build
+    // failure blames the balance; a fee-guard trip explains the fee with the
+    // real numbers and offers the send-anyway choice right here.
     recheckHeading: "Let's double-check this payment",
     recheckBody:
       "We couldn't work out the fee and total just now — your available balance may have changed. Go back and enter the payment again so the numbers are right before you send.",
-    recheckFeeBody:
-      "The network fee would take an unusually big bite out of this payment. Go back to adjust the amount or pick a different fee speed — you can still choose to send it anyway from there.",
+    recheckFeeBody: (fee: string, pct: string): string =>
+      `The network fee would take an unusually big bite out of this payment — about ${fee}, which is ${pct}% of what you're sending. You can go back to change the amount or fee speed, or choose to send it anyway.`,
+    recheckFeeHardBody:
+      'The network fee for this payment is more than this wallet will ever send — that usually means something is wrong with the fee estimate. Go back and try a different amount or fee speed.',
     recheckGoBack: 'Go back and re-check',
   },
 

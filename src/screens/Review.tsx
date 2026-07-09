@@ -3,20 +3,22 @@ import { useState } from 'react';
 import { strings } from '../strings';
 import { Chrome } from '../components/Chrome';
 import { AddressChunk, CheckRow, Sheet, Toast, copyToClipboard } from '../components/ui';
-import { fmtBtc, fmtUsd } from '../display';
-import type { Network } from '../lib';
+import { fmtBtc, fmtSats, fmtUsd } from '../display';
+import { MAX_FEE_ABSOLUTE_SATS, type Network } from '../lib';
 import type { FeeTier, PendingSend } from '../state';
 
 /**
  * The result of the Review dry-run build. `ok: false` means the build could not
  * be completed, so Review must block sending rather than show fake numbers (F4).
  * The reason keeps the copy honest (F10): `'fee-too-high'` when the engine's fee
- * guard tripped, `'stale'` for everything else (e.g. the UTXO set changed under
- * a poll between compose and review).
+ * guard tripped (carrying the real numbers so the blocked state can explain and
+ * offer recovery, F11), `'stale'` for everything else (e.g. the UTXO set changed
+ * under a poll between compose and review).
  */
 export type ReviewNumbers =
   | { ok: true; amountSats: bigint; feeSats: bigint; totalSats: bigint }
-  | { ok: false; reason: 'fee-too-high' | 'stale' };
+  | { ok: false; reason: 'stale' }
+  | { ok: false; reason: 'fee-too-high'; feeSats: bigint; comparedToSats: bigint };
 
 /** Fee-time label for the review row, matching the compose chips. */
 function tierTime(tier: FeeTier): string {
@@ -44,6 +46,13 @@ export function Review(props: {
   btcUsd: number | null;
   onConfirm: () => Promise<void>;
   onBack: () => void;
+  /**
+   * Called when the user chooses "Send anyway" from the fee-blocked state
+   * (F11): the parent re-composes the same payment with `allowHighFee: true`,
+   * after which this screen re-renders with the real numbers and the normal
+   * full review gate. Never reachable when the block was a hard fee limit.
+   */
+  onAcceptHighFee: () => void;
 }): JSX.Element {
   const live = props.network === 'mainnet';
   const [checked, setChecked] = useState(false);
@@ -52,14 +61,49 @@ export function Review(props: {
   const [toast, setToast] = useState<string | null>(null);
 
   // F4: a failed dry-run blocks the whole screen. Render a recheck state with no
-  // fabricated numbers and no way to send. The copy names the real cause (F10):
-  // only a genuine build failure blames the balance; a fee-guard trip explains
-  // the fee instead.
+  // fabricated numbers and no enabled Send. The copy names the real cause (F10),
+  // and a consent-gated fee block offers a working recovery right here (F11) —
+  // this state must never again be a dead end.
   if (!props.numbers.ok) {
-    const body =
-      props.numbers.reason === 'fee-too-high'
-        ? strings.review.recheckFeeBody
-        : strings.review.recheckBody;
+    if (props.numbers.reason === 'fee-too-high') {
+      const { feeSats, comparedToSats } = props.numbers;
+      // Recoverable = the consent (percentage) rule tripped: consent wasn't
+      // given yet and the fee is inside the hard limits. A hard-limit trip
+      // (hostile rate → feeSats 0n from the rate guard, or fee > absolute
+      // ceiling, or consent already given yet still blocked) is NOT recoverable
+      // — offering "Send anyway" there would loop, so we say so honestly.
+      const recoverable =
+        !props.pending.allowHighFee && feeSats > 0n && feeSats <= MAX_FEE_ABSOLUTE_SATS;
+      const sentBase = comparedToSats - feeSats; // what would actually be sent
+      const pct = sentBase > 0n ? Number((feeSats * 100n) / sentBase) : 0;
+      const feeStr = props.btcUsd !== null ? fmtUsd(feeSats, props.btcUsd) : fmtSats(feeSats);
+      return (
+        <Chrome network={props.network} onBack={props.onBack} title={strings.review.title}>
+          <div className="screen-body">
+            <h1 className="h1" style={{ fontSize: 'var(--fs-heading)' }}>
+              {strings.review.recheckHeading}
+            </h1>
+            <div className="warn">
+              <div className="warn__text">
+                {recoverable
+                  ? strings.review.recheckFeeBody(feeStr, String(pct))
+                  : strings.review.recheckFeeHardBody}
+              </div>
+            </div>
+            <div className="bottom-actions">
+              <button className="btn btn--primary btn--block" onClick={props.onBack}>
+                {strings.review.recheckGoBack}
+              </button>
+              {recoverable ? (
+                <button className="btn btn--secondary btn--block" onClick={props.onAcceptHighFee}>
+                  {strings.send.sendAnyway}
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </Chrome>
+      );
+    }
     return (
       <Chrome network={props.network} onBack={props.onBack} title={strings.review.title}>
         <div className="screen-body">
@@ -67,7 +111,7 @@ export function Review(props: {
             {strings.review.recheckHeading}
           </h1>
           <div className="warn">
-            <div className="warn__text">{body}</div>
+            <div className="warn__text">{strings.review.recheckBody}</div>
           </div>
           <div className="bottom-actions">
             <button className="btn btn--primary btn--block" onClick={props.onBack}>

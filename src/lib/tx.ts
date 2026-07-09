@@ -232,15 +232,9 @@ function feeForVsize(vsize: number, feeRateSatVb: number): bigint {
   return BigInt(Math.ceil(vsize * feeRateSatVb));
 }
 
-/**
- * Estimates the fee (sats) for a P2WPKH tx with the given input/output counts
- * at a fee rate, using the same vsize math as coin selection. Exported so the
- * compose screen can pre-check the fee-vs-amount ratio with the SAME numbers
- * the engine will use, and warn the user before Review instead of hitting the
- * engine guard cold (F10).
- */
-export function estimateFeeSats(numInputs: number, numOutputs: number, feeRateSatVb: number): bigint {
-  return feeForVsize(estimateVsize(numInputs, numOutputs), feeRateSatVb);
+/** The ceiling the {@link MAX_FEE_FRACTION} consent rule compares a fee against. */
+function feeFractionCeiling(comparedTo: bigint): bigint {
+  return (comparedTo * BigInt(Math.round(MAX_FEE_FRACTION * 1000))) / 1000n;
 }
 
 /**
@@ -294,6 +288,97 @@ function selectCoins(
 }
 
 /**
+ * The result of a fee/selection dry run — the EXACT numbers
+ * {@link buildAndSignTx} will use, because both consume the same selection code
+ * path (F11: no parallel estimate that can drift from the build).
+ */
+export interface FeeSelection {
+  /** The UTXOs the build will spend, in selection order. */
+  readonly selected: readonly WalletUtxo[];
+  /** Number of inputs selected. */
+  readonly numInputs: number;
+  /** Sum of the selected input values, in sats. */
+  readonly totalInputSats: bigint;
+  /** The exact fee the built tx will pay, in sats (dust-fold included). */
+  readonly feeSats: bigint;
+  /** Change returned to the wallet (0 when folded into the fee or sendMax). */
+  readonly changeSats: bigint;
+  /** Whether the built tx will carry a change output. */
+  readonly hasChange: boolean;
+  /** The amount that will actually reach the recipient, in sats. */
+  readonly sendAmountSats: bigint;
+  /**
+   * True when this fee trips the {@link MAX_FEE_FRACTION} informed-consent
+   * rule — i.e. {@link buildAndSignTx} will throw {@link FeeTooHighError}
+   * unless `allowHighFee` is set. Computed here, by the same code the build
+   * runs, so a compose-screen pre-check can never disagree with the build.
+   */
+  readonly needsHighFeeConsent: boolean;
+}
+
+/**
+ * Dry-runs the engine's coin selection and fee computation for a prospective
+ * send — including the sub-dust change fold and the sendMax sweep — WITHOUT
+ * touching any key material. This is the single source of truth for "what fee
+ * would this payment pay": {@link buildAndSignTx} consumes this same function,
+ * so a compose-screen pre-check built on it is exact by construction (F11).
+ *
+ * @throws {InvalidTxParamsError} On a non-positive fee rate or amount.
+ * @throws {InsufficientFundsError} When funds cannot cover amount + fee.
+ */
+export function estimateSendFee(params: {
+  utxos: readonly WalletUtxo[];
+  amountSats: bigint;
+  feeRateSatVb: number;
+  sendMax?: boolean;
+}): FeeSelection {
+  const { utxos, amountSats, feeRateSatVb } = params;
+  const sendMax = params.sendMax ?? false;
+
+  if (!(feeRateSatVb > 0) || !Number.isFinite(feeRateSatVb)) {
+    throw new InvalidTxParamsError('feeRateSatVb must be a positive number');
+  }
+  if (utxos.length === 0) {
+    throw new InsufficientFundsError(0n, sendMax ? 0n : amountSats);
+  }
+  if (!sendMax && amountSats <= 0n) {
+    throw new InvalidTxParamsError('amountSats must be positive');
+  }
+
+  if (sendMax) {
+    const selected = [...utxos];
+    const totalInput = selected.reduce((sum, u) => sum + u.value, 0n);
+    const feeSats = feeForVsize(estimateVsize(selected.length, 1), feeRateSatVb);
+    const sendAmount = totalInput - feeSats;
+    if (sendAmount < DUST_LIMIT_SATS) {
+      throw new InsufficientFundsError(totalInput, feeSats + DUST_LIMIT_SATS);
+    }
+    return {
+      selected,
+      numInputs: selected.length,
+      totalInputSats: totalInput,
+      feeSats,
+      changeSats: 0n,
+      hasChange: false,
+      sendAmountSats: sendAmount,
+      needsHighFeeConsent: feeSats > feeFractionCeiling(totalInput),
+    };
+  }
+
+  const sel = selectCoins(utxos, amountSats, feeRateSatVb);
+  return {
+    selected: sel.selected,
+    numInputs: sel.selected.length,
+    totalInputSats: sel.totalInput,
+    feeSats: sel.feeSats,
+    changeSats: sel.changeSats,
+    hasChange: sel.hasChange,
+    sendAmountSats: amountSats,
+    needsHighFeeConsent: sel.feeSats > feeFractionCeiling(amountSats + sel.feeSats),
+  };
+}
+
+/**
  * Builds and signs a P2WPKH transaction from the wallet's UTXOs.
  *
  * Behaviour:
@@ -342,33 +427,14 @@ export function buildAndSignTx(params: BuildTxParams): BuiltTx {
 
   const net = btcNetwork(network);
 
-  let selected: WalletUtxo[];
-  let feeSats: bigint;
-  let changeSats: bigint;
-  let sendAmount: bigint;
-  let hasChange: boolean;
-  let totalInput: bigint;
-
-  if (sendMax) {
-    selected = [...utxos];
-    totalInput = selected.reduce((sum, u) => sum + u.value, 0n);
-    const vsize = estimateVsize(selected.length, 1); // single output, no change
-    feeSats = feeForVsize(vsize, feeRateSatVb);
-    sendAmount = totalInput - feeSats;
-    if (sendAmount < DUST_LIMIT_SATS) {
-      throw new InsufficientFundsError(totalInput, feeSats + DUST_LIMIT_SATS);
-    }
-    changeSats = 0n;
-    hasChange = false;
-  } else {
-    const result = selectCoins(utxos, amountSats, feeRateSatVb);
-    selected = result.selected;
-    totalInput = result.totalInput;
-    feeSats = result.feeSats;
-    changeSats = result.changeSats;
-    hasChange = result.hasChange;
-    sendAmount = amountSats;
-  }
+  // The ONE selection/fee code path, shared with the compose pre-check (F11):
+  // any fee this build pays — dust-fold included — is exactly what
+  // estimateSendFee reported for the same inputs.
+  const sel = estimateSendFee({ utxos, amountSats, feeRateSatVb, sendMax });
+  const { feeSats, changeSats, hasChange } = sel;
+  const selected = sel.selected;
+  const totalInput = sel.totalInputSats;
+  const sendAmount = sel.sendAmountSats;
 
   // F1 defence-in-depth (engine layer): even with an in-range rate, bound the
   // computed fee. For a Send Max there is no separate amount, so we compare
@@ -386,19 +452,16 @@ export function buildAndSignTx(params: BuildTxParams): BuiltTx {
     );
   }
 
-  // Percentage rule — the ONLY guard allowHighFee bypasses (F10): a legitimate
-  // small send naturally carries a proportionally large fee, and the UI collects
-  // an explicit informed confirmation before setting the flag.
-  if (!allowHighFee) {
-    const fractionCeiling = (comparedTo * BigInt(Math.round(MAX_FEE_FRACTION * 1000))) / 1000n;
-    if (feeSats > fractionCeiling) {
-      throw new FeeTooHighError(
-        `Fee ${feeSats} sats exceeds ${Math.round(MAX_FEE_FRACTION * 100)}% of the amount being sent`,
-        feeSats,
-        feeRateSatVb,
-        comparedTo,
-      );
-    }
+  // Percentage rule — the ONLY guard allowHighFee bypasses (F10). The flag is
+  // computed inside estimateSendFee so the compose pre-check and this build can
+  // never disagree about whether consent is needed (F11).
+  if (!allowHighFee && sel.needsHighFeeConsent) {
+    throw new FeeTooHighError(
+      `Fee ${feeSats} sats exceeds ${Math.round(MAX_FEE_FRACTION * 100)}% of the amount being sent`,
+      feeSats,
+      feeRateSatVb,
+      comparedTo,
+    );
   }
 
   // Build the transaction. `allowUnknownOutputs` is false (default) so any

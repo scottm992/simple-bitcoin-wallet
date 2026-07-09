@@ -318,11 +318,20 @@ export default function App(): JSX.Element {
       };
     } catch (err) {
       // The UTXO set may have changed under a 30s poll (InsufficientFunds), or
-      // the fee tripped the sanity guard (FeeTooHighError — normally caught at
-      // compose time, but the compose estimate can differ slightly from the
-      // real build). Name the real cause; never render numbers we can't stand
-      // behind.
-      return { ok: false, reason: err instanceof FeeTooHighError ? 'fee-too-high' : 'stale' };
+      // the fee tripped the sanity guard (FeeTooHighError — the compose
+      // pre-check shares the engine's own selection code so this normally can't
+      // happen, but if it ever does the blocked state must offer a real
+      // recovery, F11). Name the real cause and carry the real numbers; never
+      // render numbers we can't stand behind.
+      if (err instanceof FeeTooHighError) {
+        return {
+          ok: false,
+          reason: 'fee-too-high',
+          feeSats: err.feeSats,
+          comparedToSats: err.comparedToSats,
+        };
+      }
+      return { ok: false, reason: 'stale' };
     }
   }
 
@@ -545,6 +554,17 @@ export default function App(): JSX.Element {
             btcUsd={state.btcUsd}
             onConfirm={confirmSend}
             onBack={() => dispatch({ type: 'navigate', screen: 'send' })}
+            onAcceptHighFee={() => {
+              // F11 recovery: re-compose the same payment with informed consent.
+              // The dry-run then succeeds and the full review gate (numbers,
+              // checkbox, Send now) still applies before anything is sent.
+              if (state.pendingSend) {
+                dispatch({
+                  type: 'composeSend',
+                  pending: { ...state.pendingSend, allowHighFee: true },
+                });
+              }
+            }}
           />
         );
       }

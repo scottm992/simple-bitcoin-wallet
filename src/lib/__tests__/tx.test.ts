@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildAndSignTx,
+  estimateSendFee,
   scriptForAddress,
   InsufficientFundsError,
   InvalidRecipientError,
@@ -348,6 +349,108 @@ describe('buildAndSignTx — fee sanity cap (F1)', () => {
     });
     expect(res.feeSats).toBeGreaterThan(0n);
     expect(res.feeSats).toBeLessThan(60_000n / 4n);
+  });
+});
+
+// --- F11: the compose pre-check and the build share one selection path ------
+
+describe('estimateSendFee — exact agreement with buildAndSignTx (F11)', () => {
+  /**
+   * Asserts the drift-killing property for one scenario: the dry-run fee and
+   * consent flag must EXACTLY match what buildAndSignTx does — same fee, and
+   * consent-needed if-and-only-if the unconsented build throws FeeTooHighError.
+   */
+  function assertEstimateMatchesBuild(utxoSet: WalletUtxo[], amountSats: bigint, rate: number): void {
+    const est = estimateSendFee({ utxos: utxoSet, amountSats, feeRateSatVb: rate });
+    const built = buildAndSignTx({
+      mnemonic: ABANDON,
+      network: 'mainnet',
+      utxos: utxoSet,
+      recipient: RECIPIENT,
+      amountSats,
+      feeRateSatVb: rate,
+      changeAddress: CHANGE,
+      allowHighFee: true, // bypass only the consent rule so the build completes
+    });
+    // The estimate IS the build's fee — exactly, dust-fold included.
+    expect(est.feeSats).toBe(built.feeSats);
+    expect(est.totalInputSats).toBe(built.totalInputSats);
+    expect(est.changeSats).toBe(built.changeSats);
+    // The consent flag agrees exactly with the unconsented build's behavior.
+    let threwConsent = false;
+    try {
+      buildAndSignTx({
+        mnemonic: ABANDON,
+        network: 'mainnet',
+        utxos: utxoSet,
+        recipient: RECIPIENT,
+        amountSats,
+        feeRateSatVb: rate,
+        changeAddress: CHANGE,
+      });
+    } catch (e) {
+      expect(e).toBeInstanceOf(FeeTooHighError);
+      threwConsent = true;
+    }
+    expect(est.needsHighFeeConsent).toBe(threwConsent);
+  }
+
+  it("reproduces the reviewer's Round-3 scenario exactly (17,500-sat UTXO, 13,000-sat send, 30 sat/vB)", () => {
+    const single: WalletUtxo[] = [
+      { txid: 'f'.repeat(64), vout: 0, value: 17_500n, path: addr0.path, address: addr0.address },
+    ];
+    const est = estimateSendFee({ utxos: single, amountSats: 13_000n, feeRateSatVb: 30 });
+    // The change (270) is dust → folded → the REAL fee is 4,500, not the
+    // 2-output 4,230 the old parallel estimate reported — and that crosses 25%.
+    expect(est.feeSats).toBe(4_500n);
+    expect(est.hasChange).toBe(false);
+    expect(est.needsHighFeeConsent).toBe(true);
+    assertEstimateMatchesBuild(single, 13_000n, 30);
+  });
+
+  it('property sweep: estimate == built fee across the dust-fold boundary (single UTXO)', () => {
+    // Single 17,500-sat UTXO at 30 sat/vB. Sweeping the amount walks through:
+    // change well above dust → change crossing the dust threshold (fold) →
+    // no-change territory. The estimate must equal the built fee at EVERY step.
+    const single: WalletUtxo[] = [
+      { txid: 'f'.repeat(64), vout: 0, value: 17_500n, path: addr0.path, address: addr0.address },
+    ];
+    for (let amt = 12_000n; amt <= 14_200n; amt += 100n) {
+      assertEstimateMatchesBuild(single, amt, 30);
+    }
+  });
+
+  it('property sweep: estimate == built fee across the boundary with multiple UTXOs', () => {
+    // Two UTXOs so the sweep also crosses the 1-input → 2-input selection edge
+    // while the dust-fold band moves with it.
+    const pair: WalletUtxo[] = [
+      { txid: 'a'.repeat(64), vout: 0, value: 9_000n, path: addr0.path, address: addr0.address },
+      { txid: 'b'.repeat(64), vout: 1, value: 8_500n, path: addr1.path, address: addr1.address },
+    ];
+    for (let amt = 3_000n; amt <= 12_000n; amt += 500n) {
+      assertEstimateMatchesBuild(pair, amt, 20);
+    }
+  });
+
+  it('sendMax: estimate matches the built sweep exactly, including the consent flag', () => {
+    const small: WalletUtxo[] = [
+      { txid: 'c'.repeat(64), vout: 0, value: 10_000n, path: addr0.path, address: addr0.address },
+    ];
+    const est = estimateSendFee({ utxos: small, amountSats: 0n, feeRateSatVb: 30, sendMax: true });
+    const built = buildAndSignTx({
+      mnemonic: ABANDON,
+      network: 'mainnet',
+      utxos: small,
+      recipient: RECIPIENT,
+      amountSats: 0n,
+      feeRateSatVb: 30,
+      changeAddress: CHANGE,
+      sendMax: true,
+      allowHighFee: true,
+    });
+    expect(est.feeSats).toBe(built.feeSats);
+    expect(est.sendAmountSats).toBe(built.totalInputSats - built.feeSats);
+    expect(est.needsHighFeeConsent).toBe(true); // 3,300 > 25% of 10,000
   });
 });
 
