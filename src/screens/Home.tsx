@@ -4,7 +4,7 @@ import { strings } from '../strings';
 import { Chrome } from '../components/Chrome';
 import { Balance } from '../components/Balance';
 import { ActivityRow } from '../components/ActivityRow';
-import type { DisplayUnit } from '../display';
+import { fmtUsd, type DisplayUnit } from '../display';
 import type { AccountSnapshot } from '../lib/account';
 import type { LoadStatus } from '../state';
 import type { Network } from '../lib';
@@ -29,8 +29,16 @@ export function Home(props: {
   const practice = props.network === 'testnet';
   const confirmed = props.account?.confirmedSats ?? 0n;
   const pending = props.account?.pendingSats ?? 0n;
-  const totalSats = confirmed + (pending > 0n ? pending : 0n);
-  const isEmpty = props.accountStatus === 'ready' && totalSats === 0n;
+  // F9: reflect net pending (including OUTGOING unconfirmed) in the hero, so
+  // right after a send the balance no longer implies the money is still here.
+  // Clamp at 0 so the amount formatters (which reject negatives) never throw;
+  // in practice confirmed always covers an outgoing pending amount.
+  const netSats = confirmed + pending;
+  const totalSats = netSats > 0n ? netSats : 0n;
+  // Break pending into its outgoing / incoming parts for an explicit label.
+  const pendingOut = pending < 0n ? -pending : 0n;
+  const pendingIn = pending > 0n ? pending : 0n;
+  const isEmpty = props.accountStatus === 'ready' && totalSats === 0n && pending === 0n;
   const activity = props.account?.activity ?? [];
   const recent = activity.slice(0, 3);
 
@@ -57,6 +65,17 @@ export function Home(props: {
           practice={practice}
           loading={props.accountStatus === 'loading' && props.account === null}
         />
+
+        {props.accountStatus === 'ready' && pendingOut > 0n ? (
+          <div className="pending-line pending-line--out">
+            {strings.home.pendingOut(fmtUsd(pendingOut, props.btcUsd))}
+          </div>
+        ) : null}
+        {props.accountStatus === 'ready' && pendingIn > 0n ? (
+          <div className="pending-line pending-line--in">
+            {strings.home.pendingIn(fmtUsd(pendingIn, props.btcUsd))}
+          </div>
+        ) : null}
 
         <div className="verb-row">
           <button className="verb" onClick={props.onReceive}>

@@ -15,6 +15,29 @@ import type { Network } from './wallet';
 /** Dust threshold for P2WPKH outputs, in satoshis (Bitcoin Core policy). */
 export const DUST_LIMIT_SATS = 546n;
 
+/**
+ * Hard ceiling on the fee rate (sat/vByte) the signer will accept. A sane rate
+ * is ~1–50 sat/vB even in congestion; anything above this is treated as a
+ * bad/hostile estimate and rejected unless {@link BuildTxParams.allowHighFee}.
+ */
+export const MAX_FEE_RATE_SAT_VB = 500;
+
+/**
+ * The largest share of the spent inputs the fee may consume before the build is
+ * rejected (as a guard against a fee that dwarfs the payment). For a Send Max
+ * this is checked against the total input; for a normal send, against
+ * amount + fee. Overridable via {@link BuildTxParams.allowHighFee}.
+ */
+export const MAX_FEE_FRACTION = 0.25;
+
+/**
+ * Absolute ceiling on the fee, in satoshis, applied independently of the
+ * fraction guard so a large-value send can't quietly burn an unbounded amount.
+ * 1,000,000 sats (0.01 BTC) is far above any legitimate single-tx fee.
+ * Overridable via {@link BuildTxParams.allowHighFee}.
+ */
+export const MAX_FEE_ABSOLUTE_SATS = 1_000_000n;
+
 /** Virtual-size constants (vBytes) used for fee estimation. */
 const TX_OVERHEAD_VB = 11; // version + locktime + segwit marker/flag + counts (rounded up from 10.5)
 const P2WPKH_INPUT_VB = 68; // per spending input
@@ -52,6 +75,12 @@ export interface BuildTxParams {
   readonly changeAddress: string;
   /** When true, sweep all UTXOs to the recipient with no change output. */
   readonly sendMax?: boolean;
+  /**
+   * Explicit opt-out of the fee-sanity guards ({@link FeeTooHighError}). Only
+   * set this when a fully-informed user has deliberately confirmed an unusually
+   * high fee. Defaults to false: a fee that looks hostile/buggy is rejected.
+   */
+  readonly allowHighFee?: boolean;
 }
 
 /** The signed transaction and its accounting, returned by {@link buildAndSignTx}. */
@@ -97,6 +126,29 @@ export class InvalidTxParamsError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'InvalidTxParamsError';
+  }
+}
+
+/**
+ * Thrown when the fee rate or the computed absolute fee exceeds the sanity
+ * bounds ({@link MAX_FEE_RATE_SAT_VB} / {@link MAX_FEE_FRACTION} /
+ * {@link MAX_FEE_ABSOLUTE_SATS}) and {@link BuildTxParams.allowHighFee} was not
+ * set. This is the engine-level backstop against a bad/hostile fee estimate
+ * draining the wallet (see F1). Carries the numbers so the UI can explain them.
+ */
+export class FeeTooHighError extends Error {
+  /** The computed fee, in satoshis. */
+  readonly feeSats: bigint;
+  /** The fee rate used, in sat/vByte. */
+  readonly feeRateSatVb: number;
+  /** The amount the fee is being compared against (send amount or total input). */
+  readonly comparedToSats: bigint;
+  constructor(message: string, feeSats: bigint, feeRateSatVb: number, comparedToSats: bigint) {
+    super(message);
+    this.name = 'FeeTooHighError';
+    this.feeSats = feeSats;
+    this.feeRateSatVb = feeRateSatVb;
+    this.comparedToSats = comparedToSats;
   }
 }
 
@@ -234,15 +286,28 @@ function selectCoins(
  * @param params - See {@link BuildTxParams}.
  * @returns The signed transaction and its accounting ({@link BuiltTx}).
  * @throws {InvalidTxParamsError} On non-positive fee rate or amount.
+ * @throws {FeeTooHighError} When the fee rate or computed fee exceeds the sanity
+ *   bounds and `allowHighFee` is not set (F1 backstop).
  * @throws {InvalidRecipientError} On a bad or wrong-network recipient.
  * @throws {InsufficientFundsError} When funds cannot cover amount + fee.
  */
 export function buildAndSignTx(params: BuildTxParams): BuiltTx {
   const { mnemonic, network, utxos, recipient, amountSats, feeRateSatVb, changeAddress } = params;
   const sendMax = params.sendMax ?? false;
+  const allowHighFee = params.allowHighFee ?? false;
 
   if (!(feeRateSatVb > 0) || !Number.isFinite(feeRateSatVb)) {
     throw new InvalidTxParamsError('feeRateSatVb must be a positive number');
+  }
+  // F1 defence-in-depth (engine layer): reject an implausibly high fee RATE
+  // before we ever build/sign, so a bad/hostile estimate can't drain funds.
+  if (!allowHighFee && feeRateSatVb > MAX_FEE_RATE_SAT_VB) {
+    throw new FeeTooHighError(
+      `Fee rate ${feeRateSatVb} sat/vB exceeds the ${MAX_FEE_RATE_SAT_VB} sat/vB safety limit`,
+      0n,
+      feeRateSatVb,
+      0n,
+    );
   }
   if (utxos.length === 0) {
     throw new InsufficientFundsError(0n, sendMax ? 0n : amountSats);
@@ -282,6 +347,32 @@ export function buildAndSignTx(params: BuildTxParams): BuiltTx {
     changeSats = result.changeSats;
     hasChange = result.hasChange;
     sendAmount = amountSats;
+  }
+
+  // F1 defence-in-depth (engine layer): even with an in-range rate, reject a
+  // computed fee that dwarfs the payment or exceeds an absolute ceiling. For a
+  // Send Max there is no separate amount, so we compare against the total input;
+  // for a normal send, against the value actually leaving the wallet
+  // (amount + fee). Both are overridable via allowHighFee.
+  if (!allowHighFee) {
+    const comparedTo = sendMax ? totalInput : sendAmount + feeSats;
+    const fractionCeiling = (comparedTo * BigInt(Math.round(MAX_FEE_FRACTION * 1000))) / 1000n;
+    if (feeSats > fractionCeiling) {
+      throw new FeeTooHighError(
+        `Fee ${feeSats} sats exceeds ${Math.round(MAX_FEE_FRACTION * 100)}% of the amount being sent`,
+        feeSats,
+        feeRateSatVb,
+        comparedTo,
+      );
+    }
+    if (feeSats > MAX_FEE_ABSOLUTE_SATS) {
+      throw new FeeTooHighError(
+        `Fee ${feeSats} sats exceeds the absolute ${MAX_FEE_ABSOLUTE_SATS}-sat safety limit`,
+        feeSats,
+        feeRateSatVb,
+        comparedTo,
+      );
+    }
   }
 
   // Build the transaction. `allowUnknownOutputs` is false (default) so any

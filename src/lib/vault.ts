@@ -312,16 +312,40 @@ function rpId(): string {
 }
 
 /**
- * Feature-detects PRF support by attempting a create/get. Returns true only if
- * a platform passkey with the `prf` extension can produce a PRF output here.
- * Used by callers before offering the passkey option; safe to call — it does
- * not persist anything.
- *
- * NOTE: This does create a throwaway credential on some platforms. Prefer
- * {@link isPasskeySupported} for a cheap capability check and only call this
- * when the user has opted in.
+ * Options passed to {@link probePasskeyPrf}. The `userInitiated` flag is a hard
+ * gate: this probe creates a real platform credential (see below), so it must
+ * never fire from a passive capability check.
  */
-export async function probePasskeyPrf(): Promise<boolean> {
+export interface ProbePasskeyOptions {
+  /**
+   * Must be `true`, and must be set from within a user gesture where the user
+   * has explicitly opted into setting up quick unlock. If false/absent the probe
+   * refuses to run and returns false — this is the F7 fail-closed guard against
+   * silently creating an orphan credential.
+   */
+  readonly userInitiated: boolean;
+}
+
+/**
+ * Feature-detects PRF support by attempting a create/get. Returns true only if a
+ * platform passkey with the `prf` extension can produce a PRF output here.
+ *
+ * IMPORTANT (F7): this necessarily *creates a real platform credential* — there
+ * is no standard way to probe PRF without a WebAuthn ceremony. WebAuthn also
+ * provides no reliable programmatic delete for platform credentials, so the
+ * credential can be left behind ("orphaned"). Therefore this function:
+ *   - refuses to run unless `opts.userInitiated === true` (so it can never be
+ *     triggered by a passive/automatic capability check), and
+ *   - best-effort signals the credential as unknown via
+ *     `PublicKeyCredential.signalUnknownCredential` where the browser supports
+ *     it, so a compliant authenticator can prune it.
+ *
+ * For a cheap, side-effect-free capability check, use {@link isPasskeySupported}
+ * instead — call this only right before {@link enablePasskeyUnlock} when the
+ * user has explicitly chosen to set up quick unlock.
+ */
+export async function probePasskeyPrf(opts: ProbePasskeyOptions): Promise<boolean> {
+  if (!opts.userInitiated) return false; // F7: never create a credential passively
   if (!isPasskeySupported()) return false;
   try {
     const cred = (await navigator.credentials.create({
@@ -329,10 +353,40 @@ export async function probePasskeyPrf(): Promise<boolean> {
     })) as PublicKeyCredential | null;
     if (!cred) return false;
     const ext = cred.getClientExtensionResults() as PrfExtensionResults & { prf?: { enabled?: boolean } };
-    return ext.prf?.enabled === true || !!ext.prf?.results?.first;
+    const supported = ext.prf?.enabled === true || !!ext.prf?.results?.first;
+    // Best-effort cleanup so we don't leave a throwaway credential behind.
+    await signalUnknownCredential(cred.rawId);
+    return supported;
   } catch {
     return false;
   }
+}
+
+/**
+ * Tells the authenticator (where supported) that a credential id is not one we
+ * recognise, so a spec-compliant platform can prune the throwaway probe
+ * credential. A no-op on browsers without `signalUnknownCredential`.
+ */
+async function signalUnknownCredential(rawId: ArrayBuffer): Promise<void> {
+  const PKC = globalThis.PublicKeyCredential as
+    | (typeof globalThis.PublicKeyCredential & {
+        signalUnknownCredential?: (opts: { rpId: string; credentialId: string }) => Promise<void>;
+      })
+    | undefined;
+  if (!PKC || typeof PKC.signalUnknownCredential !== 'function') return;
+  try {
+    await PKC.signalUnknownCredential({
+      rpId: rpId(),
+      credentialId: base64UrlNoPad(new Uint8Array(rawId)),
+    });
+  } catch {
+    /* browser rejected / unsupported — best effort only */
+  }
+}
+
+/** Encodes bytes as unpadded base64url, as required by the credential-signal API. */
+function base64UrlNoPad(bytes: Uint8Array): string {
+  return base64.encode(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 /** Builds the credential-creation options with the PRF extension enabled. */

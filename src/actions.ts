@@ -13,6 +13,8 @@ import {
   getBtcUsdPrice,
   getFeeEstimates,
   getUtxos,
+  MAX_ACCEPTED_FEE_RATE,
+  MIN_ACCEPTED_FEE_RATE,
   type AccountSnapshot,
   type FeeEstimates,
   type Network,
@@ -62,11 +64,17 @@ export async function loadFees(network: Network): Promise<FeeEstimates> {
   return getFeeEstimates(network);
 }
 
-/** Maps a fee tier to a sat/vByte rate from the estimates. */
+/**
+ * Maps a fee tier to a sat/vByte rate from the estimates, clamped into the sane
+ * `[MIN_ACCEPTED_FEE_RATE, MAX_ACCEPTED_FEE_RATE]` window (F1). Even though
+ * getFeeEstimates already clamps, this is a second, independent guard so a rate
+ * reaching tx.ts is always in-range and never zero/NaN.
+ */
 export function feeRateForTier(fees: FeeEstimates, tier: FeeTier): number {
   const raw = tier === 'faster' ? fees.fast : tier === 'economy' ? fees.slow : fees.medium;
-  // Guard against a zero/invalid estimate; tx.ts requires a positive rate.
-  return raw > 0 ? raw : 1;
+  if (!Number.isFinite(raw) || raw < MIN_ACCEPTED_FEE_RATE) return MIN_ACCEPTED_FEE_RATE;
+  if (raw > MAX_ACCEPTED_FEE_RATE) return MAX_ACCEPTED_FEE_RATE;
+  return raw;
 }
 
 /**

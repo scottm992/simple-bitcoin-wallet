@@ -45,7 +45,7 @@ export const strings = {
       "This wallet has no company account behind it. These 12 words are the only key. That's the trade for being truly in control: no one can freeze your money, and no one can recover it for you. So the words matter.",
     copyWords: 'Copy the words',
     copyToast:
-      "Copied. Paste them into your password manager or notes, then delete once you've written them on paper.",
+      "Copied for a moment. Paste them into your password manager now, then delete them from your clipboard and its history — anything you copy next can be read by other apps.",
     continue: "I've written them down",
     leaveHeading: 'Leave without saving your words?',
     leaveBody:
@@ -72,15 +72,20 @@ export const strings = {
     body: "You'll use this to unlock the wallet on this phone. It protects your wallet if someone else gets your device. It's separate from your 12 words.",
     passwordLabel: 'Password',
     confirmLabel: 'Confirm password',
-    strengthHint: 'Use at least 8 characters.',
-    strengthOk: 'Looks good.',
+    // Strength band labels shown next to the live meter (F3).
+    strengthLabel: (band: string): string => `Password strength: ${band}`,
+    strengthTooShort: 'too short',
+    strengthWeak: 'weak',
+    strengthFair: 'okay',
+    strengthGood: 'good',
+    strengthStrong: 'strong',
     faceIdToggle: 'Unlock with Face ID',
     faceIdSubtext: 'Skip typing your password on this phone.',
     submit: 'Set password',
     clarify:
       "Your password only unlocks this app on this phone. It can't recover your wallet — only your 12 words can do that.",
     mismatch: "These don't match yet.",
-    tooShort: 'A little longer, please — at least 8 characters.',
+    tooShort: 'A little longer, please — at least 10 characters.',
   },
 
   home: {
@@ -98,6 +103,10 @@ export const strings = {
     emptyActivity: 'Nothing here yet.',
     emptyActivityBody: 'Your payments will show up here once you send or receive.',
     priceUnavailable: 'price unavailable',
+    // Shown under the balance when a payment you sent is still confirming, so the
+    // hero balance doesn't imply that money is still spendable (F9).
+    pendingOut: (amount: string): string => `${amount} on its way out, waiting to confirm`,
+    pendingIn: (amount: string): string => `${amount} on its way in, waiting to confirm`,
   },
 
   receive: {
@@ -170,6 +179,12 @@ export const strings = {
     failHeading: "We couldn't send that just now",
     failBody:
       'Your bitcoin is safe and still in your wallet — nothing was sent. This is usually a connection problem. Check your internet and try again.',
+    // Dry-run failure: the amounts couldn't be worked out (e.g. the balance
+    // changed while you were here). Block sending; send them back to re-check.
+    recheckHeading: "Let's double-check this payment",
+    recheckBody:
+      "We couldn't work out the fee and total just now — your available balance may have changed. Go back and enter the payment again so the numbers are right before you send.",
+    recheckGoBack: 'Go back and re-check',
   },
 
   sent: {

@@ -38,11 +38,19 @@ export interface AccountApi {
  */
 export type AddressDeriver = (chain: Chain, index: number) => DerivedAddress;
 
-/** Tuning knobs for gap-limit discovery. Defaults match the DESIGN brief. */
+/** Tuning knobs for gap-limit discovery. */
 export interface DiscoveryOptions {
-  /** Consecutive never-used addresses that end a chain scan. Default 5. */
+  /**
+   * Consecutive never-used addresses that end a chain scan. Default 20 — the
+   * standard BIP44 gap limit (F8). The previous default of 5 could miss funds
+   * received to an address a few slots past the last used one; 20 matches what
+   * other wallets do, so a wallet restored elsewhere finds the same funds here.
+   */
   readonly gapLimit: number;
-  /** Hard cap on index scanned per chain, for speed/safety. Default 50. */
+  /**
+   * Hard cap on index scanned per chain, for speed/safety. Default 200 (F8),
+   * comfortably above the gap limit so a legitimately deep chain is still found.
+   */
   readonly maxIndex: number;
   /** How many address lookups to run at once. Default 4. */
   readonly concurrency: number;
@@ -50,10 +58,10 @@ export interface DiscoveryOptions {
   readonly activityLimit: number;
 }
 
-/** Default discovery options per the DESIGN brief. */
+/** Default discovery options. Gap limit follows the BIP44 standard (F8). */
 export const DEFAULT_DISCOVERY_OPTIONS: DiscoveryOptions = {
-  gapLimit: 5,
-  maxIndex: 50,
+  gapLimit: 20,
+  maxIndex: 200,
   concurrency: 4,
   activityLimit: 25,
 };

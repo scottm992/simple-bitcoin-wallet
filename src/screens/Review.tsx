@@ -7,6 +7,15 @@ import { fmtBtc, fmtUsd } from '../display';
 import type { Network } from '../lib';
 import type { FeeTier, PendingSend } from '../state';
 
+/**
+ * The result of the Review dry-run build. `ok: false` means the build could not
+ * be completed (e.g. the UTXO set changed under a poll, or the fee tripped the
+ * sanity guard) so Review must block sending rather than show fake numbers (F4).
+ */
+export type ReviewNumbers =
+  | { ok: true; amountSats: bigint; feeSats: bigint; totalSats: bigint }
+  | { ok: false };
+
 /** Fee-time label for the review row, matching the compose chips. */
 function tierTime(tier: FeeTier): string {
   return tier === 'faster'
@@ -21,14 +30,15 @@ function tierTime(tier: FeeTier): string {
  * total, plus the verbatim irreversibility line. On Live mode the "I've checked
  * the address" checkbox gates the Send now button. Broadcast failures show a
  * non-destructive retry sheet (money did NOT leave).
+ *
+ * If the dry-run build failed (`numbers.ok === false`), we render a blocking
+ * "re-check this payment" state with NO amounts and NO enabled Send button (F4).
  */
 export function Review(props: {
   network: Network;
   pending: PendingSend;
-  /** Amount/fee/total in sats, resolved from a dry-run build (accurate). */
-  amountSats: bigint;
-  feeSats: bigint;
-  totalSats: bigint;
+  /** Amount/fee/total from the dry-run build, or a blocked marker on failure. */
+  numbers: ReviewNumbers;
   btcUsd: number | null;
   onConfirm: () => Promise<void>;
   onBack: () => void;
@@ -39,6 +49,29 @@ export function Review(props: {
   const [failed, setFailed] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
+  // F4: a failed dry-run blocks the whole screen. Render a recheck state with no
+  // fabricated numbers and no way to send.
+  if (!props.numbers.ok) {
+    return (
+      <Chrome network={props.network} onBack={props.onBack} title={strings.review.title}>
+        <div className="screen-body">
+          <h1 className="h1" style={{ fontSize: 'var(--fs-heading)' }}>
+            {strings.review.recheckHeading}
+          </h1>
+          <div className="warn">
+            <div className="warn__text">{strings.review.recheckBody}</div>
+          </div>
+          <div className="bottom-actions">
+            <button className="btn btn--primary btn--block" onClick={props.onBack}>
+              {strings.review.recheckGoBack}
+            </button>
+          </div>
+        </div>
+      </Chrome>
+    );
+  }
+
+  const { amountSats, feeSats, totalSats } = props.numbers;
   const canSend = (!live || checked) && !busy;
 
   async function send(): Promise<void> {
@@ -68,8 +101,8 @@ export function Review(props: {
         </h1>
 
         <div className="rev-amt">
-          <div className="rev-amt__hero">{fmtUsd(props.amountSats, props.btcUsd)}</div>
-          <div className="rev-amt__btc">{fmtBtc(props.amountSats)} BTC</div>
+          <div className="rev-amt__hero">{fmtUsd(amountSats, props.btcUsd)}</div>
+          <div className="rev-amt__btc">{fmtBtc(amountSats)} BTC</div>
         </div>
 
         <label className="label">{strings.review.toLabel}</label>
@@ -81,15 +114,15 @@ export function Review(props: {
           <div className="rev-row">
             <span className="rev-row__k">{strings.review.feeLabel}</span>
             <span className="rev-row__v">
-              {strings.review.feeValue(fmtUsd(props.feeSats, props.btcUsd), tierTime(props.pending.feeTier))}
+              {strings.review.feeValue(fmtUsd(feeSats, props.btcUsd), tierTime(props.pending.feeTier))}
             </span>
           </div>
           <div className="rev-row rev-row--total">
             <span className="rev-row__k">{strings.review.totalLabel}</span>
             <span className="rev-row__v">
-              {fmtUsd(props.totalSats, props.btcUsd)}
+              {fmtUsd(totalSats, props.btcUsd)}
               <br />
-              <span className="rev-row__v-sub">{fmtBtc(props.totalSats)} BTC</span>
+              <span className="rev-row__v-sub">{fmtBtc(totalSats)} BTC</span>
             </span>
           </div>
         </div>

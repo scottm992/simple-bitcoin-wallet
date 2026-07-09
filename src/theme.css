@@ -349,6 +349,27 @@ body {
 .hint { font-size: var(--fs-small); margin-top: var(--sp-2); color: var(--text-secondary); }
 .hint--ok { color: var(--success); }
 
+/* Password strength meter (Set-a-password) */
+.pw-meter { margin-top: var(--sp-2); }
+.pw-meter__bar {
+  height: 6px;
+  width: 100%;
+  background: var(--surface-inset);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+}
+.pw-meter__fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--radius-pill);
+  transition: width .15s ease, background .15s ease;
+}
+.pw-meter__fill--too-short { width: 15%;  background: var(--danger); }
+.pw-meter__fill--weak      { width: 33%;  background: var(--danger); }
+.pw-meter__fill--fair      { width: 55%;  background: var(--warning); }
+.pw-meter__fill--good      { width: 80%;  background: var(--success); }
+.pw-meter__fill--strong    { width: 100%; background: var(--success); }
+
 /* Toggle row (Face ID) */
 .toggle-row {
   display: flex; align-items: center; justify-content: space-between;
@@ -384,6 +405,16 @@ body {
 .balance__hero--practice { color: var(--accent); }
 .balance__secondary { font-size: var(--fs-callout); color: var(--text-secondary); margin-top: var(--sp-2); font-weight: var(--fw-medium); }
 .balance__hint { font-size: 11px; color: var(--text-muted); margin-top: var(--sp-1); }
+
+/* Pending in/out line under the balance hero (F9) */
+.pending-line {
+  text-align: center;
+  font-size: var(--fs-small);
+  margin-top: var(--sp-2);
+  font-weight: var(--fw-medium);
+}
+.pending-line--out { color: var(--warning); }
+.pending-line--in { color: var(--success); }
 
 /* ---- Home verb tiles ---- */
 .verb-row { display: flex; gap: var(--sp-3); margin: var(--sp-5) 0 var(--sp-2); }

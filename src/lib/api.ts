@@ -7,9 +7,25 @@
  * API-level rejection ({@link ApiResponseError}).
  */
 import type { Network } from './wallet';
+import { MAX_SUPPLY_SATS } from './format';
 
 /** Default per-request timeout, in milliseconds. */
 const DEFAULT_TIMEOUT_MS = 15_000;
+
+/**
+ * Fee-rate sanity window (sat/vByte) applied to untrusted estimates from
+ * mempool.space (F1). A legitimate rate is ~1–50 even in heavy congestion; we
+ * accept a generous ceiling but clamp anything outside `[MIN, MAX]` so a
+ * compromised/buggy endpoint can't push a wallet-draining rate into the signer.
+ */
+export const MIN_ACCEPTED_FEE_RATE = 1;
+export const MAX_ACCEPTED_FEE_RATE = 500;
+
+/**
+ * Hard cap on the number of array entries we will ingest from a single list
+ * endpoint (utxos / txs), so a hostile response can't exhaust memory (F2).
+ */
+const MAX_ARRAY_ENTRIES = 5_000;
 
 /** Base URL for the mempool.space REST API for a given network. */
 export function apiBaseUrl(network: Network): string {
@@ -41,6 +57,73 @@ export class ApiResponseError extends Error {
     this.status = status;
     this.body = body;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Untrusted-response validation (F2)
+//
+// Every numeric/string field consumed from mempool.space is validated on ingest
+// so a hostile or buggy response surfaces as a typed ApiResponseError rather
+// than a NaN, a thrown BigInt(), or an implausible balance wedging the wallet.
+// ---------------------------------------------------------------------------
+
+/** Asserts `v` is a JSON object (not null, not an array). */
+function asObject(v: unknown, what: string): Record<string, unknown> {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+    throw new ApiResponseError(200, `Malformed ${what}: expected an object`);
+  }
+  return v as Record<string, unknown>;
+}
+
+/** Asserts `v` is an array no larger than `MAX_ARRAY_ENTRIES`. */
+function asArray(v: unknown, what: string): unknown[] {
+  if (!Array.isArray(v)) {
+    throw new ApiResponseError(200, `Malformed ${what}: expected an array`);
+  }
+  if (v.length > MAX_ARRAY_ENTRIES) {
+    throw new ApiResponseError(200, `Malformed ${what}: too many entries (${v.length})`);
+  }
+  return v;
+}
+
+/**
+ * Validates a satoshi value: a safe, non-negative integer no larger than the
+ * 21M-BTC supply cap. Returns it as a bigint. Rejects floats, NaN, negatives,
+ * non-numbers, and implausibly large aggregates (F2).
+ */
+function satAmount(v: unknown, what: string): bigint {
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || !Number.isSafeInteger(v)) {
+    throw new ApiResponseError(200, `Malformed ${what}: not a non-negative integer`);
+  }
+  const sats = BigInt(v);
+  if (sats > MAX_SUPPLY_SATS) {
+    throw new ApiResponseError(200, `Malformed ${what}: exceeds the 21M BTC supply cap`);
+  }
+  return sats;
+}
+
+/** Validates a non-negative integer (e.g. a vout / block height). */
+function nonNegInt(v: unknown, what: string): number {
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || !Number.isSafeInteger(v)) {
+    throw new ApiResponseError(200, `Malformed ${what}: not a non-negative integer`);
+  }
+  return v;
+}
+
+/** Validates a lowercase-hex transaction id (64 hex chars). */
+function txid(v: unknown, what: string): string {
+  if (typeof v !== 'string' || !/^[0-9a-f]{64}$/.test(v)) {
+    throw new ApiResponseError(200, `Malformed ${what}: not a valid txid`);
+  }
+  return v;
+}
+
+/** Validates a boolean field. */
+function asBool(v: unknown, what: string): boolean {
+  if (typeof v !== 'boolean') {
+    throw new ApiResponseError(200, `Malformed ${what}: not a boolean`);
+  }
+  return v;
 }
 
 /** Confirmed + pending balance for an address, in satoshis. */
@@ -125,23 +208,23 @@ async function getJson<T>(url: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<
   }
 }
 
-/** Shape of mempool.space's `/address/:addr` response (subset used). */
-interface RawAddressStats {
-  chain_stats: { funded_txo_sum: number; spent_txo_sum: number };
-  mempool_stats: { funded_txo_sum: number; spent_txo_sum: number };
-}
-
 /**
- * Fetches confirmed and pending balance for an address.
+ * Fetches confirmed and pending balance for an address. Every numeric field is
+ * validated on ingest (F2): integers only, non-negative, ≤ 21M BTC. A malformed
+ * value surfaces as an {@link ApiResponseError} rather than a NaN or a thrown
+ * BigInt wedging the wallet into the network-error state.
  * @param network - The active network.
  * @param address - The address to query.
  */
 export async function getAddressStats(network: Network, address: string): Promise<AddressStats> {
-  const raw = await getJson<RawAddressStats>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}`);
-  const funded = BigInt(raw.chain_stats.funded_txo_sum);
-  const spent = BigInt(raw.chain_stats.spent_txo_sum);
-  const memFunded = BigInt(raw.mempool_stats.funded_txo_sum);
-  const memSpent = BigInt(raw.mempool_stats.spent_txo_sum);
+  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}`);
+  const obj = asObject(raw, 'address stats');
+  const chain = asObject(obj['chain_stats'], 'chain_stats');
+  const mem = asObject(obj['mempool_stats'], 'mempool_stats');
+  const funded = satAmount(chain['funded_txo_sum'], 'chain funded_txo_sum');
+  const spent = satAmount(chain['spent_txo_sum'], 'chain spent_txo_sum');
+  const memFunded = satAmount(mem['funded_txo_sum'], 'mempool funded_txo_sum');
+  const memSpent = satAmount(mem['spent_txo_sum'], 'mempool spent_txo_sum');
   return {
     confirmedSats: funded - spent,
     pendingSats: memFunded - memSpent,
@@ -150,52 +233,59 @@ export async function getAddressStats(network: Network, address: string): Promis
   };
 }
 
-/** Shape of mempool.space's `/address/:addr/utxo` response entries. */
-interface RawUtxo {
-  txid: string;
-  vout: number;
-  value: number;
-  status: { confirmed: boolean; block_height?: number };
-}
-
 /**
- * Fetches the unspent outputs for an address.
+ * Fetches the unspent outputs for an address. Every entry is validated on ingest
+ * (F2): txids must be well-formed, values are non-negative integers ≤ 21M BTC,
+ * and the array is size-capped. A malformed entry surfaces as an
+ * {@link ApiResponseError}, never a thrown BigInt or a bad UTXO into signing.
  * @param network - The active network.
  * @param address - The address to query.
  */
 export async function getUtxos(network: Network, address: string): Promise<ApiUtxo[]> {
-  const raw = await getJson<RawUtxo[]>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/utxo`);
-  return raw.map((u) => {
+  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/utxo`);
+  const arr = asArray(raw, 'utxo list');
+  return arr.map((entry) => {
+    const u = asObject(entry, 'utxo');
+    const status = asObject(u['status'], 'utxo status');
+    const confirmed = asBool(status['confirmed'], 'utxo confirmed');
+    const blockHeight = status['block_height'];
     const utxo: ApiUtxo = {
-      txid: u.txid,
-      vout: u.vout,
-      value: BigInt(u.value),
-      confirmed: u.status.confirmed,
-      ...(u.status.block_height !== undefined ? { blockHeight: u.status.block_height } : {}),
+      txid: txid(u['txid'], 'utxo txid'),
+      vout: nonNegInt(u['vout'], 'utxo vout'),
+      value: satAmount(u['value'], 'utxo value'),
+      confirmed,
+      ...(blockHeight !== undefined ? { blockHeight: nonNegInt(blockHeight, 'utxo block_height') } : {}),
     };
     return utxo;
   });
 }
 
-/** Shape of mempool.space's `/v1/fees/recommended` response. */
-interface RawFees {
-  fastestFee: number;
-  halfHourFee: number;
-  hourFee: number;
-  economyFee: number;
-  minimumFee: number;
+/**
+ * Clamps an untrusted fee-rate estimate into the accepted `[MIN, MAX]` window
+ * (F1). A non-finite/≤0 value falls back to the minimum accepted rate rather
+ * than propagating a bad number into fee math.
+ */
+function clampFeeRate(v: unknown): number {
+  const n = typeof v === 'number' && Number.isFinite(v) ? v : MIN_ACCEPTED_FEE_RATE;
+  if (n < MIN_ACCEPTED_FEE_RATE) return MIN_ACCEPTED_FEE_RATE;
+  if (n > MAX_ACCEPTED_FEE_RATE) return MAX_ACCEPTED_FEE_RATE;
+  return n;
 }
 
 /**
- * Fetches recommended fee rates, mapped to fast/medium/slow (sat/vByte).
+ * Fetches recommended fee rates, mapped to fast/medium/slow (sat/vByte). Each
+ * rate is clamped into the sane `[MIN_ACCEPTED_FEE_RATE, MAX_ACCEPTED_FEE_RATE]`
+ * window (F1) so a compromised/spiking endpoint can't push a wallet-draining
+ * fee rate downstream.
  * @param network - The active network.
  */
 export async function getFeeEstimates(network: Network): Promise<FeeEstimates> {
-  const raw = await getJson<RawFees>(`${apiBaseUrl(network)}/v1/fees/recommended`);
+  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/v1/fees/recommended`);
+  const obj = asObject(raw, 'fee estimates');
   return {
-    fast: raw.fastestFee,
-    medium: raw.halfHourFee,
-    slow: raw.hourFee,
+    fast: clampFeeRate(obj['fastestFee']),
+    medium: clampFeeRate(obj['halfHourFee']),
+    slow: clampFeeRate(obj['hourFee']),
   };
 }
 
@@ -220,51 +310,62 @@ export async function broadcastTx(network: Network, txHex: string): Promise<stri
   return body; // mempool.space returns the txid as plain text
 }
 
-/** Shape of mempool.space's `/address/:addr/txs` entries (subset used). */
-interface RawTx {
-  txid: string;
-  status: { confirmed: boolean; block_time?: number };
-  vin: { prevout: { scriptpubkey_address?: string; value: number } | null }[];
-  vout: { scriptpubkey_address?: string; value: number }[];
-}
-
 /**
  * Fetches recent transactions touching an address, with the net value change
- * for that address computed per transaction.
+ * for that address computed per transaction. Every field is validated on ingest
+ * (F2): txids well-formed, per-output/input values are non-negative integers
+ * ≤ 21M BTC, and both the tx list and each tx's vin/vout arrays are size-capped.
+ * A malformed entry surfaces as an {@link ApiResponseError}.
  * @param network - The active network.
  * @param address - The address to query.
  */
 export async function getAddressTxs(network: Network, address: string): Promise<AddressTx[]> {
-  const raw = await getJson<RawTx[]>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/txs`);
-  return raw.map((tx) => {
+  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/txs`);
+  const arr = asArray(raw, 'tx list');
+  return arr.map((entry) => {
+    const tx = asObject(entry, 'tx');
+    const status = asObject(tx['status'], 'tx status');
+    const confirmed = asBool(status['confirmed'], 'tx confirmed');
+    const blockTime = status['block_time'];
+
     let net = 0n;
-    for (const vout of tx.vout) {
-      if (vout.scriptpubkey_address === address) net += BigInt(vout.value);
+    for (const voutEntry of asArray(tx['vout'], 'tx vout')) {
+      const vout = asObject(voutEntry, 'vout');
+      if (vout['scriptpubkey_address'] === address) net += satAmount(vout['value'], 'vout value');
     }
-    for (const vin of tx.vin) {
-      if (vin.prevout && vin.prevout.scriptpubkey_address === address) net -= BigInt(vin.prevout.value);
+    for (const vinEntry of asArray(tx['vin'], 'tx vin')) {
+      const vin = asObject(vinEntry, 'vin');
+      const prevout = vin['prevout'];
+      if (prevout !== null && prevout !== undefined) {
+        const po = asObject(prevout, 'prevout');
+        if (po['scriptpubkey_address'] === address) net -= satAmount(po['value'], 'prevout value');
+      }
     }
     const out: AddressTx = {
-      txid: tx.txid,
-      confirmed: tx.status.confirmed,
+      txid: txid(tx['txid'], 'tx txid'),
+      confirmed,
       netSats: net,
-      ...(tx.status.block_time !== undefined ? { blockTime: tx.status.block_time } : {}),
+      ...(blockTime !== undefined ? { blockTime: nonNegInt(blockTime, 'tx block_time') } : {}),
     };
     return out;
   });
 }
 
-/** Shape of mempool.space's `/v1/prices` response (subset used). */
-interface RawPrices {
-  USD: number;
-}
-
 /**
  * Fetches the current BTC/USD price. Always queries mainnet regardless of the
- * active network (there is no meaningful testnet price).
+ * active network (there is no meaningful testnet price). The value is validated
+ * as a finite, positive, plausibly-bounded number (F2) so a malformed price
+ * can't feed a NaN/absurd figure into the USD display.
  * @returns The BTC price in USD.
  */
 export async function getBtcUsdPrice(): Promise<number> {
-  const raw = await getJson<RawPrices>('https://mempool.space/api/v1/prices');
-  return raw.USD;
+  const raw = await getJson<unknown>('https://mempool.space/api/v1/prices');
+  const obj = asObject(raw, 'prices');
+  const usd = obj['USD'];
+  // A generous upper bound: reject clearly-bogus prices while never rejecting a
+  // real one. 1e9 USD/BTC is orders of magnitude beyond any plausible market.
+  if (typeof usd !== 'number' || !Number.isFinite(usd) || usd <= 0 || usd > 1e9) {
+    throw new ApiResponseError(200, 'Malformed price: not a plausible positive number');
+  }
+  return usd;
 }

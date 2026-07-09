@@ -34,11 +34,15 @@ the mnemonic in at call time and let it go out of scope.
 
 **Types**
 - `WalletUtxo { txid: string; vout: number; value: bigint; path: string; address: string }`
-- `BuildTxParams { mnemonic; network; utxos; recipient; amountSats: bigint; feeRateSatVb: number; changeAddress; sendMax? }`
+- `BuildTxParams { mnemonic; network; utxos; recipient; amountSats: bigint; feeRateSatVb: number; changeAddress; sendMax?; allowHighFee? }`
 - `BuiltTx { txHex; txid; feeSats: bigint; vsize: number; totalInputSats: bigint; changeSats: bigint }`
 - `DUST_LIMIT_SATS = 546n`
 
-**Errors**: `InsufficientFundsError` (`.available`, `.required`), `InvalidRecipientError`, `InvalidTxParamsError`.
+**Fee-sanity constants (F1)**: `MAX_FEE_RATE_SAT_VB = 500`, `MAX_FEE_FRACTION = 0.25`, `MAX_FEE_ABSOLUTE_SATS = 1_000_000n`.
+
+**Errors**: `InsufficientFundsError` (`.available`, `.required`), `InvalidRecipientError`, `InvalidTxParamsError`, `FeeTooHighError` (`.feeSats`, `.feeRateSatVb`, `.comparedToSats`).
+
+`buildAndSignTx` rejects (with `FeeTooHighError`) a fee rate above `MAX_FEE_RATE_SAT_VB`, or a computed fee above `MAX_FEE_FRACTION` of the amount being sent (total input for `sendMax`) or above `MAX_FEE_ABSOLUTE_SATS`, unless `allowHighFee: true` is set after an explicit informed confirmation.
 
 **Functions**
 - `buildAndSignTx(params: BuildTxParams): BuiltTx` — validates recipient for the network, runs largest-first coin selection with fee iteration, folds dust change into the fee, supports `sendMax`. Signs P2WPKH inputs, finalizes, returns hex + txid.
@@ -56,7 +60,11 @@ Every call takes `network: Network` first. GETs retry once on transport failure;
 - `FeeEstimates { fast; medium; slow }` (sat/vB numbers)
 - `AddressTx { txid; confirmed; blockTime?; netSats: bigint }`
 
-**Errors**: `ApiNetworkError` (`.cause`) — transport; `ApiResponseError` (`.status`, `.body`) — non-2xx.
+**Fee-rate clamp constants (F1)**: `MIN_ACCEPTED_FEE_RATE = 1`, `MAX_ACCEPTED_FEE_RATE = 500`. `getFeeEstimates` clamps every returned rate into this window.
+
+**Validation (F2)**: every numeric/string field consumed from mempool.space is validated on ingest — integers only, non-negative, `≤ MAX_SUPPLY_SATS`, well-formed 64-hex txids, array size caps. A malformed field throws a typed `ApiResponseError` (never a NaN or an uncaught `BigInt()` throw).
+
+**Errors**: `ApiNetworkError` (`.cause`) — transport; `ApiResponseError` (`.status`, `.body`) — non-2xx **or** malformed/out-of-range response.
 
 **Functions**
 - `apiBaseUrl(network): string`
@@ -89,8 +97,8 @@ remains a fallback. Secrets are never logged or placed in errors.
 - `getVaultNetwork(): Network | null`; `setVaultNetwork(network): void`
 
 **Passkey functions** (all fail gracefully with typed errors)
-- `isPasskeySupported(): boolean` — cheap capability check.
-- `probePasskeyPrf(): Promise<boolean>` — deeper PRF probe (creates a throwaway credential; call only on opt-in).
+- `isPasskeySupported(): boolean` — cheap, side-effect-free capability check (use this by default).
+- `probePasskeyPrf(opts: { userInitiated: boolean }): Promise<boolean>` — deeper PRF probe. **Creates a real platform credential** (WebAuthn has no side-effect-free PRF probe), so it refuses to run unless `userInitiated: true` and best-effort signals the throwaway credential for pruning (F7). Call only from an explicit user opt-in, immediately before `enablePasskeyUnlock`.
 - `enablePasskeyUnlock(mnemonic): Promise<void>` — create platform passkey + store PRF-wrapped ciphertext.
 - `unlockWithPasskey(): Promise<string>`
 - `isPasskeyEnabled(): boolean`; `disablePasskeyUnlock(): void`

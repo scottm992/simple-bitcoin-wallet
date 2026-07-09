@@ -39,7 +39,7 @@ import { Unlock } from './screens/Unlock';
 import { Home } from './screens/Home';
 import { Receive } from './screens/Receive';
 import { Send } from './screens/Send';
-import { Review } from './screens/Review';
+import { Review, type ReviewNumbers } from './screens/Review';
 import { Sent } from './screens/Sent';
 import { Activity } from './screens/Activity';
 import { Settings } from './screens/Settings';
@@ -76,6 +76,13 @@ export default function App(): JSX.Element {
   // Display unit for the balance (remembered per session).
   const [unit, setUnit] = useState<DisplayUnit>('usd');
   const [firstHomeVisit, setFirstHomeVisit] = useState(true);
+
+  // F6: client-side throttle on wrong-password unlock attempts. This is NOT a
+  // real security boundary — a determined attacker copies the vault and brute-
+  // forces it offline (scrypt is the actual defence). It only slows a casual
+  // device-local guesser and is documented as such. The count lives in a ref so
+  // it survives re-renders but resets on a full reload / successful unlock.
+  const failedUnlocksRef = useRef(0);
 
   // Which activity txid to auto-open when navigating from Home (optional).
   const [explainerOpen, setExplainerOpen] = useState(false);
@@ -211,13 +218,22 @@ export default function App(): JSX.Element {
 
   // ---- Unlock -------------------------------------------------------------
   async function unlockPassword(password: string): Promise<boolean> {
+    // F6: after a few wrong tries, add a short, growing delay before the next
+    // attempt is even evaluated. Capped so a legitimate user isn't locked out.
+    const fails = failedUnlocksRef.current;
+    if (fails >= 3) {
+      const delayMs = Math.min(2 ** (fails - 3) * 500, 5_000);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
     try {
       const mnemonic = await unlockVault(password);
       setUnlocked(mnemonic);
+      failedUnlocksRef.current = 0;
       dispatch({ type: 'unlocked' });
       setFirstHomeVisit(true);
       return true;
     } catch {
+      failedUnlocksRef.current += 1;
       return false;
     }
   }
@@ -280,32 +296,40 @@ export default function App(): JSX.Element {
   }
 
   // Dry-run the build to show accurate fee/total on Review, reusing the same
-  // params the confirm step will use (idempotent).
-  function reviewNumbers(pending: PendingSend): { amountSats: bigint; feeSats: bigint; totalSats: bigint } {
-    if (!state.account) return { amountSats: pending.amountSats, feeSats: 0n, totalSats: pending.amountSats };
+  // params the confirm step will use (idempotent). On ANY failure we return an
+  // `ok: false` result so Review blocks sending and shows a "recheck this
+  // payment" state — never fabricated $0-fee numbers on the last-chance money
+  // screen (F4).
+  function reviewNumbers(pending: PendingSend): ReviewNumbers {
+    if (!state.account) return { ok: false };
     try {
       const built = getMnemonicBuild(pending);
       const amountSats = pending.sendMax
         ? built.totalInputSats - built.feeSats
         : pending.amountSats;
       return {
+        ok: true,
         amountSats,
         feeSats: built.feeSats,
         totalSats: amountSats + built.feeSats,
       };
     } catch {
-      // If the build can't complete (shouldn't happen after compose validation),
-      // fall back to the composed numbers.
-      return {
-        amountSats: pending.amountSats,
-        feeSats: 0n,
-        totalSats: pending.amountSats,
-      };
+      // The UTXO set may have changed under a 30s poll (InsufficientFunds), the
+      // fee may have tripped the sanity guard (FeeTooHighError), etc. Whatever
+      // the cause, we must not render numbers we can't stand behind.
+      return { ok: false };
     }
   }
 
-  /** Builds (but does not broadcast) the tx to read accurate accounting. */
+  /**
+   * Builds (but does not broadcast) the tx to read accurate accounting. Requires
+   * a wallet change address; if one is somehow missing we throw rather than
+   * defaulting change to any external address (F7 — fail closed, never overpay
+   * the recipient).
+   */
   function getMnemonicBuild(pending: PendingSend): ReturnType<typeof buildAndSignTx> {
+    const changeAddress = state.account?.changeAddress;
+    if (!changeAddress) throw new Error('missing change address');
     const mnemonic = getMnemonic();
     return buildAndSignTx({
       mnemonic,
@@ -314,7 +338,7 @@ export default function App(): JSX.Element {
       recipient: pending.recipient,
       amountSats: pending.amountSats,
       feeRateSatVb: pending.feeRateSatVb,
-      changeAddress: state.account?.changeAddress ?? pending.recipient,
+      changeAddress,
       sendMax: pending.sendMax,
     });
   }
@@ -510,9 +534,7 @@ export default function App(): JSX.Element {
           <Review
             network={network}
             pending={state.pendingSend}
-            amountSats={nums.amountSats}
-            feeSats={nums.feeSats}
-            totalSats={nums.totalSats}
+            numbers={nums}
             btcUsd={state.btcUsd}
             onConfirm={confirmSend}
             onBack={() => dispatch({ type: 'navigate', screen: 'send' })}
@@ -521,9 +543,8 @@ export default function App(): JSX.Element {
       }
 
       case 'sent': {
-        const amt = state.pendingSend
-          ? reviewNumbers(state.pendingSend).amountSats
-          : 0n;
+        const nums = state.pendingSend ? reviewNumbers(state.pendingSend) : { ok: false as const };
+        const amt = nums.ok ? nums.amountSats : 0n;
         return (
           <Sent
             network={network}

@@ -3,7 +3,24 @@ import { useState } from 'react';
 import { strings } from '../strings';
 import { Chrome } from '../components/Chrome';
 import { PasswordInput } from '../components/ui';
+import { assessPassword, type PasswordStrength } from '../password';
 import type { Network } from '../lib';
+
+/** Maps a strength band to its plain-English label + meter class. */
+function bandLabel(strength: PasswordStrength): string {
+  switch (strength) {
+    case 'too-short':
+      return strings.password.strengthTooShort;
+    case 'weak':
+      return strings.password.strengthWeak;
+    case 'fair':
+      return strings.password.strengthFair;
+    case 'good':
+      return strings.password.strengthGood;
+    case 'strong':
+      return strings.password.strengthStrong;
+  }
+}
 
 /**
  * Set-a-password for this device. Optionally enables Face ID (passkey) unlock.
@@ -23,9 +40,9 @@ export function SetPassword(props: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const longEnough = password.length >= 8;
+  const assessment = assessPassword(password);
   const matches = password === confirm && confirm.length > 0;
-  const canSubmit = longEnough && matches && !busy;
+  const canSubmit = assessment.acceptable && matches && !busy;
 
   const confirmError = confirm.length > 0 && password !== confirm;
 
@@ -59,9 +76,22 @@ export function SetPassword(props: {
               ariaLabel={strings.password.passwordLabel}
             />
           </div>
-          <div className={`hint ${longEnough ? 'hint--ok' : ''}`}>
-            {longEnough ? strings.password.strengthOk : strings.password.strengthHint}
-          </div>
+          {password.length > 0 ? (
+            <div
+              className={`pw-meter pw-meter--${assessment.strength}`}
+              role="status"
+              aria-label={strings.password.strengthLabel(bandLabel(assessment.strength))}
+            >
+              <div className="pw-meter__bar" aria-hidden="true">
+                <span className={`pw-meter__fill pw-meter__fill--${assessment.strength}`} />
+              </div>
+              <div className={`hint ${assessment.acceptable ? 'hint--ok' : ''}`}>
+                {assessment.hint}
+              </div>
+            </div>
+          ) : (
+            <div className="hint">{assessment.hint}</div>
+          )}
         </div>
 
         <div className="field-group">
