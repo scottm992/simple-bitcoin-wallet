@@ -6,11 +6,14 @@ import type { PendingSend } from './state';
 import {
   createVault,
   deleteVault as deleteVaultStorage,
+  deriveReceiveAddress,
   disablePasskeyUnlock,
   enablePasskeyUnlock,
   generateMnemonic,
+  getCachedReceiveIndex,
   isPasskeyEnabled,
   isPasskeySupported,
+  setCachedReceiveIndex,
   setVaultNetwork,
   unlockVault,
   unlockWithPasskey,
@@ -132,6 +135,9 @@ export default function App(): JSX.Element {
       });
     try {
       const account = await loadAccount(network);
+      // Remember the next-unused receive index (non-secret) so Receive can
+      // derive the right address locally if a later discovery is unavailable.
+      setCachedReceiveIndex(network, account.receiveIndex);
       dispatch({ type: 'accountLoaded', account });
     } catch {
       dispatch({ type: 'accountError' });
@@ -289,6 +295,30 @@ export default function App(): JSX.Element {
     deleteVaultStorage();
     lockNow();
     dispatch({ type: 'vaultDeleted' });
+  }
+
+  // ---- Receive -------------------------------------------------------------
+  /**
+   * The address Receive shows. Discovery only determines which index is next-
+   * UNUSED; the wallet's own addresses are always derivable locally. So when
+   * discovery hasn't succeeded (flaky network, still loading), fall back to a
+   * locally-derived receive address — at the last cached next-unused index if
+   * one was ever recorded for this network, else index 0 — so Receive ALWAYS
+   * shows a real, spendable-to address of this wallet. Worst case is address
+   * reuse; showing nothing (or an empty QR) is never acceptable.
+   */
+  function receiveDisplayAddress(): string {
+    if (state.account) return state.account.receiveAddress;
+    if (!isUnlocked()) return '';
+    try {
+      const index = getCachedReceiveIndex(state.network) ?? 0;
+      return deriveReceiveAddress(getMnemonic(), state.network, index).address;
+    } catch {
+      // Derivation should never fail with an unlocked session; if it somehow
+      // does, Receive renders its "can't show your address" state — never an
+      // empty QR.
+      return '';
+    }
   }
 
   // ---- Send / Review ------------------------------------------------------
@@ -506,7 +536,7 @@ export default function App(): JSX.Element {
         return (
           <Receive
             network={network}
-            address={state.account?.receiveAddress ?? ''}
+            address={receiveDisplayAddress()}
             onBack={goHome}
           />
         );

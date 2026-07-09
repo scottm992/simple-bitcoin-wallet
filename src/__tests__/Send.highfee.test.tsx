@@ -51,6 +51,7 @@ function makeAccount(values: readonly bigint[]): AccountSnapshot {
       address: 'bc1qowned',
     })),
     receiveAddress: 'bc1qreceive',
+    receiveIndex: 0,
     changeAddress: 'bc1qchange',
     activity: [],
     usedAddresses: [],

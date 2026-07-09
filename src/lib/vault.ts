@@ -68,6 +68,12 @@ export interface Vault {
   readonly createdAt: string;
   /** Optional passkey unlock material. */
   readonly passkey?: PasskeyBlob;
+  /**
+   * Last-known next-unused receive index per network (not secret — an index,
+   * not an address or key). Lets Receive fall back to a locally-derived
+   * address at the right index when account discovery is unavailable.
+   */
+  readonly lastReceiveIndex?: Partial<Record<Network, number>>;
 }
 
 /** Thrown when the supplied password fails GCM authentication. */
@@ -197,6 +203,29 @@ export function setVaultNetwork(network: Network): void {
   const vault = readVault();
   if (!vault) throw new NoVaultError();
   writeVault({ ...vault, network });
+}
+
+/**
+ * Returns the cached last-known next-unused receive index for a network, or
+ * null when none has been recorded (fresh wallet / never discovered). Not a
+ * secret — it is a derivation index, not an address or key.
+ */
+export function getCachedReceiveIndex(network: Network): number | null {
+  const vault = readVault();
+  const idx = vault?.lastReceiveIndex?.[network];
+  return typeof idx === 'number' && Number.isInteger(idx) && idx >= 0 ? idx : null;
+}
+
+/**
+ * Records the last-known next-unused receive index for a network alongside the
+ * vault (non-secret), so Receive can derive the right address locally when
+ * discovery is unavailable. Silently no-ops without a vault or on a bogus index.
+ */
+export function setCachedReceiveIndex(network: Network, index: number): void {
+  if (!Number.isInteger(index) || index < 0) return;
+  const vault = readVault();
+  if (!vault) return;
+  writeVault({ ...vault, lastReceiveIndex: { ...vault.lastReceiveIndex, [network]: index } });
 }
 
 // ---------------------------------------------------------------------------

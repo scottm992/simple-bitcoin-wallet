@@ -86,6 +86,13 @@ export interface AccountSnapshot {
   readonly utxos: readonly WalletUtxo[];
   /** THE address shown on Receive: the next unused receive (chain-0) address. */
   readonly receiveAddress: string;
+  /**
+   * The derivation index of {@link receiveAddress}. Cached (non-secret) by the
+   * UI so Receive can fall back to a locally-derived address at the last-known
+   * index when discovery is unavailable (flaky network), rather than showing
+   * nothing.
+   */
+  readonly receiveIndex: number;
   /** The next unused change (chain-1) address, for `buildAndSignTx`. */
   readonly changeAddress: string;
   /** Combined recent activity, newest first, deduped, capped. */
@@ -273,6 +280,7 @@ export async function discoverAccount(
     pendingSats,
     utxos,
     receiveAddress: receive.nextUnusedAddress,
+    receiveIndex: receive.nextUnusedIndex,
     changeAddress: change.nextUnusedAddress,
     activity,
     usedAddresses: usedScanned.map((s) => s.derived.address),

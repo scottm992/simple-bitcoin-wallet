@@ -38,6 +38,24 @@ export function Receive(props: {
     await copy();
   }
 
+  // No address at all (should not normally happen — the parent falls back to a
+  // locally derived address even offline). Never render an empty address row
+  // or a QR that encodes nothing a payer could mistakenly scan.
+  if (props.address.trim() === '') {
+    return (
+      <Chrome network={props.network} onBack={props.onBack} title={strings.receive.title}>
+        <div className="screen-body">
+          <h1 className="h1" style={{ fontSize: 'var(--fs-heading)' }}>
+            {strings.receive.heading}
+          </h1>
+          <div className="callout">
+            <div className="callout__body">{strings.receive.unavailable}</div>
+          </div>
+        </div>
+      </Chrome>
+    );
+  }
+
   return (
     <Chrome network={props.network} onBack={props.onBack} title={strings.receive.title}>
       <div className="screen-body">

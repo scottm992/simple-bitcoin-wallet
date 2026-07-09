@@ -121,6 +121,10 @@ export const strings = {
     newAddress: 'Show a new address',
     qrError: "Couldn't draw the code — copy the address instead.",
     qrAlt: 'QR code for your bitcoin address',
+    // Shown if no address is available at all (should not normally happen —
+    // Receive falls back to a locally derived address even offline).
+    unavailable:
+      "We can't show your address right now. Check your connection and try again in a moment.",
   },
 
   send: {

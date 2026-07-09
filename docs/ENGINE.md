@@ -100,6 +100,7 @@ remains a fallback. Secrets are never logged or placed in errors.
 - `unlockVault(password): Promise<string>` — throws `WrongPasswordError` on GCM auth failure.
 - `vaultExists(): boolean`; `deleteVault(): void`
 - `getVaultNetwork(): Network | null`; `setVaultNetwork(network): void`
+- `getCachedReceiveIndex(network): number | null`; `setCachedReceiveIndex(network, index): void` — non-secret last-known next-unused receive index per network, stored alongside the vault. Lets Receive derive a correct address locally when discovery is unavailable (fall back to index 0 if never recorded).
 
 **Passkey functions** (all fail gracefully with typed errors)
 - `isPasskeySupported(): boolean` — cheap, side-effect-free capability check (use this by default).

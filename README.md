@@ -2,6 +2,8 @@
 
 A dead-simple, beginner-friendly Bitcoin wallet that runs entirely in your browser.
 
+**Live app:** https://scottm992.github.io/simple-bitcoin-wallet/
+
 - **Create a wallet** — generates a standard 12-word seed phrase (BIP39)
 - **Receive bitcoin** — shows your address as text + QR code
 - **Send bitcoin** — paste an address, enter an amount, review, send
@@ -12,7 +14,13 @@ A dead-simple, beginner-friendly Bitcoin wallet that runs entirely in your brows
 - **Password-encrypted storage**, with optional Face ID / passkey unlock on
   supported devices (WebAuthn PRF)
 
-> ⚠️ **Status: under construction.** Do not use with real funds yet.
+> ⚠️ **Status: new software.** The code has been through a four-round adversarial
+> security audit (see `docs/review/`) with all findings resolved, but it is young
+> and lightly road-tested. Start in **Practice mode**, then use small amounts you
+> can afford to lose. Known limitations: the app trusts mempool.space for chain
+> data (it validates everything, but a compromised endpoint could still mislead
+> the display); there is no fee-bumping (RBF) for stuck transactions; reusing a
+> receive address reduces privacy; the unlock throttle is client-side only.
 
 ## Security model
 
