@@ -415,6 +415,7 @@ body {
 }
 .pending-line--out { color: var(--warning); }
 .pending-line--in { color: var(--success); }
+.pending-line--checking { color: var(--text-muted); font-weight: var(--fw-regular); }
 
 /* ---- Home verb tiles ---- */
 .verb-row { display: flex; gap: var(--sp-3); margin: var(--sp-5) 0 var(--sp-2); }

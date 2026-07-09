@@ -99,7 +99,13 @@ function persistScanMarks(network: Network, snap: AccountSnapshot): void {
  */
 export function startDiscovery(params: {
   network: Network;
-  onSnapshot: (snapshot: AccountSnapshot) => void;
+  /**
+   * Receives each snapshot as it lands. `complete` is false for the fast
+   * phase-1 result and true for the full gap-20 result (F12): the UI keeps a
+   * subtle "checking for updates" cue up while only an incomplete snapshot is
+   * on screen, and the poll tick completes the scan if this run is cut off.
+   */
+  onSnapshot: (snapshot: AccountSnapshot, complete: boolean) => void;
   onError: () => void;
   deadlineMs?: number;
 }): DiscoveryHandle {
@@ -127,16 +133,21 @@ export function startDiscovery(params: {
         ...shared,
         gapLimit: FAST_GAP_LIMIT,
       });
+      // F13: if the run was superseded while this phase's continuation was
+      // still queued (e.g. a network switch on the same frame), do NOT
+      // dispatch a stale snapshot — the aborter owns the screen now.
+      if (externallyAborted) return;
       gotSnapshot = true;
       persistScanMarks(network, fast);
-      onSnapshot(fast);
+      onSnapshot(fast, false);
 
       const full = await discoverAccount(network, derive, accountApi, {
         ...shared,
         gapLimit: FULL_GAP_LIMIT,
       });
+      if (externallyAborted) return;
       persistScanMarks(network, full);
-      onSnapshot(full);
+      onSnapshot(full, true);
     } catch {
       // Deadline expiry or network failure. With a phase-1 result already on
       // screen we keep it; with nothing, settle to error so the UI never sits
@@ -217,7 +228,7 @@ export class DiscoveryController {
   /** Aborts any in-flight run and starts a fresh two-phase discovery. */
   refresh(params: {
     network: Network;
-    onSnapshot: (snapshot: AccountSnapshot) => void;
+    onSnapshot: (snapshot: AccountSnapshot, complete: boolean) => void;
     onError: () => void;
     deadlineMs?: number;
   }): void {
@@ -231,15 +242,26 @@ export class DiscoveryController {
 
   /**
    * One cheap poll tick. Skipped (zero requests) while a discovery run or a
-   * previous poll is still in flight. On a detected change, `onChanged` fires —
-   * the caller reacts by scheduling a full refresh.
+   * previous poll is still in flight. When the snapshot on screen is
+   * INCOMPLETE (a deadline/abort cut phase 2 short, F12), the tick self-heals
+   * by requesting a full refresh instead of the cheap check. Otherwise it runs
+   * the cheap used+tips check and fires `onChanged` when money moved — the
+   * caller reacts to both by scheduling a full refresh.
    */
   pollTick(params: {
     network: Network;
     account: AccountSnapshot;
+    /** Whether the on-screen snapshot came from a full scan (F12). */
+    accountComplete: boolean;
     onChanged: () => void;
   }): void {
     if (this.current !== null || this.pollBusy) return;
+    if (!params.accountComplete) {
+      // Self-heal: the last run never finished its full scan. Complete it now
+      // (this tick issues zero requests itself; the refresh does the work).
+      params.onChanged();
+      return;
+    }
     this.pollBusy = true;
     void pollAccount(params.network, params.account)
       .then((changed) => {

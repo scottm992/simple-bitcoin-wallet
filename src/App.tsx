@@ -99,12 +99,14 @@ export default function App(): JSX.Element {
     discoveryRef.current ??= new DiscoveryController();
     return discoveryRef.current;
   }
-  // Latest account snapshot, mirrored into a ref so the poll interval closure
-  // always sees the current value without resetting its cadence.
+  // Latest account snapshot + its completeness, mirrored into refs so the poll
+  // interval closure always sees current values without resetting its cadence.
   const accountRef = useRef<AccountSnapshot | null>(null);
+  const accountCompleteRef = useRef(true);
   useEffect(() => {
     accountRef.current = state.account;
-  }, [state.account]);
+    accountCompleteRef.current = state.accountComplete;
+  }, [state.account, state.accountComplete]);
 
   // ---- Boot: detect existing vault, install session guards ----------------
   useEffect(() => {
@@ -156,7 +158,7 @@ export default function App(): JSX.Element {
       });
     discovery().refresh({
       network,
-      onSnapshot: (account) => dispatch({ type: 'accountLoaded', account }),
+      onSnapshot: (account, complete) => dispatch({ type: 'accountLoaded', account, complete }),
       onError: () => dispatch({ type: 'accountError' }),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -197,6 +199,7 @@ export default function App(): JSX.Element {
       discovery().pollTick({
         network: state.network,
         account,
+        accountComplete: accountCompleteRef.current,
         onChanged: () => refreshAll(),
       });
     }, 30_000);
@@ -318,6 +321,11 @@ export default function App(): JSX.Element {
   }
 
   function switchNetwork(to: Network): void {
+    // F13: kill the old network's in-flight discovery FIRST, so no
+    // stale-network snapshot can dispatch after the switch; the setNetwork
+    // reducer then blanks the account synchronously (a skeleton on switch is
+    // correct at the practice/live trust boundary).
+    discoveryRef.current?.abort();
     setVaultNetwork(to);
     applyNetworkTheme(to);
     dispatch({ type: 'setNetwork', network: to });
@@ -551,6 +559,7 @@ export default function App(): JSX.Element {
             network={network}
             account={state.account}
             accountStatus={state.accountStatus}
+            accountComplete={state.accountComplete}
             btcUsd={state.btcUsd}
             unit={unit}
             onCycleUnit={setUnit}
@@ -584,6 +593,7 @@ export default function App(): JSX.Element {
               network={network}
               account={null}
               accountStatus={state.accountStatus}
+              accountComplete={state.accountComplete}
               btcUsd={state.btcUsd}
               unit={unit}
               onCycleUnit={setUnit}

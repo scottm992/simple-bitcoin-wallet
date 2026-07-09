@@ -14,6 +14,8 @@ export function Home(props: {
   network: Network;
   account: AccountSnapshot | null;
   accountStatus: LoadStatus;
+  /** False while only the fast partial scan is on screen (F12): show a cue. */
+  accountComplete: boolean;
   btcUsd: number | null;
   unit: DisplayUnit;
   onCycleUnit: (u: DisplayUnit) => void;
@@ -66,6 +68,11 @@ export function Home(props: {
           loading={props.accountStatus === 'loading' && props.account === null}
         />
 
+        {props.account !== null && !props.accountComplete ? (
+          <div className="pending-line pending-line--checking" role="status">
+            {strings.home.stillChecking}
+          </div>
+        ) : null}
         {props.accountStatus === 'ready' && pendingOut > 0n ? (
           <div className="pending-line pending-line--out">
             {strings.home.pendingOut(fmtUsd(pendingOut, props.btcUsd))}

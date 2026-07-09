@@ -107,6 +107,9 @@ export const strings = {
     // hero balance doesn't imply that money is still spendable (F9).
     pendingOut: (amount: string): string => `${amount} on its way out, waiting to confirm`,
     pendingIn: (amount: string): string => `${amount} on its way in, waiting to confirm`,
+    // Shown while only the quick first look at your balance is on screen (F12):
+    // calm, non-alarming, disappears once the deeper check finishes.
+    stillChecking: 'Checking for updates…',
   },
 
   receive: {

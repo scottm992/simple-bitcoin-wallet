@@ -16,10 +16,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 const mockNet = vi.hoisted(() => ({
-  mode: 'instant' as 'instant' | 'hang',
+  mode: 'instant' as 'instant' | 'hang' | 'manual',
+  /** When set, requests beyond this many stats calls hang (stalls phase 2). */
+  hangAfter: null as number | null,
   used: new Set<string>(),
   statsCalls: [] as string[],
   abortedRequests: 0,
+  /** 'manual' mode: resolvers for every pending stats request, in order. */
+  pending: [] as (() => void)[],
 }));
 
 vi.mock('../lib/api', async (importOriginal) => {
@@ -28,7 +32,26 @@ vi.mock('../lib/api', async (importOriginal) => {
     ...actual,
     getAddressStats: vi.fn(async (_network: unknown, address: string, signal?: AbortSignal) => {
       mockNet.statsCalls.push(address);
-      if (mockNet.mode === 'hang') {
+      const statsFor = (addr: string) => {
+        const used = mockNet.used.has(addr);
+        return {
+          confirmedSats: used ? 10_000n : 0n,
+          pendingSats: 0n,
+          fundedSats: used ? 10_000n : 0n,
+          spentSats: 0n,
+        };
+      };
+      if (mockNet.mode === 'manual') {
+        // The test resolves each request explicitly, so it can wedge an abort
+        // between a phase's resolution and its queued continuation.
+        return new Promise<ReturnType<typeof statsFor>>((resolve) => {
+          mockNet.pending.push(() => resolve(statsFor(address)));
+        });
+      }
+      const stall =
+        mockNet.mode === 'hang' ||
+        (mockNet.hangAfter !== null && mockNet.statsCalls.length > mockNet.hangAfter);
+      if (stall) {
         // Simulates mempool.space stalling a throttled connection: the request
         // only ever settles when aborted.
         return new Promise<never>((_resolve, reject) => {
@@ -40,13 +63,7 @@ vi.mock('../lib/api', async (importOriginal) => {
           else signal?.addEventListener('abort', onAbort);
         });
       }
-      const used = mockNet.used.has(address);
-      return {
-        confirmedSats: used ? 10_000n : 0n,
-        pendingSats: 0n,
-        fundedSats: used ? 10_000n : 0n,
-        spentSats: 0n,
-      };
+      return statsFor(address);
     }),
     getUtxos: vi.fn(async () => []),
     getAddressTxs: vi.fn(async () => []),
@@ -73,9 +90,11 @@ const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 beforeEach(() => {
   localStorage.clear();
   mockNet.mode = 'instant';
+  mockNet.hangAfter = null;
   mockNet.used.clear();
   mockNet.statsCalls = [];
   mockNet.abortedRequests = 0;
+  mockNet.pending = [];
   setUnlocked(ABANDON);
 });
 
@@ -209,7 +228,7 @@ describe('DiscoveryController — single-flight (Bug A1)', () => {
 
     // A poll tick during the run must not issue a single request.
     const onChanged = vi.fn();
-    controller.pollTick({ network: 'testnet', account: freshSnapshot(), onChanged });
+    controller.pollTick({ network: 'testnet', account: freshSnapshot(), accountComplete: true, onChanged });
     await tick();
     expect(mockNet.statsCalls.length).toBe(inFlight);
     expect(onChanged).not.toHaveBeenCalled();
@@ -275,5 +294,103 @@ describe('pollAccount — cheap poll (Bug A3)', () => {
     };
     mockNet.used.add('tb1-used-a');
     await expect(pollAccount('testnet', snap)).resolves.toBe(true);
+  });
+});
+
+describe('startDiscovery — snapshot completeness (F12)', () => {
+  it('flags phase 1 as incomplete and the full scan as complete', async () => {
+    const flags: boolean[] = [];
+    const handle = startDiscovery({
+      network: 'testnet',
+      onSnapshot: (_snap, complete) => flags.push(complete),
+      onError: vi.fn(),
+    });
+    await handle.done;
+    expect(flags).toEqual([false, true]);
+  });
+});
+
+describe('deadline-cut phase 2 self-heals on the next poll tick (F12)', () => {
+  it('keeps the incomplete phase-1 result at the deadline, then completes via pollTick', async () => {
+    vi.useFakeTimers();
+    // Phase 1 (10 stats requests) succeeds instantly; everything after stalls,
+    // so the 20s deadline cuts phase 2 off — exactly the throttled-burst case.
+    mockNet.hangAfter = 10;
+
+    const controller = new DiscoveryController();
+    const flags: boolean[] = [];
+    const onError = vi.fn();
+    controller.refresh({
+      network: 'testnet',
+      onSnapshot: (_snap, complete) => flags.push(complete),
+      onError,
+    });
+
+    await vi.advanceTimersByTimeAsync(20_500); // past the 20s deadline
+    // The run settled: phase-1 kept (incomplete), no error, controller idle.
+    expect(flags).toEqual([false]);
+    expect(onError).not.toHaveBeenCalled();
+    expect(controller.busy).toBe(false);
+
+    // Next poll tick: with an incomplete snapshot it self-heals — it requests a
+    // full refresh (onChanged) WITHOUT issuing any requests of its own.
+    const before = mockNet.statsCalls.length;
+    const onChanged = vi.fn();
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: false,
+      onChanged,
+    });
+    expect(onChanged).toHaveBeenCalledTimes(1);
+    expect(mockNet.statsCalls.length).toBe(before);
+
+    // The caller reacts by refreshing; the network has recovered, so the run
+    // now finishes with a COMPLETE snapshot — the cue can clear.
+    mockNet.hangAfter = null;
+    controller.refresh({
+      network: 'testnet',
+      onSnapshot: (_snap, complete) => flags.push(complete),
+      onError,
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(flags).toEqual([false, false, true]);
+    expect(onError).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+});
+
+describe('network switch — no stale dispatch after an eager abort (F13)', () => {
+  it('a snapshot resolved-but-not-yet-dispatched is dropped when the run is aborted on the same frame', async () => {
+    // Reproduces the exact F13 race: phase 1 has RESOLVED (its continuation is
+    // queued as a microtask) when switchNetwork aborts the run. Without the
+    // pre-dispatch abort guard, the stale old-network snapshot would still
+    // dispatch after the switch cleared the account.
+    mockNet.mode = 'manual';
+    const controller = new DiscoveryController();
+    const onSnapshot = vi.fn();
+    const onError = vi.fn();
+    controller.refresh({ network: 'testnet', onSnapshot, onError });
+
+    // Phase 1, first batches: 4 requests per chain.
+    await tick();
+    expect(mockNet.pending.length).toBe(8);
+    for (const resolve of mockNet.pending.splice(0)) resolve();
+
+    // Phase 1, final index per chain.
+    await tick();
+    expect(mockNet.pending.length).toBe(2);
+
+    // Resolve the last requests and — SYNCHRONOUSLY, before any microtask can
+    // run — abort, exactly as switchNetwork now does.
+    for (const resolve of mockNet.pending.splice(0)) resolve();
+    controller.abort();
+
+    // Flush everything: the resolved phase-1 must have been dropped silently.
+    await tick();
+    await tick();
+    await tick();
+    expect(onSnapshot).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
   });
 });

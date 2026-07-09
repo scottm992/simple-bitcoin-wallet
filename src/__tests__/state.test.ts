@@ -58,7 +58,7 @@ describe('reducer — screen state machine', () => {
 
   it('locking clears account + send state and returns to unlock', () => {
     let s: AppState = reducer(initialState, { type: 'unlocked' });
-    s = reducer(s, { type: 'accountLoaded', account: { confirmedSats: 5n } as never });
+    s = reducer(s, { type: 'accountLoaded', account: { confirmedSats: 5n } as never, complete: true });
     s = reducer(s, { type: 'locked' });
     expect(s.screen).toBe('unlock');
     expect(s.account).toBe(null);
@@ -67,13 +67,17 @@ describe('reducer — screen state machine', () => {
 
   it('switching network throws away chain state and reloads', () => {
     let s: AppState = reducer(initialState, { type: 'unlocked' });
-    s = reducer(s, { type: 'accountLoaded', account: { confirmedSats: 9n } as never });
+    s = reducer(s, { type: 'accountLoaded', account: { confirmedSats: 9n } as never, complete: true });
     s = reducer(s, { type: 'feesLoaded', feeEstimates: { fast: 5, medium: 3, slow: 1 } });
+    // An incomplete snapshot was on screen; the switch must blank everything
+    // SYNCHRONOUSLY in the reducer (F13) and reset the completeness flag (F12).
+    s = { ...s, accountComplete: false };
     s = reducer(s, { type: 'setNetwork', network: 'testnet' });
     expect(s.network).toBe('testnet');
     expect(s.account).toBe(null);
     expect(s.feeEstimates).toBe(null);
     expect(s.accountStatus).toBe('loading');
+    expect(s.accountComplete).toBe(true);
   });
 
   it('compose → broadcast → clear moves through review and sent', () => {

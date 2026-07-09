@@ -65,6 +65,13 @@ export interface AppState {
   /** Account snapshot for the active network, or null before first load. */
   readonly account: AccountSnapshot | null;
   readonly accountStatus: LoadStatus;
+  /**
+   * Whether the current snapshot came from a FULL (gap-20) scan. False while
+   * only the fast phase-1 result is on screen (F12): Home shows a subtle
+   * "checking for updates" cue and the poll tick self-heals by completing the
+   * scan. True whenever there is no snapshot at all (nothing to qualify).
+   */
+  readonly accountComplete: boolean;
 
   /** BTC/USD price, or null when unavailable (offline). */
   readonly btcUsd: number | null;
@@ -95,7 +102,7 @@ export type Action =
   | { type: 'vaultDeleted' }
   | { type: 'setNetwork'; network: Network }
   | { type: 'accountLoading' }
-  | { type: 'accountLoaded'; account: AccountSnapshot }
+  | { type: 'accountLoaded'; account: AccountSnapshot; complete: boolean }
   | { type: 'accountError' }
   | { type: 'priceLoaded'; btcUsd: number | null }
   | { type: 'feesLoaded'; feeEstimates: FeeEstimates }
@@ -113,6 +120,7 @@ export const initialState: AppState = {
   hasVault: false,
   account: null,
   accountStatus: 'idle',
+  accountComplete: true,
   btcUsd: null,
   feeEstimates: null,
   pendingSend: null,
@@ -152,6 +160,7 @@ export function reducer(state: AppState, action: Action): AppState {
         flow: null,
         account: null,
         accountStatus: 'loading',
+        accountComplete: true,
         pendingSend: null,
         sentTxid: null,
       };
@@ -163,6 +172,7 @@ export function reducer(state: AppState, action: Action): AppState {
         flow: null,
         account: null,
         accountStatus: 'idle',
+        accountComplete: true,
         pendingSend: null,
         sentTxid: null,
       };
@@ -184,12 +194,14 @@ export function reducer(state: AppState, action: Action): AppState {
       };
 
     case 'setNetwork':
-      // Switching networks throws away the other network's chain state.
+      // Switching networks throws away the other network's chain state
+      // synchronously — no stale-network balance may survive the switch (F13).
       return {
         ...state,
         network: action.network,
         account: null,
         accountStatus: 'loading',
+        accountComplete: true,
         feeEstimates: null,
         pendingSend: null,
         sentTxid: null,
@@ -199,7 +211,12 @@ export function reducer(state: AppState, action: Action): AppState {
       return { ...state, accountStatus: 'loading' };
 
     case 'accountLoaded':
-      return { ...state, account: action.account, accountStatus: 'ready' };
+      return {
+        ...state,
+        account: action.account,
+        accountStatus: 'ready',
+        accountComplete: action.complete,
+      };
 
     case 'accountError':
       return { ...state, accountStatus: 'error' };
