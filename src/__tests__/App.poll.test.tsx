@@ -55,6 +55,43 @@ const ABANDON =
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 const PASSWORD = 'test-password-12';
 
+/**
+ * The REAL setTimeout, captured at module load — before any test installs fake
+ * timers (vi.useFakeTimers replaces the global property; a saved reference to
+ * the original still schedules genuine macrotasks). This is the escape hatch
+ * that makes {@link settle} deterministic: unlock awaits Node WebCrypto
+ * (crypto.subtle.importKey/decrypt in vault.ts), whose promises resolve on the
+ * THREADPOOL via real event-loop turns — not on the faked clock and not on the
+ * microtask queue. A one-shot advanceTimersByTimeAsync(N) yields only a bounded
+ * number of real turns (one per fired fake timer), so whether the decrypt
+ * completion landed inside them was a real-scheduling race (~25% flake, always
+ * at the post-unlock assertion).
+ */
+const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+
+/** One REAL macrotask turn — lets threadpool completions (WebCrypto) land. */
+const realTurn = (): Promise<void> => new Promise((resolve) => realSetTimeout(resolve, 0));
+
+/**
+ * Polls the DOM until `pred` holds, alternating one real event-loop turn (for
+ * threadpool-resolved promises) with a small fake-clock advance inside `act`
+ * (for anything the app scheduled on timers). Bounded: throws if the app never
+ * reaches the expected state, so a genuine regression still fails loudly. The
+ * fake time consumed is a few ms per iteration — far below the 30s poll
+ * interval, so the exactly-one-tick-per-30s assertions in this suite are
+ * unaffected (the interval's next fire stays within the tests' 30_000 advance).
+ */
+async function settle(pred: () => boolean, tries = 200): Promise<void> {
+  for (let i = 0; i < tries; i++) {
+    if (pred()) return;
+    await act(async () => {
+      await realTurn();
+      await vi.advanceTimersByTimeAsync(5);
+    });
+  }
+  throw new Error('settle(): the app never reached the expected state');
+}
+
 let container: HTMLDivElement;
 let root: Root;
 
@@ -97,16 +134,19 @@ async function bootToHome(): Promise<void> {
     root = createRoot(container);
     root.render(<App />);
   });
-  // Boot resolves to the Unlock screen (a vault exists).
+  // Boot resolves to the Unlock screen (a vault exists). settle(), not a fixed
+  // advance: boot/unlock await WebCrypto, which resolves on real event-loop
+  // turns the fake clock does not drive (see realSetTimeout above).
+  await settle(() => container.querySelector('input[type="password"]') !== null);
   const pw = container.querySelector<HTMLInputElement>('input[type="password"]');
   expect(pw).not.toBeNull();
   await act(async () => setNativeValue(pw!, PASSWORD));
   await act(async () => (byText(strings.unlock.unlock) as HTMLElement).click());
-  // Let unlock + the initial refreshAll (account + price + fees) settle.
-  await act(async () => {
-    await vi.advanceTimersByTimeAsync(500);
-  });
+  // Let unlock (scrypt + AES-GCM decrypt on the threadpool) + the initial
+  // refreshAll (account + price + fees) settle — polled, not a one-shot 500ms
+  // advance, so the WebCrypto completions always get the real turns they need.
   // On Home now: the Receive/Send verb row is present regardless of balance.
+  await settle(() => container.querySelector('.verb-row') !== null);
   expect(container.querySelector('.verb-row')).not.toBeNull();
 }
 
