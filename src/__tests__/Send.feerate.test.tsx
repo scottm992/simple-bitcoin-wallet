@@ -134,9 +134,10 @@ describe('Send — fee-rate display (sat/vB)', () => {
   it('when estimates are absent (fees null) no rate is shown and nothing crashes', async () => {
     await mountSend(null);
 
-    // The compose screen still renders (fee chips present)...
-    expect(container.querySelectorAll('.fee').length).toBe(3);
-    // ...but with no rate line on any chip, and no stray "sat/vB" text.
+    // The compose screen still renders (three tier chips + the Custom chip)...
+    expect(container.querySelectorAll('.fee').length).toBe(4);
+    // ...but with no rate line on any chip, and no stray "sat/vB" text (the
+    // Custom chip shows no rate either — nothing valid has been typed).
     expect(container.querySelector('.fee__rate')).toBeNull();
     expect(container.textContent).not.toContain('sat/vB');
   });

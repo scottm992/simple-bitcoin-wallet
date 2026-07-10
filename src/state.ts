@@ -30,15 +30,38 @@ export type Screen =
 /** Which flow we're in, so setPassword knows where it came from. */
 export type Flow = 'create' | 'restore' | null;
 
-/** A fee tier the user can choose on Send. */
+/**
+ * A RECOMMENDED fee tier on Send. Deliberately does NOT include 'custom':
+ * `feeRateForTier` (actions.ts) is total over exactly these three values, and
+ * the Speed-up sheet offers only tiers — keeping this type narrow means a
+ * custom choice can never reach the tier→rate mapping by accident.
+ */
 export type FeeTier = 'standard' | 'faster' | 'economy';
+
+/**
+ * What the user picked in the Send fee selector: a recommended tier, or
+ * 'custom' — their own typed sat/vB rate (validated at entry by Send's
+ * `classifyCustomFeeRate` before it can reach state). The rate itself always
+ * travels in `PendingSend.feeRateSatVb` regardless of the choice; this value
+ * only records WHICH picker produced it, so Review can label the fee honestly
+ * (a tier promises an arrival time, a custom rate cannot).
+ */
+export type FeeChoice = FeeTier | 'custom';
 
 /** A composed-but-not-yet-sent payment carried from Send → Review → Sent. */
 export interface PendingSend {
   readonly recipient: string;
   readonly amountSats: bigint;
   readonly feeRateSatVb: number;
-  readonly feeTier: FeeTier;
+  /**
+   * Which fee choice produced `feeRateSatVb`: a tier (feeRateForTier's clamped
+   * output) or 'custom' (a user-typed rate Send validated into
+   * [MIN_CUSTOM_FEE_RATE, MAX_ACCEPTED_FEE_RATE] — reject-never-clamp).
+   * Labeling only: everything downstream (the Review dry-run and the broadcast
+   * build) consumes `feeRateSatVb` through the same single path either way
+   * (F11) and the engine's hard fee guards apply unchanged.
+   */
+  readonly feeTier: FeeChoice;
   readonly sendMax: boolean;
   /**
    * True only when the user explicitly confirmed an unusually large

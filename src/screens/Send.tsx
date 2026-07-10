@@ -7,6 +7,7 @@ import { fmtBtc, fmtSats, fmtUsd, usdToSats } from '../display';
 import {
   DUST_LIMIT_SATS,
   InvalidRecipientError,
+  MAX_ACCEPTED_FEE_RATE,
   btcStringToSats,
   estimateSendFee,
   scriptForAddress,
@@ -17,10 +18,80 @@ import {
 } from '../lib';
 import { feeRateForTier } from '../actions';
 import type { AccountSnapshot } from '../lib/account';
-import type { FeeTier, PendingSend } from '../state';
+import type { FeeChoice, FeeTier, PendingSend } from '../state';
 
 /** Estimated vsize of a typical 1-in/2-out P2WPKH tx, for fee-in-USD hints. */
 const TYPICAL_VSIZE = 141;
+
+/**
+ * The floor for a USER-TYPED custom fee rate, in sat/vB — deliberately below
+ * the `MIN_ACCEPTED_FEE_RATE = 1` floor the recommended tiers keep.
+ *
+ * WHY 0.1: Bitcoin Core 30 (Oct 2025) lowered the default `minrelaytxfee` to
+ * 0.1 sat/vB, and our broadcast node honors it — live probe 2026-07-10 of
+ * blockstream.info: `/api/mempool`'s fee_histogram bottom buckets carry large
+ * ACCEPTED volume at ≈0.1 sat/vB (e.g. [0.10000050, 99130 vB]), and its
+ * `/api/fee-estimates` itself returns sub-1 rates (0.747 for 144+ block
+ * targets). Accepted ≠ confirmed, though — a sub-1 payment can wait a very
+ * long time or be dropped when the network gets busy — so the UI pairs any
+ * sub-1 rate with the slow-lane hint, and Speed up (RBF) is the rescue.
+ *
+ * WHY only here: this constant governs ONLY user-typed intent. API-derived
+ * tier estimates stay on the audited `feeRateForTier` clamp
+ * [MIN_ACCEPTED_FEE_RATE, MAX_ACCEPTED_FEE_RATE] — mempool.space's own
+ * recommended minimumFee is 1, consistent with that clamp staying put. This is
+ * THE single relaxation point the roadmap reserved for the sub-1 decision:
+ * the engine beneath accepts any positive finite rate (its hard guards are the
+ * 500 sat/vB ceiling and the 1M-sat absolute cap, both untouched), so nothing
+ * below this line re-floors or re-clamps a custom rate. F1 surface — reviewed
+ * territory (Round 14).
+ */
+export const MIN_CUSTOM_FEE_RATE = 0.1;
+
+/** The classification of the custom fee-rate text (see classifyCustomFeeRate). */
+export type CustomFeeRateClass =
+  | { kind: 'empty' }
+  | { kind: 'malformed' }
+  | { kind: 'out-of-range' }
+  | { kind: 'valid'; rate: number };
+
+/**
+ * Strictly classifies the custom fee-rate text — a user-typed number headed
+ * for the fee engine, so this is money-path validation (Round 14 territory).
+ *
+ * Mirrors btcStringToSats's house strict-parse style: ONE plain decimal form
+ * only — digits with at most one dot. Everything else is `malformed`, never
+ * coerced: signs, spaces inside, grouping commas ('1,5'), multiple dots
+ * ('1.2.3'), hex, and SCIENTIFIC NOTATION ('1e3') — rejected by design even
+ * though Number() could parse it, because a money number must read exactly as
+ * typed, with no notation that lets one stray keystroke change its magnitude
+ * a thousandfold.
+ *
+ * The accepted window is [MIN_CUSTOM_FEE_RATE, MAX_ACCEPTED_FEE_RATE] — the
+ * ceiling REFERENCES the F1 constant (never a re-typed literal, so the two
+ * can never drift). Decimals are allowed: the engine's fee math is
+ * fraction-safe (`ceil(vsize × rate)`). Out-of-range input is REJECTED, never
+ * clamped — silently editing a number the user typed for money would make the
+ * display lie about the transmission. The parse happens ONCE, here; only the
+ * returned validated number ever reaches component state or PendingSend.
+ */
+export function classifyCustomFeeRate(text: string): CustomFeeRateClass {
+  const trimmed = text.trim();
+  if (trimmed === '') return { kind: 'empty' };
+  // The btcStringToSats shape: optional integer part, optional fractional
+  // part, at least one digit, and nothing else (anchored both ends).
+  const match = /^(\d*)(?:\.(\d*))?$/.exec(trimmed);
+  if (!match || trimmed === '.') return { kind: 'malformed' };
+  if ((match[1] ?? '') === '' && (match[2] ?? '') === '') return { kind: 'malformed' };
+  const rate = Number(trimmed);
+  // A matched plain decimal can still overflow Number (an absurd digit run →
+  // Infinity); non-finite is out-of-range, same as any other too-big value.
+  if (!Number.isFinite(rate)) return { kind: 'out-of-range' };
+  if (rate < MIN_CUSTOM_FEE_RATE || rate > MAX_ACCEPTED_FEE_RATE) {
+    return { kind: 'out-of-range' };
+  }
+  return { kind: 'valid', rate };
+}
 
 type EntryUnit = 'usd' | 'btc';
 
@@ -52,13 +123,45 @@ export function Send(props: {
   const [address, setAddress] = useState('');
   const [entryUnit, setEntryUnit] = useState<EntryUnit>('usd');
   const [amountText, setAmountText] = useState('');
-  const [tier, setTier] = useState<FeeTier>('standard');
+  const [feeChoice, setFeeChoice] = useState<FeeChoice>('standard');
+  // The raw text in the custom-rate input. Kept even while a tier is selected
+  // (switching away and back shouldn't eat what was typed), but it is INERT
+  // then: feeRate below derives from it only when feeChoice === 'custom', so a
+  // stale custom entry can never leak into a tier send.
+  const [customFeeText, setCustomFeeText] = useState('');
   const [sendMax, setSendMax] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
   const spendableSats = props.account.confirmedSats;
   const addrClass = classifyAddress(address, props.network);
-  const feeRate = props.fees ? feeRateForTier(props.fees, tier) : 1;
+
+  // The custom text, parsed ONCE and validated ONCE; only the validated number
+  // inside a 'valid' result ever flows onward (into feeRate, below).
+  const customFee = useMemo<CustomFeeRateClass>(
+    () => classifyCustomFeeRate(customFeeText),
+    [customFeeText],
+  );
+
+  // THE single point where a fee rate enters the compose flow (F11): the tier
+  // path (feeRateForTier's clamped output) and the custom path (the validated
+  // user-typed rate) converge on this one value, which then feeds the SAME
+  // estimateSendFee dry-run below, the SAME PendingSend.feeRateSatVb in
+  // review(), and — via App's reviewNumbers/confirmSend — the SAME
+  // buildAndSignTx/signAndBroadcast. No parallel fee computation anywhere.
+  //
+  // `null` means "no usable rate yet" (custom chosen, input empty/invalid):
+  // every preview number derived from a rate goes dark rather than showing a
+  // fee at a rate the user didn't type, and Review stays disabled. The tier
+  // path keeps its pre-existing rate-1 display placeholder while estimates are
+  // still loading (sending remains gated on real estimates via canReview).
+  const feeRate: number | null =
+    feeChoice === 'custom'
+      ? customFee.kind === 'valid'
+        ? customFee.rate
+        : null
+      : props.fees
+        ? feeRateForTier(props.fees, feeChoice)
+        : 1;
 
   // Parse the entered amount into sats (from whichever unit is active).
   const amountSats = useMemo<bigint | null>(() => {
@@ -91,6 +194,9 @@ export function Send(props: {
   // possible yet (no amount, or insufficient funds — handled by other errors).
   const feeSelection = useMemo<FeeSelection | null>(() => {
     const utxos = props.account.utxos;
+    // No usable rate (custom chosen but not validly entered) → no dry-run: we
+    // never estimate at a rate the user didn't type.
+    if (feeRate === null) return null;
     if (utxos.length === 0) return null;
     try {
       if (sendMax) {
@@ -104,10 +210,15 @@ export function Send(props: {
     }
   }, [sendMax, amountSats, feeRate, props.account.utxos]);
 
-  // Fee for the selected tier: the exact engine fee when a selection exists,
+  // Fee for the selected choice: the exact engine fee when a selection exists,
   // else a typical-size placeholder for display before an amount is entered.
-  const feeSats = feeSelection?.feeSats ?? BigInt(Math.ceil(TYPICAL_VSIZE * feeRate));
-  const feeUsd = props.btcUsd === null ? null : satsToUsdString(feeSats, props.btcUsd);
+  // Null when there is no usable rate at all — the fee/total displays then
+  // render nothing (an honest blank beats a number at a rate nobody chose).
+  const feeSats: bigint | null =
+    feeSelection?.feeSats ??
+    (feeRate === null ? null : BigInt(Math.ceil(TYPICAL_VSIZE * feeRate)));
+  const feeUsd =
+    props.btcUsd === null || feeSats === null ? null : satsToUsdString(feeSats, props.btcUsd);
 
   // Validation for enabling Review + inline errors.
   let amountError: string | null = null;
@@ -117,7 +228,10 @@ export function Send(props: {
     else if (amountSats < DUST_LIMIT_SATS) {
       const minUsd = props.btcUsd === null ? '0.50' : satsToUsdString(DUST_LIMIT_SATS, props.btcUsd);
       amountError = strings.send.dust(props.btcUsd === null ? '$0.50' : minUsd);
-    } else if (amountSats + feeSats > spendableSats) {
+    } else if (feeSats !== null && amountSats + feeSats > spendableSats) {
+      // With no usable rate the over-balance check simply waits: there is no
+      // honest max-spendable without a fee, and Review is already held back by
+      // the custom input's own error state.
       const maxSpendable = spendableSats > feeSats ? spendableSats - feeSats : 0n;
       amountError = strings.send.overBalance(fmtUsd(maxSpendable, props.btcUsd));
     }
@@ -125,7 +239,7 @@ export function Send(props: {
 
   const addressReady = addrClass === 'valid';
   const amountReady = sendMax
-    ? spendableSats > feeSats + DUST_LIMIT_SATS
+    ? feeSats !== null && spendableSats > feeSats + DUST_LIMIT_SATS
     : amountSats !== null && amountSats >= DUST_LIMIT_SATS && amountError === null;
 
   // F10 informed consent: will the build trip the fee-vs-amount percentage
@@ -137,7 +251,12 @@ export function Send(props: {
   const highFee: boolean =
     props.fees !== null && amountReady && feeSelection !== null && feeSelection.needsHighFeeConsent;
 
-  const canReview = addressReady && amountReady && props.fees !== null && !highFee;
+  // Review needs a valid destination, a valid amount, live fee estimates (kept
+  // as a gate even for a custom rate — estimates arriving doubles as an
+  // endpoint-health signal, and relaxing it would be a separate decision), a
+  // usable rate, and no un-consented high-fee condition.
+  const canReview =
+    addressReady && amountReady && props.fees !== null && feeRate !== null && !highFee;
 
   async function paste(): Promise<void> {
     try {
@@ -160,13 +279,18 @@ export function Send(props: {
    * three use identical params. It never bypasses the engine's hard limits.
    */
   function review(allowHighFee: boolean): void {
-    if (!(addressReady && amountReady && props.fees !== null)) return;
+    // feeRate !== null repeats canReview's gate for the "Send anyway" entry
+    // path too: no PendingSend can ever be built without a usable rate.
+    if (!(addressReady && amountReady && props.fees !== null && feeRate !== null)) return;
     if (highFee && !allowHighFee) return;
     const pending: PendingSend = {
       recipient: address.trim(),
       amountSats: sendMax ? spendableSats : (amountSats ?? 0n),
+      // The SAME value the compose dry-run above used — tier or custom, this
+      // is the one field the Review dry-run and the broadcast build consume
+      // (F11), so displayed, previewed, and signed rates are one number.
       feeRateSatVb: feeRate,
-      feeTier: tier,
+      feeTier: feeChoice,
       sendMax,
       allowHighFee,
     };
@@ -179,19 +303,24 @@ export function Send(props: {
     { tier: 'economy', title: strings.send.feeEconomy, time: strings.send.feeEconomyTime },
   ];
 
-  // Total preview.
+  // Total preview. (With no usable rate, feeSats is null and the total line is
+  // not rendered — these fall back to 0n only to keep the math total.)
   const previewAmountSats = sendMax
-    ? spendableSats > feeSats
+    ? feeSats !== null && spendableSats > feeSats
       ? spendableSats - feeSats
       : 0n
     : (amountSats ?? 0n);
-  const totalSats = sendMax ? spendableSats : previewAmountSats + feeSats;
+  const totalSats = sendMax ? spendableSats : previewAmountSats + (feeSats ?? 0n);
 
   // Real numbers for the high-fee notice: the fee (in USD, or sats when the
   // price is unavailable) and what share of the sent amount it represents.
-  const highFeeFeeStr = props.btcUsd !== null ? fmtUsd(feeSats, props.btcUsd) : fmtSats(feeSats);
+  // Rendered only when highFee is true, which requires a live feeSelection —
+  // so the 0n fallback never actually reaches the screen.
+  const highFeeFeeSats = feeSelection?.feeSats ?? 0n;
+  const highFeeFeeStr =
+    props.btcUsd !== null ? fmtUsd(highFeeFeeSats, props.btcUsd) : fmtSats(highFeeFeeSats);
   const highFeePct =
-    previewAmountSats > 0n ? Number((feeSats * 100n) / previewAmountSats) : 0;
+    previewAmountSats > 0n ? Number((highFeeFeeSats * 100n) / previewAmountSats) : 0;
 
   return (
     <Chrome network={props.network} onBack={props.onBack} title={strings.send.title}>
@@ -274,11 +403,15 @@ export function Send(props: {
               {strings.send.max}
             </button>
           </div>
-          {sendMax ? (
+          {sendMax && feeSats !== null ? (
+            // F21: the sweep amount is spendable-minus-fee, so with no usable
+            // rate (custom chosen, not validly entered) there is no honest
+            // number to show — go dark like every other rate-derived preview,
+            // never a fabricated $0.00.
             <div className="amount-conv">
               {fmtUsd(previewAmountSats, props.btcUsd)} · {fmtBtc(previewAmountSats)} BTC
             </div>
-          ) : conversion ? (
+          ) : !sendMax && conversion ? (
             <div className="amount-conv">{conversion}</div>
           ) : null}
           {amountError ? (
@@ -320,9 +453,9 @@ export function Send(props: {
               return (
                 <button
                   key={c.tier}
-                  className={`fee ${tier === c.tier ? 'fee--sel' : ''}`}
-                  onClick={() => setTier(c.tier)}
-                  aria-pressed={tier === c.tier}
+                  className={`fee ${feeChoice === c.tier ? 'fee--sel' : ''}`}
+                  onClick={() => setFeeChoice(c.tier)}
+                  aria-pressed={feeChoice === c.tier}
                 >
                   <div className="fee__title">{c.title}</div>
                   <div className="fee__sub">
@@ -336,8 +469,81 @@ export function Send(props: {
                 </button>
               );
             })}
+            {/* The fourth choice: the user's own rate. Its rate line and USD
+                hint appear ONLY once the typed rate validates — the chip never
+                previews a number the user didn't successfully enter (the same
+                displayed = transmitted honesty rule as the tier chips). */}
+            <button
+              className={`fee ${feeChoice === 'custom' ? 'fee--sel' : ''}`}
+              onClick={() => setFeeChoice('custom')}
+              aria-pressed={feeChoice === 'custom'}
+            >
+              <div className="fee__title">{strings.send.feeCustom}</div>
+              <div className="fee__sub">
+                {strings.send.feeCustomSub}
+                <br />
+                {customFee.kind === 'valid' && props.btcUsd !== null
+                  ? `≈ ${fmtUsd(BigInt(Math.ceil(TYPICAL_VSIZE * customFee.rate)), props.btcUsd)}`
+                  : ''}
+              </div>
+              {customFee.kind === 'valid' ? (
+                <div className="fee__rate">{strings.send.feeRate(customFee.rate)}</div>
+              ) : null}
+            </button>
           </div>
-          {props.btcUsd !== null && (amountReady || sendMax) ? (
+          {feeChoice === 'custom' ? (
+            <div style={{ marginTop: 'var(--sp-3)' }}>
+              <label className="label" htmlFor="send-custom-fee">
+                {strings.send.customFeeLabel}
+              </label>
+              <div
+                className={`input-wrap ${customFee.kind === 'valid' ? 'input-wrap--valid' : ''} ${
+                  customFee.kind === 'malformed' || customFee.kind === 'out-of-range'
+                    ? 'input-wrap--error'
+                    : ''
+                }`}
+                style={{ alignItems: 'baseline' }}
+              >
+                <input
+                  id="send-custom-fee"
+                  className="input"
+                  value={customFeeText}
+                  onChange={(e) => setCustomFeeText(e.target.value)}
+                  placeholder={strings.send.customFeePlaceholder}
+                  inputMode="decimal"
+                  autoComplete="off"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  aria-label={strings.send.customFeeLabel}
+                />
+                <span className="small">{strings.send.customFeeUnit}</span>
+              </div>
+              {customFee.kind === 'malformed' ? (
+                <p className="error-text">{strings.send.customFeeMalformed}</p>
+              ) : customFee.kind === 'out-of-range' ? (
+                <p className="error-text">
+                  {strings.send.customFeeOutOfRange(
+                    String(MIN_CUSTOM_FEE_RATE),
+                    String(MAX_ACCEPTED_FEE_RATE),
+                  )}
+                </p>
+              ) : customFee.kind === 'valid' && customFee.rate < 1 ? (
+                // Sub-1 slow-lane hint: informational only, never a consent
+                // gate — Review stays enabled (the 25% fee-vs-amount rule is
+                // the only consent flow on this screen).
+                <p className="small">{strings.send.customFeeSlowHint}</p>
+              ) : (
+                <p className="small">
+                  {strings.send.customFeeExplainer(
+                    String(MIN_CUSTOM_FEE_RATE),
+                    String(MAX_ACCEPTED_FEE_RATE),
+                  )}
+                </p>
+              )}
+            </div>
+          ) : null}
+          {props.btcUsd !== null && feeSats !== null && (amountReady || sendMax) ? (
             <div className="total-line">
               {strings.send.totalLine(
                 fmtUsd(previewAmountSats, props.btcUsd),

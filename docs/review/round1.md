@@ -1939,3 +1939,239 @@ live API calls this pass. Gates re-confirmed after deletion: `tsc --noEmit`
 clean, `npm test` = 294 passing, `npm run build` clean, dist CSP
 `connect-src 'self' https://mempool.space https://blockstream.info`. Next
 finding number: **F21**._
+
+---
+
+# Round 14 — Custom sat/vB fee input (floor 0.1)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 1 (F21 Info)**
+
+FULL money-path round (a user-controlled number now reaches the fee engine) on the
+two `custom-fee` commits: `6e4da44` (feature + tests), `4a5d3d6` (ROADMAP). The
+feature: a fourth "Custom" chip on Send with a typed sat/vB input, window
+[`MIN_CUSTOM_FEE_RATE` = 0.1, `MAX_ACCEPTED_FEE_RATE` = 500], reject-never-clamp,
+a sub-1 informational slow-lane hint (deliberately not a consent gate), a
+fee-below-relay-floor broadcast rejection surfaced with honest copy and no retry,
+and a bump-rescue proof for sub-1 sends. `npm test` = **319 passing**,
+`tsc --noEmit` clean, `npm run build` clean, dist CSP byte-identical to Round 13's
+(`connect-src 'self' https://mempool.space https://blockstream.info; script-src
+'self'; object-src 'none'; base-uri 'self'; form-action 'none'`), no `console.*`
+in `src/`, no new deps (`package.json`/lock untouched), `public/` untouched (no
+`CACHE_NAME` bump owed). Zero live API calls this round (the sub-1 evidence is the
+cited 2026-07-10 probe). Verified with throwaway `round14.review.test.tsx`
+(16 probes, executed, deleted).
+
+## Per-area verdicts
+
+- **1. `classifyCustomFeeRate` (the new trust boundary) — SOUND under hostile
+  input.** The regex `^(\d*)(?:\.(\d*))?$` is CHARACTER-IDENTICAL to the audited
+  `btcStringToSats` shape (format.ts:54) — anchored both ends, ASCII-only `\d`
+  (no `u` flag, so Arabic-Indic/full-width/math-bold digits, superscripts,
+  fractions, CJK numerals all reject — probed), no sign/exponent/radix/comma path
+  exists to reach `Number()`. Probes: `1e3`/`1E3`/`1e-3`/`.5e1`, `0x10`/`0o17`/
+  `0b101`, `+1`/`-1`/unicode-minus, `1_000`, `1,5`, `Infinity`/`NaN` — all
+  malformed; `5\nabc`, `5\n6`, interior space/nbsp — malformed (JS `$` without
+  `/m` does not match before an interior newline; `trim()` legitimately strips
+  pure edge whitespace); 400-digit run — `Number` = Infinity — out-of-range,
+  never NaN; `1e308`-magnitude finite runs — out-of-range; `0`/`0.0`/`0.0…01`
+  (subnormal underflow) — out-of-range. `'007'`/`'000.5'` parse decimally (no
+  octal hazard — the regex admits no radix prefix). Scientific notation is
+  rejected BY DESIGN with the WHY comment present (one stray keystroke must not
+  mean 1000x). Single-parse-point CONFIRMED by grep: `customFeeText` has exactly
+  three non-test consumers (useState, the `classifyCustomFeeRate` useMemo, the
+  controlled input `value`); the only `Number()` calls in Send.tsx are inside
+  the classifier, the pre-existing USD amount parse, and a display percentage.
+  The raw text cannot reach state or `PendingSend` — probe pinned that typing
+  `0.1000000000000000001` transmits the parsed double `0.1` (typeof number) and
+  the chip paints `0.1 sat/vB`, never the 21-char string.
+- **2. F11 single path — AIRTIGHT, traced all four consumers.** `feeRate`
+  (Send.tsx:157) is the sole convergence point: tier (`feeRateForTier`, still
+  double-clamped) or validated custom rate. It feeds (a) the compose
+  `estimateSendFee` dry-run (line 195–211), (b) `PendingSend.feeRateSatVb`
+  (review(), line 292), and via App.tsx VERBATIM (c) `reviewNumbers` →
+  `getMnemonicBuild` → `buildAndSignTx` (App.tsx:507–522) and (d) `confirmSend`
+  → `signAndBroadcast` (App.tsx:524–542). No parallel computation exists
+  (`feeRateForTier`'s only other non-test caller is the Speed-up sheet's
+  unchanged 'faster' path in Activity.tsx:190). The `feeRate === null` gate is
+  airtight: `canReview` requires it, and `review()` re-checks it on BOTH entry
+  paths — the Review button and the high-fee "Send anyway" button (probe:
+  clicking Review with sendMax + custom-empty is a no-op). There is no form, no
+  onSubmit, no onKeyDown in Send.tsx — no Enter path bypasses the disabled
+  button. Interleavings probed: custom→faster→Max→custom transmits the retained
+  custom rate; custom→economy transmits 5/'economy' with nothing of the
+  abandoned entry (shipped test covers the plain switch-back too); invalidating
+  the rate under an OPEN high-fee consent notice collapses the "Send anyway"
+  button in the same render (highFee requires a live feeSelection, which
+  requires a non-null rate).
+- **3. F1/F10 inheritance — INTACT, defense-in-depth verified beneath the UI.**
+  `tx.ts` confirmed to have NO floor-of-1 to remove (guards were always
+  `> 0 && isFinite`): the engine hunk count in this diff is zero (see area 6).
+  Probe: a state-corrupted `feeRateSatVb: 9999` is hard-rejected by
+  `buildAndSignTx` with `allowHighFee` both false AND true (`MAX_FEE_RATE_SAT_VB`
+  precedes everything); NaN/0/−1/Infinity throw `InvalidTxParamsError`. If
+  corruption produced such a PendingSend anyway, App's Review dry-run catches
+  `FeeTooHighError` → the F4 blocked/recheck state — no path to broadcast. The
+  25% consent rule trips for custom rates through the REAL flow (shipped test
+  mounts real Send + real engine, clicks the real notice's button, asserts
+  `allowHighFee: true` on the pending — no consent logic is mocked). Sub-1 ×
+  dust probed: a 546-sat send from a 1,000-sat UTXO at 0.1 → fee =
+  `ceil(vsize × 0.1)` ≥ 1 sat, sub-dust change folds into the fee exactly as at
+  integer rates, estimate == build to the satoshi, and the fold correctly
+  triggers `needsHighFeeConsent` (454/546 > 25%). A 0.1 sendMax sweep pays ≥ 1
+  sat — `Math.ceil` structurally forbids a zero/negative fee for any positive
+  rate.
+- **4. Sub-1 specifics — SOUND.** The slow-lane hint renders iff
+  `valid && rate < 1` (probed at 0.1 = shown, 1 = explainer instead) and gates
+  nothing — Review stays enabled, no consent semantics attach. Bump rescue
+  re-verified INDEPENDENTLY including the case the shipped tests miss: a
+  no-change SWEEP at 0.1 — `estimateBumpFee(hasChangeOutput: false)` raises the
+  fee to the BIP125 floors (rule 4: ≥ old + 1 sat/vB × vsize; strictly-greater
+  effective rate), takes the increase from the recipient
+  (`reducesRecipientBy > 0`, honestly reported for the sheet's consent), keeps
+  the recipient above dust, reconciles to the input total, and `buildRbfBumpTx`
+  signs exactly the estimate (F11). `isFeeBelowRelayFloorError` breadth
+  attacked: it requires an `ApiResponseError` INSTANCE (thrown only by our own
+  non-2xx handler — a matching message on a plain Error/string/object never
+  classifies) and the regex hits only Core's two verbatim forms; a hostile body
+  crafted to match can — worst case — swap the failure sheet's copy and
+  suppress the retry button, which grants the attacker NOTHING: the generic
+  sheet already carries a "Go back" action, and an immediate recompose reuses
+  the same locally-unchanged UTXO set (largest-first selection overlaps on the
+  first input), so a second build CONFLICTS with the first — a replacement, not
+  a double-pay. Near-miss phrasings (`insufficient fee, rejecting replacement`,
+  truncations, paraphrases, empty body) all fall to the generic sheet, whose
+  retry re-broadcasts byte-identical bytes (deterministic build over unchanged
+  state; Esplora re-broadcast of an accepted tx = success) — idempotent, safe.
+  A min-relay rejection writes NOTHING to sendLog: `recordSend` sits after the
+  `broadcastTx` await (actions.ts:838→845) and the shipped
+  `actions.broadcastfail` test pins the storage key null through the real
+  (mock-relay-only) path.
+- **5. Display honesty — HOLDS at the value level; one zero-paint wrinkle
+  (F21).** The chip and the Review row render the PARSED number — `String(rate)`
+  of the same double in `feeRateSatVb` — and a double's `String()` round-trip is
+  exact, so displayed == transmitted always. The anchored decimal regex admits
+  no float-artifact SOURCE text; a user literally typing
+  `0.30000000000000004` gets that exact double displayed and transmitted.
+  Half-ulp boundary rounding adjudicated below. The `feeSats: bigint | null`
+  ripple goes dark almost everywhere: total line gated on `feeSats !== null`,
+  `feeUsd` null, over-balance check waits, high-fee numbers read the live
+  selection only — EXCEPT the sendMax conversion line (F21, Info, below).
+- **6. Regression + gates — GREEN.** 319/319 (every F1–F20 pin green), `tsc`
+  clean, build clean, CSP byte-identical, no `console.*`, no new deps.
+  `git diff main...custom-fee` over `src/lib/tx.ts src/lib/api.ts
+  src/actions.ts src/lib/vault.ts src/lib/sendLog.ts src/screens/Activity.tsx
+  src/screens/speedUp.ts package.json package-lock.json public/ index.html` is
+  EMPTY — engine, API, actions, vault, send log, and the Speed-up sheet are
+  byte-untouched; the Speed-up path stays tier-only (`FeeTier` deliberately
+  excludes 'custom', so `feeRateForTier` remains total — checked by type and by
+  grep). The one pre-existing-test delta (`Send.feerate.test.tsx`) only updates
+  the chip count 3→4. `ENGINE.md`'s clamp claims remain true (tiers keep
+  [1, 500]; the engine never claimed a floor). (Nit, no number: `DESIGN.md:385`
+  still describes the fee selector as "a simple three-choice selector (not
+  sat/vByte)" — stale since Round 12 added the rate lines; historical doc.)
+
+## New findings
+
+### F21 — [SEV-Info] Send Max + Custom-with-no-rate paints a fabricated $0.00 as the Max amount
+
+- **Where:** `src/screens/Send.tsx:406-409` (the sendMax `amount-conv` line)
+  rendering `previewAmountSats`, which lines 308–312 collapse to `0n` when
+  `feeSats === null`.
+- **Scenario (probed):** tap **Max** with a tier selected, then tap **Custom**
+  before typing a rate: the amount line paints `$0.00 · 0.00000000 BTC` as the
+  amount that would be swept — a number nobody computed (the real max is
+  balance − fee, unknowable without a rate). Everything money-path is already
+  dark/gated: the total line is hidden, Review is hard-disabled, `review()` is
+  a no-op (probed), and no PendingSend can carry it. But the feature's own rule
+  — "an honest blank beats a number at a rate nobody chose" — breaks on this
+  one line: the null goes to ZERO here, not dark.
+- **Fix:** when `sendMax && feeSats === null`, render the conversion line empty
+  or an em-dash placeholder instead of formatting `0n`. One-line ternary;
+  display-only.
+
+## Adjudications (as briefed)
+
+- **`'1.'` / `'.5'` accepted — INTENDED, keep.** The regex is character-for-
+  character the `btcStringToSats` shape the amount field has always accepted
+  (optional integer part, optional fraction, at least one digit total). Both
+  parse unambiguously (`1`, `0.5`), both display back as the parsed value, and
+  rejecting them here while the BTC amount field accepts them would be the real
+  inconsistency.
+- **Half-ulp boundary rounding — ACCEPTABLE.** Text within half an ulp of a
+  window edge classifies at the edge (`'0.1000000000000000001'` and
+  `'0.09999999999999999999'` → valid at exactly `0.1`;
+  `'500.00000000000001'` → valid at exactly `500`; the first representable
+  values outside stay rejected — all probed). This is inherent to ANY
+  double-based parse, the transmitted value is strictly in-window, and the UI
+  displays the PARSED value (`0.1`), never the raw text — so
+  displayed == transmitted holds and reject-never-clamp is preserved at the
+  value level, which is the level the engine consumes. Sub-attosat/vB
+  text-vs-value drift has no monetary meaning (fees are ceil'd to whole sats).
+- **The retained `props.fees !== null` gate — CONSERVATIVE, ACCEPTABLE.**
+  With tier estimates unavailable (mempool.space down), a valid custom rate
+  still cannot send. This blocks a genuinely-useful escape hatch (fees come
+  from mempool.space while broadcast goes to blockstream, so the outage that
+  blocks sending isn't even the broadcast path's), but the gate fails CLOSED,
+  doubles as an endpoint-health signal exactly as the code comment argues, and
+  relaxing it changes what "estimates unreachable" means for the whole screen —
+  correctly deferred as a separate owner decision. UX consideration, not a
+  finding.
+- **`isFeeBelowRelayFloorError` breadth — CORRECTLY NARROW, worst case
+  benign.** Instance-gated to our own thrown type, matches only Core's two
+  verbatim relay-floor forms, and its ONLY effect is sheet copy + retry
+  suppression (no sendLog write, no state beyond the sheet variant, no new
+  user capability — "Go back" existed on the generic sheet). False negatives
+  degrade to the generic sheet's idempotent retry; false positives require a
+  hostile relay that could already lie in worse ways (Round 13's trust
+  verdict), and the immediate-recompose path self-protects via input conflict.
+
+## Ship recommendation
+
+**SHIP.** The new trust boundary is a strict, anchored, house-consistent parse
+with exactly one entry point and no coercion path; the validated number rides
+the audited F11 single path end to end; the engine's F1/F10 hard guards bind
+unchanged beneath a corrupted state; the sub-1 lane is honestly hinted,
+rescue-proven (sweep case included), log-clean on rejection, and safely
+surfaced at the relay floor; and the fee-math surface is byte-identical. The
+one finding is an Info-severity display wrinkle on an already-gated state.
+
+_Round-14 throwaway tests used the `.review.test.tsx` suffix, were executed,
+and were deleted; the only file modified is this `docs/review/round1.md`,
+committed on `custom-fee` (not pushed). Zero live API calls this round. Gates
+re-confirmed after deletion: `tsc --noEmit` clean, `npm test` = 319 passing,
+`npm run build` clean, dist CSP unchanged. Next finding number: **F22**._
+
+## Round 14 closure — F21 re-check
+
+**F21 — CLOSED.** Fix commit `5377d91` (PM-authored per the one-liners policy;
+this closure is the independent check the policy exists for). The sendMax
+conversion line now renders only when `sendMax && feeSats !== null`, with the
+WHY comment citing F21, and the else-branch became `!sendMax && conversion`.
+
+- **Reproduction re-run (my probe, not the fix's own test):** Max + Custom with
+  no rate → NO `.amount-conv` node, no `$0.00`, no `0.00000000 BTC` anywhere on
+  the screen; also dark for a MALFORMED (`abc`) and an OUT-OF-RANGE (`0.01`)
+  entry, not just empty (the shipped regression test covers only the empty
+  case — the fix's `feeSats !== null` gate covers all three, probed). A valid
+  rate restores the honest balance-minus-fee line; switching back to a tier
+  keeps it honest. Review stays hard-disabled and `review()` a no-op throughout.
+- **The else-branch adjustment is CORRECT and necessary, not just cosmetic:**
+  under Max the `conversion` memo is NON-empty (amountSats = spendableSats), so
+  a plain `feeSats !== null ? sweep : conversion ? …` would have leaked the
+  full-balance conversion into the dark state — the `!sendMax` guard prevents
+  exactly that (probed: no conversion string paints in the F21 state). Non-Max
+  rendering is byte-identical: a typed USD amount paints the same
+  `convBtc(…)` string before/after and UNDER custom-with-no-rate, invalid, and
+  valid rates alike (the line is amount-derived, deliberately rate-free), the
+  BTC entry unit path is unchanged, and an empty amount still paints nothing.
+- **No other `previewAmountSats` fallback renders:** its three render sites are
+  the now-gated sweep line, the `feeSats !== null`-gated total line, and the
+  high-fee percentage (rendered only with a live feeSelection). Diff scope is
+  exactly Send.tsx (the one ternary + comment) and the one added regression
+  test; engine/actions/api untouched.
+
+Gates on `5377d91`: `npm test` = **320 passing** (319 + the F21 regression
+test), `tsc --noEmit` clean, `npm run build` clean. Throwaway
+`round14closure.review.test.tsx` (4 probes) executed and deleted.
+
+**SHIP** stands. Next finding number: **F22**.
