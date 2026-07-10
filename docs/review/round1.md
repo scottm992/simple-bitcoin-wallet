@@ -2376,3 +2376,21 @@ and were deleted; the only file modified is this `docs/review/round1.md`,
 committed on local main (not pushed). Zero live API calls this round. Gates
 re-confirmed after deletion: `tsc --noEmit` clean, `npm test` = 331 passing,
 `npm run build` clean, dist CSP unchanged. Next finding number: **F23**._
+
+## Round 15 closure — F22 re-check
+
+**F22 — CLOSED.** Fix commit `39e9095` (PM-authored per the one-liners policy;
+this closure is the independent check). Verified against the committed source:
+`strings.receive.rotatedNotice` now reads "the address you were showing **has
+been used**" — the suggested wording applied verbatim — and the string's WHY
+comment records the stale-cache-seam reasoning explicitly ("the copy must not
+overclaim recency — F22, round 15"); the old phrase survives only inside that
+comment, never in rendered copy. No test pinned the old literal: every
+reference to the notice — the render site (Receive.tsx:106) and all eight
+assertions in `Receive.nudge.test.tsx` — goes through the
+`strings.receive.rotatedNotice` constant, so the copy change propagates by
+construction. The diff is exactly the one string + its comment in
+`src/strings.ts` (7+/4−, no other file); Receive's firing logic, guards, and
+the live-region markup are byte-untouched, so every Round-15 probe result
+stands. Gates re-run on `39e9095`: `tsc --noEmit` clean, `npm test` = **331
+passing**. **SHIP** stands. Next finding number: **F23**.
