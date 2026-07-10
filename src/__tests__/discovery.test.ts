@@ -460,11 +460,12 @@ describe('startDiscovery — snapshot completeness (F12)', () => {
   });
 });
 
-describe('deadline-cut phase 2 self-heals — but only after the backoff window (F12 + §1a)', () => {
-  it('keeps the incomplete phase-1 result, suppresses self-heal in the window, then completes', async () => {
+describe('progress-cut phase 2 self-heals after the QUICK window (F12 + §b)', () => {
+  it('keeps the phase-1 partial, gated inside the quick window, then self-heals FAR sooner than a full ladder rung', async () => {
     vi.useFakeTimers();
-    // Phase 1 (10 stats requests) succeeds instantly; everything after stalls,
-    // so the 20s deadline cuts phase 2 off — exactly the throttled-burst case.
+    // Phase 1 (10 requests) lands instantly; everything after stalls, so the
+    // inactivity cutoff cuts phase 2 off. The run MADE PROGRESS (10 landed), so
+    // it earns a QUICK retry (~8s) — not the ~60s rung it took pre-v1.1.2.
     mockNet.hangAfter = 10;
 
     const controller = new DiscoveryController();
@@ -476,17 +477,14 @@ describe('deadline-cut phase 2 self-heals — but only after the backoff window 
       onError,
     });
 
-    await vi.advanceTimersByTimeAsync(20_500); // past the 20s deadline
+    await vi.advanceTimersByTimeAsync(12_500); // past the 12s inactivity cutoff
     // The run settled: phase-1 kept (incomplete), no error, controller idle.
     expect(flags).toEqual([false]);
     expect(onError).not.toHaveBeenCalled();
     expect(controller.busy).toBe(false);
 
-    // §1a: the cut run ESCALATED the ladder, so the very next poll tick — still
-    // inside the backoff window — must NOT self-heal. It issues nothing, so a
-    // stalled run cannot trigger a second run within the window (this is the
-    // whole fix: no more 30s hammer). This behaviour is a deliberate change from
-    // the pre-v1.1.1 "self-heal on the very next tick".
+    // Immediately after the cut we are INSIDE the ~8s quick window (eligible at
+    // cut+8s ≈ 20s): the very next poll tick must still be gated — zero requests.
     const before = mockNet.statsCalls.length;
     const onChanged = vi.fn();
     controller.pollTick({
@@ -498,10 +496,9 @@ describe('deadline-cut phase 2 self-heals — but only after the backoff window 
     expect(onChanged).not.toHaveBeenCalled();
     expect(mockNet.statsCalls.length).toBe(before);
 
-    // Once the window elapses (level-1 = ~60s + up to 10s jitter; advance well
-    // past it), the tick self-heals — a full refresh (onChanged) WITHOUT issuing
-    // any requests of its own.
-    await vi.advanceTimersByTimeAsync(71_000);
+    // Past the QUICK window (~8s — FAR short of the old ~60s ladder rung) the
+    // tick self-heals: a full refresh (onChanged) with zero requests of its own.
+    await vi.advanceTimersByTimeAsync(8_500); // t≈21s, past cut+8s but well under 60s
     controller.pollTick({
       network: 'testnet',
       account: freshSnapshot(),
@@ -871,9 +868,157 @@ describe('automatic-refresh backoff ladder (§1a/§1f)', () => {
     }
     // Without backoff the self-heal would fire a fresh 40-request run roughly
     // every tick (~15+ over 12 min). With the ladder, runs get exponentially
-    // rarer: a small handful.
+    // rarer: a small handful. A fully wedged network lands NOTHING, so every run
+    // is no-progress and walks the FULL ladder — decaying exactly as in v1.1.1
+    // (the §b quick retry is never granted here).
     expect(runsStarted).toBeLessThanOrEqual(7);
     expect(runsStarted).toBeGreaterThanOrEqual(2);
+    controller.abort();
+    vi.useRealTimers();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §b (v1.1.2) — progress-gated backoff. A cut run that LANDED new responses
+// (made progress; the cross-run cache means its resume pays only the shrinking
+// remainder) earns a QUICK retry; a run that landed nothing walks the full
+// ladder. GUARDRAIL: a quick-retried run that then lands nothing does NOT loop
+// on the quick window — it escalates, so a wedged network can never self-DoS.
+// ---------------------------------------------------------------------------
+
+describe('progress-gated backoff (§b)', () => {
+  it('a progress-cut run is eligible within the QUICK window and the resume pays only the remainder', async () => {
+    vi.useFakeTimers();
+    // Phase 1 (10) + 15 more land (25 cached), then everything stalls → cut. The
+    // run made progress, so the automatic path is quick-eligible (~8s).
+    mockNet.hangAfter = 25;
+    const controller = new DiscoveryController();
+    let complete = false;
+    controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(12_500); // inactivity cut (progress)
+    expect(controller.busy).toBe(false);
+
+    // Inside the quick window: a poll tick is still gated.
+    const gatedProbe = vi.fn();
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: false,
+      onChanged: gatedProbe,
+    });
+    expect(gatedProbe).not.toHaveBeenCalled();
+
+    // Network recovers; past the quick window the self-heal fires and the resumed
+    // run reuses the 25 cached responses — paying ONLY the remaining 15 of 40.
+    mockNet.hangAfter = null;
+    await vi.advanceTimersByTimeAsync(8_500); // t≈21s, past cut+8s
+    const before = mockNet.statsCalls.length;
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: false,
+      onChanged: () =>
+        controller.refresh({
+          network: 'testnet',
+          onSnapshot: (_s, c) => {
+            if (c) complete = true;
+          },
+          onError: vi.fn(),
+        }),
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    expect(complete).toBe(true);
+    expect(mockNet.statsCalls.length - before).toBe(15); // 40 − 25 cached
+    controller.abort();
+    vi.useRealTimers();
+  });
+
+  it('a quick-retried run that lands NOTHING new walks the FULL ladder (no quick-retry loop)', async () => {
+    vi.useFakeTimers();
+    // Run A: phase 1 (10) lands, phase 2 stalls → progress-cut → quick retry.
+    mockNet.hangAfter = 10;
+    const controller = new DiscoveryController();
+    const refreshOnce = (): void =>
+      controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    refreshOnce();
+    await vi.advanceTimersByTimeAsync(12_500); // cut A at ~12s (progress → quick)
+
+    // Quick window elapses → the self-heal starts run B. hangAfter is STILL 10,
+    // so run B resumes phase 1 from cache (no NEW landings) and phase 2 stalls →
+    // run B lands NOTHING new (madeProgress = false).
+    await vi.advanceTimersByTimeAsync(8_500); // t≈21s, quick-eligible
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: false,
+      onChanged: refreshOnce,
+    });
+    // Run B lands nothing, so its own inactivity cutoff fires ~12s after it
+    // started (~t=33s).
+    await vi.advanceTimersByTimeAsync(12_500); // t≈33.5s
+    expect(controller.busy).toBe(false);
+
+    // Run B escalated the FULL ladder (level-1 ≈ 60s), NOT another quick retry.
+    // A probe ~30s after cut B — well past the 8s quick window but far short of
+    // 60s — must still be GATED, proving there is no quick-retry loop.
+    await vi.advanceTimersByTimeAsync(30_000); // t≈63.5s (cut B + ~30s)
+    const gatedProbe = vi.fn();
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: false,
+      onChanged: gatedProbe,
+    });
+    expect(gatedProbe).not.toHaveBeenCalled();
+
+    // Only well past the full rung (cut B + ~70s) is it eligible again.
+    await vi.advanceTimersByTimeAsync(40_000); // t≈103.5s (cut B + ~70s)
+    const healed = vi.fn();
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: false,
+      onChanged: healed,
+    });
+    expect(healed).toHaveBeenCalledTimes(1);
+    controller.abort();
+    vi.useRealTimers();
+  });
+
+  it('a complete snapshot resets the ladder AND any pending quick-retry window', async () => {
+    vi.useFakeTimers();
+    // A progress-cut arms a quick-retry window (nextEligible = cut+8s).
+    mockNet.hangAfter = 10;
+    const controller = new DiscoveryController();
+    controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(12_500); // progress-cut → quick window armed
+    expect(controller.busy).toBe(false);
+
+    // A manual refresh completes (network recovered) → resets EVERYTHING,
+    // including the pending quick-retry window.
+    mockNet.hangAfter = null;
+    let complete = false;
+    controller.refresh({
+      network: 'testnet',
+      onSnapshot: (_s, c) => {
+        if (c) complete = true;
+      },
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(complete).toBe(true);
+
+    // The very next poll tick is NOT gated — the cheap 2-request poll runs
+    // immediately (ladder fully healthy; no lingering quick-retry gate).
+    const before = mockNet.statsCalls.length;
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: true,
+      onChanged: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockNet.statsCalls.length - before).toBe(2); // the two tips
     controller.abort();
     vi.useRealTimers();
   });

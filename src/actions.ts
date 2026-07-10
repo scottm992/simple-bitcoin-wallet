@@ -119,6 +119,20 @@ const MAX_BACKOFF_LEVEL = 8;
 const BACKOFF_JITTER_MS = 10_000;
 
 /**
+ * Progress-gated quick retry (§b, v1.1.2). When a cut run made progress (landed
+ * ≥1 new response), the automatic self-heal becomes eligible again after just
+ * this long — far shorter than any full ladder rung — because the cross-run cache
+ * means the resume pays only the shrinking remainder (convergence is monotonic
+ * and cheap). ~8s: long enough not to hammer a recovering connection, short
+ * enough that the "may be behind" wait doesn't linger. HARD guardrails in
+ * {@link DiscoveryController.settleIncomplete} keep this from re-creating the
+ * v1.1.1 self-DoS: it is granted ONLY on progress, and a run it grants that then
+ * lands NOTHING walks the full ladder — so consecutive no-progress runs always
+ * decay, and a wedged network is never quick-retried.
+ */
+const QUICK_RETRY_MS = 8_000;
+
+/**
  * The concrete api object passed into discovery. We import the named functions
  * from the barrel and shape them into the AccountApi interface.
  */
@@ -420,10 +434,14 @@ export async function pollAccount(
  * - `pollTick` is skipped entirely while a discovery or a previous poll is
  *   still running, so 30s ticks can never pile bursts on top of a slow crawl;
  * - the AUTOMATIC path (self-heal / poll) is gated by an exponential backoff
- *   ladder (§1a/§1f): a run that ends in error or is cut incomplete escalates
- *   it, any successful complete snapshot resets it, and while backed off the
+ *   ladder (§1a/§1f): a complete snapshot resets it, and while backed off the
  *   automatic tick issues ZERO requests so offered load decays instead of
- *   growing. `refresh` — the MANUAL path — is never gated.
+ *   growing. A cut/errored run's escalation is PROGRESS-GATED (§b, v1.1.2): a run
+ *   that LANDED new responses (made progress — the cross-run cache means its
+ *   resume pays only the shrinking remainder) earns a QUICK retry instead of a
+ *   full rung; a run that landed nothing walks the full ladder, so consecutive
+ *   no-progress runs on a wedged network still decay exactly as before. `refresh`
+ *   — the MANUAL path — is never gated.
  *
  * Headless (no React) so the piling/skipping/backoff behavior is directly
  * testable.
@@ -432,9 +450,11 @@ export class DiscoveryController {
   private current: DiscoveryHandle | null = null;
   private pollBusy = false;
 
-  /** Backoff ladder state (§1a). Level 0 = healthy; the automatic path is
-   *  suppressed until `Date.now() >= nextEligibleAt`. Manual refresh ignores
-   *  both — it always runs now. */
+  /** Backoff ladder state (§1a/§b). Level 0 = healthy; the automatic path is
+   *  suppressed until `Date.now() >= nextEligibleAt`. A progress-cut run sets a
+   *  short {@link QUICK_RETRY_MS} eligibility and resets the level; a no-progress
+   *  cut escalates the level (30s·2^level, capped). Manual refresh ignores both —
+   *  it always runs now. */
   private backoffLevel = 0;
   private nextEligibleAt = 0;
 
@@ -447,9 +467,10 @@ export class DiscoveryController {
    * Aborts any in-flight run and starts a fresh two-phase discovery. This is
    * the MANUAL path (Try again / unlock / network switch / post-broadcast) — it
    * is ALWAYS instant and never gated by the backoff ladder. Its OUTCOME still
-   * feeds the ladder, though: a completed full snapshot resets it, an error or a
-   * deadline-cut incomplete run escalates it — so the automatic path that shares
-   * this controller backs off (or recovers) based on what actually happened.
+   * feeds the ladder, though: a completed full snapshot resets it; a cut/errored
+   * run either earns a quick retry (it made progress) or escalates the full
+   * ladder (it landed nothing) — so the automatic path that shares this
+   * controller backs off (or recovers) based on what actually happened.
    */
   refresh(params: {
     network: Network;
@@ -459,13 +480,15 @@ export class DiscoveryController {
      *  {@link startDiscovery}). */
     onProgress?: (checked: number, estimatedTotal: number) => void;
     /**
-     * Fires exactly once when THIS run settles (complete, error, or
-     * deadline-cut) AND is still the current run — never for a superseded run.
-     * The App clears the stored scan-progress here, so a run the deadline cut
-     * mid-scan can't leave a frozen "address N of ~M" on the cue: with no run in
-     * flight the cue must fall back to its deliberate-wait (State B) text.
+     * Fires exactly once when THIS run settles (complete, error, or cut) AND is
+     * still the current run — never for a superseded run. The App clears the
+     * stored scan-progress here, so a run cut mid-scan can't leave a frozen
+     * "address N of ~M" on the cue: with no run in flight the cue must fall back
+     * to its deliberate-wait (State B) text.
      */
     onSettled?: () => void;
+    inactivityMs?: number;
+    hardCapMs?: number;
     deadlineMs?: number;
     waveDelayMs?: number;
   }): void {
@@ -488,7 +511,9 @@ export class DiscoveryController {
       if (this.current !== handle) return;
       this.current = null;
       if (sawComplete) this.resetBackoff();
-      else this.escalateBackoff();
+      // §b: a cut/errored run is gated by whether it made forward progress —
+      // read the run's landed-response count off the handle.
+      else this.settleIncomplete(handle.madeProgress());
       // Settle signal: only the current run reaches here, so the App can safely
       // drop a stale scan-progress count without racing a newer run's ticks.
       params.onSettled?.();
@@ -498,12 +523,16 @@ export class DiscoveryController {
   /**
    * One cheap poll tick — the AUTOMATIC path. Skipped (zero requests) while a
    * discovery run or a previous poll is still in flight, AND while the backoff
-   * ladder says we're not yet eligible (§1a): a stalled run cannot cause a
+   * ladder says we're not yet eligible (§1a/§b): a stalled run cannot cause a
    * second run within the backoff window, and a wedged network sees offered load
-   * decay instead of grow. Once eligible:
-   *  - an INCOMPLETE on-screen snapshot (a deadline/abort cut phase 2 short,
-   *    F12) self-heals by requesting a full refresh (which RESUMES via the
-   *    cross-run cache — see §1b); it does NOT invalidate the cache;
+   * decay instead of grow. Eligibility is the QUICK window ({@link QUICK_RETRY_MS})
+   * after a progress-cut run, or a full ladder rung after a no-progress one. Once
+   * eligible:
+   *  - an INCOMPLETE on-screen snapshot (a cutoff/abort cut phase 2 short, F12)
+   *    self-heals by requesting a full refresh (which RESUMES via the cross-run
+   *    cache — see §1b); it does NOT invalidate the cache. Because the App's tick
+   *    is a 30s clock, a quick-eligible self-heal is FELT at the next tick edge
+   *    unless a faster follow-up nudge is pending (see `App.tsx`);
    *  - otherwise it runs the cheap used+tips check and, when money moved,
    *    invalidates the cache (§1b — so the following rescan re-fetches the moved
    *    address fresh and can never un-detect the change) and fires `onChanged`.
@@ -555,16 +584,47 @@ export class DiscoveryController {
     this.current = null;
   }
 
+  /**
+   * Accounts a cut/errored (non-complete) run against the backoff ladder,
+   * PROGRESS-GATED (§b, v1.1.2):
+   *
+   * - **Made progress** (landed ≥1 new response): the resume will pay only the
+   *   shrinking remainder via the cross-run cache, so grant a QUICK retry
+   *   ({@link QUICK_RETRY_MS}) and RESET the ladder level — "progress resets the
+   *   privilege". Consecutive progressing runs therefore keep resuming promptly,
+   *   which is exactly right: each one advances the cache toward a complete scan.
+   * - **No progress** (landed nothing — a true stall): escalate the FULL ladder
+   *   one rung. This is the ONLY guardrail needed to prevent a quick-retry loop:
+   *   a quick-retried run that then lands nothing hits this branch and walks the
+   *   ladder (it does NOT earn a second quick retry), and a persistently wedged
+   *   network — where no run ever lands anything — decays exactly as in v1.1.1.
+   *
+   * No separate "was quick-retried" flag is needed: quick is granted ONLY on
+   * progress, and progress is genuine forward convergence (a network fetch
+   * resolved that wasn't cached), so a quick chain is self-limiting — it ends the
+   * moment a run completes (→ {@link resetBackoff}) or stalls (→ full ladder).
+   */
+  private settleIncomplete(madeProgress: boolean): void {
+    if (madeProgress) {
+      this.backoffLevel = 0;
+      this.nextEligibleAt = Date.now() + QUICK_RETRY_MS;
+      return;
+    }
+    this.escalateBackoff();
+  }
+
   /** Escalates the automatic-refresh backoff one rung: 30s → 1m → 2m → 4m →
-   *  cap ~8m, plus jitter. Called when a run errors or is cut incomplete. */
+   *  cap ~8m, plus jitter. Called for a no-progress cut/error (§b). */
   private escalateBackoff(): void {
     this.backoffLevel = Math.min(this.backoffLevel + 1, MAX_BACKOFF_LEVEL);
     const interval = Math.min(BACKOFF_BASE_MS * 2 ** this.backoffLevel, BACKOFF_CAP_MS);
     this.nextEligibleAt = Date.now() + interval + Math.floor(Math.random() * BACKOFF_JITTER_MS);
   }
 
-  /** Resets the ladder to healthy — the automatic path may act on the next
-   *  tick. Called whenever a full (complete) snapshot lands. */
+  /** Resets the ladder to healthy — level 0 and immediately eligible, so the
+   *  automatic path may act on the next tick. This also clears any pending
+   *  quick-retry window (`nextEligibleAt = 0`). Called whenever a full (complete)
+   *  snapshot lands: a complete snapshot resets EVERYTHING. */
   private resetBackoff(): void {
     this.backoffLevel = 0;
     this.nextEligibleAt = 0;

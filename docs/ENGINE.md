@@ -166,9 +166,10 @@ outlives this regardless of activity — preserves round-5 F12: the run settles
 deterministically, the skeleton is never open-ended; a capped run keeps its
 phase-1 partial and resumes from the cross-run cache). Both timers abort the SAME
 AbortController; do NOT restore a single fixed wall (it can't tell "slow but
-landing" from "wedged" and cuts progressing runs). **Backoff ladder (§1a):**
+landing" from "wedged" and cuts progressing runs). **Backoff ladder (§1a/§b):**
 `BACKOFF_BASE_MS = 30_000`, `BACKOFF_CAP_MS = 480_000` (~8m), `MAX_BACKOFF_LEVEL
-= 8`, `BACKOFF_JITTER_MS = 10_000`.
+= 8`, `BACKOFF_JITTER_MS = 10_000`, `QUICK_RETRY_MS = 8_000` (§b — a cut run that
+made progress becomes eligible again this fast, see `DiscoveryController`).
 
 **Single-run pacing (Stage 2, v1.1.1).** The chain scan (`account.ts`
 `scanChain`) runs at `concurrency = 2` (down from 4) with a jittered
@@ -267,22 +268,36 @@ a full gap-20 evaluation.
   (`App.tsx` `discoveryRef`). `refresh(params)` — the MANUAL path (Try again /
   unlock / network switch / post-broadcast) — aborts any in-flight run and starts
   fresh; it is ALWAYS instant, never gated. Its OUTCOME feeds the backoff ladder:
-  a completed (phase-2) snapshot resets it, an error or a deadline-cut incomplete
-  run escalates it (a superseded run touches neither). `refresh` also accepts
-  optional `onProgress` (forwarded to the run for the scan-progress cue) and
-  `onSettled` — fired once when THIS run settles (complete, error, or cut) AND is
-  still the current run (never a superseded one). The App clears the stored
-  scan-progress in `onSettled`, so a run the deadline cut mid-scan can't leave a
-  frozen "address N of ~M" on the cue — with no run in flight the cue falls back
-  to its deliberate-wait, tappable text. `pollTick(params)` — the
-  AUTOMATIC path — is skipped (zero requests) while a run or a prior poll is in
-  flight AND while the ladder says we're not yet eligible (§1a: 30s → 1m → 2m →
-  4m → cap ~8m, +jitter), so a stalled run can't fire a second run within the
+  a completed (phase-2) snapshot resets EVERYTHING; a cut/errored run is
+  **progress-gated (§b, v1.1.2)** — if it LANDED new responses (made progress; the
+  cross-run cache means its resume pays only the shrinking remainder) it earns a
+  QUICK retry (`QUICK_RETRY_MS`, ~8s) and the ladder level resets, otherwise it
+  escalates the full ladder one rung (a superseded run touches neither). The
+  progress signal is `DiscoveryHandle.madeProgress()` (≥1 network response
+  landed — cache hits don't count, so a resumed run that only re-walks the cache
+  and then stalls is correctly "no progress" and walks the ladder). **No separate
+  "was quick-retried" flag is needed:** quick is granted ONLY on genuine forward
+  progress, so a quick-retried run that then lands nothing hits the no-progress
+  branch and escalates — consecutive no-progress runs always decay and a wedged
+  network can never self-DoS on the quick window. `refresh` also accepts optional
+  `onProgress` (forwarded to the run for the scan-progress cue) and `onSettled` —
+  fired once when THIS run settles (complete, error, or cut) AND is still the
+  current run (never a superseded one). The App clears the stored scan-progress in
+  `onSettled`, so a run cut mid-scan can't leave a frozen "address N of ~M" on the
+  cue — with no run in flight the cue falls back to its deliberate-wait, tappable
+  text. `pollTick(params)` — the AUTOMATIC path — is skipped (zero requests) while
+  a run or a prior poll is in flight AND while the ladder says we're not yet
+  eligible (§1a: 30s → 1m → 2m → 4m → cap ~8m, +jitter; §b: the ~8s quick window
+  after a progress-cut), so a stalled run can't fire a second run within the
   window and a wedged network's offered load DECAYS. Once eligible: an incomplete
   snapshot self-heals via a full refresh (which resumes from the cache, no
   invalidation); otherwise it runs the cheap check and, on detected movement,
   invalidates the cache then fires `onChanged`. The App's 30s interval stays a
-  dumb clock — the controller decides whether a tick may act. `abort()` on
+  dumb baseline clock — the controller decides whether a tick may act; a small
+  visibility-gated, single-shot follow-up in `App.tsx` (`QUICK_SELF_HEAL_FOLLOWUP_MS`)
+  nudges the self-heal while the snapshot sits in the deliberate-wait state, so a
+  quick-eligible resume is FELT within seconds rather than at the next 30s edge
+  (bounded and no-op unless the controller is already eligible). `abort()` on
   lock/unmount/network switch — on a network switch, call it synchronously BEFORE
   dispatching `setNetwork` (F13). `busy: boolean`.
 - `loadAccount(network)` — one full single-phase discovery (no deadline/phases).

@@ -59,6 +59,19 @@ import { Settings } from './screens/Settings';
 import { Sheet } from './components/ui';
 import { strings } from './strings';
 
+/**
+ * Fast follow-up delay for the v1.1.2 progress-gated quick retry. When a run is
+ * cut mid-scan but made progress, the controller becomes eligible to self-heal
+ * within its ~8s quick window — far sooner than the 30s baseline clock's next
+ * edge. This one-shot nudge, armed only while the snapshot sits in the
+ * deliberate-wait (State B) state, lets that quick resume be FELT promptly
+ * instead of waiting up to a full tick (the owner's "sat there ~a minute"
+ * complaint). Kept at ~8s to line up with the controller's QUICK_RETRY_MS; the
+ * controller's eligibility gate + single-flight are the real throttle, so this
+ * can only ever advance the timing of an already-eligible check, never burst.
+ */
+const QUICK_SELF_HEAL_FOLLOWUP_MS = 8_000;
+
 /** Applies the data-network attribute so the accent swaps in Practice mode. */
 function applyNetworkTheme(network: Network): void {
   const root = document.documentElement;
@@ -239,6 +252,45 @@ export default function App(): JSX.Element {
     }, 30_000);
     return () => clearInterval(id);
   }, [onWalletScreen, state.network, refreshPriceFees, refreshAccount]);
+
+  // Fast follow-up for the v1.1.2 progress-gated quick retry. While the snapshot
+  // is INCOMPLETE and no run is in flight — the deliberate-wait "State B" the
+  // Home cue shows after a run was cut mid-scan — the controller may already be
+  // eligible to self-heal within its ~8s quick window, much sooner than the 30s
+  // clock's next edge. This arms a SINGLE, visibility-gated one-shot to nudge the
+  // self-heal so a progress-cut resume is felt promptly. SAFE by construction:
+  //  - it is a no-op unless the controller says it's eligible AND no run is busy
+  //    (the eligibility gate + single-flight are the throttle — this can never
+  //    burst or amplify load, only advance the timing of an already-due check);
+  //  - it targets exactly State B (incomplete snapshot, not scanning), which is
+  //    reachable only when a run kept a phase-1 partial — i.e. a run that made
+  //    progress. A no-progress run errors with NO snapshot (not State B), so this
+  //    never fires for one, and a resumed run that lands nothing is on the FULL
+  //    ladder, so the nudge simply no-ops (gated) and the 30s clock takes over;
+  //  - it is bounded: one timer per State-B episode, re-armed only when the
+  //    incomplete/scanning state actually changes.
+  const selfHealPending =
+    onWalletScreen &&
+    state.account !== null &&
+    !state.accountComplete &&
+    state.accountStatus !== 'loading' &&
+    state.scanProgress === null;
+  useEffect(() => {
+    if (!selfHealPending) return;
+    const id = setTimeout(() => {
+      if (!isUnlocked() || document.visibilityState !== 'visible') return;
+      if (discovery().busy) return;
+      const account = accountRef.current;
+      if (!account) return;
+      discovery().pollTick({
+        network: state.network,
+        account,
+        accountComplete: accountCompleteRef.current,
+        onChanged: () => refreshAccount(),
+      });
+    }, QUICK_SELF_HEAL_FOLLOWUP_MS);
+    return () => clearTimeout(id);
+  }, [selfHealPending, state.network, refreshAccount]);
 
   // ---- Navigation helpers -------------------------------------------------
   const goHome = useCallback(() => dispatch({ type: 'navigate', screen: 'home' }), []);
