@@ -155,8 +155,18 @@ is single-flight, budget-limited, and deadline-bounded. Any change touching
 discovery must preserve this pattern (see review rounds 5–6, F12/F13).
 
 **Constants**: `FAST_GAP_LIMIT = 5` (phase 1), `FULL_GAP_LIMIT = 20` (phase 2,
-BIP44/F8), `DISCOVERY_DEADLINE_MS = 20_000` (do NOT raise — a bigger deadline
-just increases offered load), `POLL_CONCURRENCY = 4`. **Backoff ladder (§1a):**
+BIP44/F8), `POLL_CONCURRENCY = 4`. **Progress-aware run deadline (v1.1.2,
+replaces the old fixed `DISCOVERY_DEADLINE_MS = 20_000`):**
+`DISCOVERY_INACTIVITY_MS = 12_000` (a run is cut only after this long with NO
+response landing — every landed response resets it, so a slow-but-MOVING network
+completes in one run instead of being guillotined mid-scan; 12s sits above the
+api layer's 8s per-request timeout and below the old 20s wall, so a true stall is
+cut FASTER than before) and `DISCOVERY_HARD_CAP_MS = 120_000` (a run NEVER
+outlives this regardless of activity — preserves round-5 F12: the run settles
+deterministically, the skeleton is never open-ended; a capped run keeps its
+phase-1 partial and resumes from the cross-run cache). Both timers abort the SAME
+AbortController; do NOT restore a single fixed wall (it can't tell "slow but
+landing" from "wedged" and cuts progressing runs). **Backoff ladder (§1a):**
 `BACKOFF_BASE_MS = 30_000`, `BACKOFF_CAP_MS = 480_000` (~8m), `MAX_BACKOFF_LEVEL
 = 8`, `BACKOFF_JITTER_MS = 10_000`.
 
@@ -165,10 +175,11 @@ just increases offered load), `POLL_CONCURRENCY = 4`. **Backoff ladder (§1a):**
 `PACING_WAVE_DELAY_MS` (~200 ms + up to 100 ms jitter) delay BETWEEN waves, so a
 full run spreads over several seconds instead of firing as one burst. The two
 chains still scan concurrently, so peak in-flight is ~4 (not ~8). This is safe
-ONLY because of the cross-run cache below: a paced run the deadline cuts RESUMES
-rather than restarts. `DISCOVERY_DEADLINE_MS` stays 20_000 — pacing never
-lengthens the deadline (`waveDelayMs` is threaded through `startDiscovery` /
-`DiscoveryController.refresh`, defaulting to the production value; tests pass 0).
+ONLY because of the cross-run cache below: a paced run cut short RESUMES rather
+than restarts. Pacing never lengthens either run-deadline timer above; a
+slow-but-moving paced run keeps landing responses and completes uncut (`waveDelayMs`
+is threaded through `startDiscovery` / `DiscoveryController.refresh`, defaulting to
+the production value; tests pass 0).
 The cheap poll keeps `POLL_CONCURRENCY = 4` and is not paced. **Only waves that
 actually hit the network are paced (F17).** `scanChain` snapshots the
 `ScanCache`'s monotonic real-fetch counter around each wave and inserts the
@@ -200,7 +211,7 @@ and lock (all networks, no arg). `pollAccount` reads `getAddressStats` directly
 from 0 (F12) — only response reuse changes; `complete=true` only ever comes from
 a full gap-20 evaluation.
 
-- `startDiscovery({ network, onSnapshot, onError, onProgress?, deadlineMs? }): DiscoveryHandle`
+- `startDiscovery({ network, onSnapshot, onError, onProgress?, inactivityMs?, hardCapMs?, deadlineMs? }): DiscoveryHandle`
   — one two-phase run. **Phase 1** (first paint): fast gap-5 scan anchored at the
   cached high-water marks. **Phase 2** (correctness): extends to the full gap-20
   scan from index 0, reusing every response still fresh in the per-network
@@ -218,10 +229,20 @@ a full gap-20 evaluation.
   changes nothing about request timing/counts — pure instrumentation (§8
   do-nots hold). Like `onSnapshot`, it is SILENCED the instant the run is
   aborted/superseded (same `externallyAborted` guard), so no stale/cross-run
-  count leaks past an abort (F13-style). The run settles deterministically at the deadline:
-  a landed phase-1 result is kept; with no result at all, `onError` fires — the
-  skeleton is never open-ended. `DiscoveryHandle { done: Promise<void>; abort():
-  void }` — `abort()` cancels every in-flight request and silences the run: a
+  count leaks past an abort (F13-style). **Progress-aware deadline (v1.1.2):** the
+  run is bounded by an `inactivityMs` cutoff (default `DISCOVERY_INACTIVITY_MS`,
+  RESET on every landed response via the engine-internal `onResponse` hook wired
+  through `withScanCache` — a cache hit does NOT reset it, but a fully-cached
+  re-walk finishes inside the window anyway) and a `hardCapMs` wall (default
+  `DISCOVERY_HARD_CAP_MS`, never reset). Both abort the same AbortController;
+  tests inject small values for either (and the legacy `deadlineMs` still sets the
+  hard cap). Either way the run settles deterministically: a landed phase-1 result
+  is kept; with no result at all, `onError` fires — the skeleton is never
+  open-ended. `DiscoveryHandle { done: Promise<void>; madeProgress(): boolean;
+  abort(): void }` — `madeProgress()` is `true` iff ≥1 api response LANDED this
+  run (a network fetch resolved; cache hits don't count), read by the controller
+  to gate the backoff ladder. `abort()` cancels every in-flight request and
+  silences the run: a
   superseded run never dispatches a snapshot or an error, even if a phase had
   already resolved with its continuation still queued (F13). `abort()` does NOT
   clear the cache — a superseding manual refresh must be able to resume — but an

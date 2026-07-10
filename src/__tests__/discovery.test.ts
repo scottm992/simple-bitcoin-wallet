@@ -19,6 +19,13 @@ const mockNet = vi.hoisted(() => ({
   mode: 'instant' as 'instant' | 'hang' | 'manual',
   /** When set, requests beyond this many stats calls hang (stalls phase 2). */
   hangAfter: null as number | null,
+  /**
+   * When set, each (non-stalled, non-manual) stats request resolves after this
+   * many ms via a real timer — a "slow but MOVING" network. Honors abort, so a
+   * discovery cutoff still cancels an in-flight slow request. Used to exercise
+   * the v1.1.2 inactivity cutoff (landings keep resetting it) and hard cap.
+   */
+  responseDelayMs: null as number | null,
   used: new Set<string>(),
   statsCalls: [] as string[],
   abortedRequests: 0,
@@ -59,6 +66,28 @@ vi.mock('../lib/api', async (importOriginal) => {
             mockNet.abortedRequests++;
             reject(new actual.ApiNetworkError('aborted'));
           };
+          if (signal?.aborted) onAbort();
+          else signal?.addEventListener('abort', onAbort);
+        });
+      }
+      if (mockNet.responseDelayMs !== null) {
+        // Slow but MOVING: resolves after a delay unless aborted first. Each
+        // landing resets the run's inactivity cutoff, so a slow-but-moving run
+        // completes in one run (v1.1.2); an aborting cutoff/cap cancels it.
+        return new Promise<ReturnType<typeof statsFor>>((resolve, reject) => {
+          const t = setTimeout(() => {
+            cleanup();
+            resolve(statsFor(address));
+          }, mockNet.responseDelayMs ?? 0);
+          const onAbort = (): void => {
+            cleanup();
+            mockNet.abortedRequests++;
+            reject(new actual.ApiNetworkError('aborted'));
+          };
+          function cleanup(): void {
+            clearTimeout(t);
+            signal?.removeEventListener('abort', onAbort);
+          }
           if (signal?.aborted) onAbort();
           else signal?.addEventListener('abort', onAbort);
         });
@@ -120,6 +149,7 @@ beforeEach(() => {
   (DEFAULT_DISCOVERY_OPTIONS as { waveDelayMs?: number }).waveDelayMs = 0;
   mockNet.mode = 'instant';
   mockNet.hangAfter = null;
+  mockNet.responseDelayMs = null;
   mockNet.used.clear();
   mockNet.statsCalls = [];
   mockNet.abortedRequests = 0;
@@ -195,8 +225,8 @@ describe('startDiscovery — two-phase scan (Bug A2)', () => {
   });
 });
 
-describe('startDiscovery — deadline (Bug A4)', () => {
-  it('a stalled network settles to the error state at the deadline — never an eternal skeleton', async () => {
+describe('startDiscovery — progress-aware deadline (Bug A4 / v1.1.2)', () => {
+  it('a total stall from the start settles to error at the INACTIVITY cutoff — faster than the old 20s wall', async () => {
     vi.useFakeTimers();
     mockNet.mode = 'hang';
 
@@ -204,16 +234,107 @@ describe('startDiscovery — deadline (Bug A4)', () => {
     const onError = vi.fn();
     const handle = startDiscovery({ network: 'testnet', onSnapshot, onError });
 
-    // Well before the deadline: still pending, nothing settled.
-    await vi.advanceTimersByTimeAsync(19_000);
+    // Nothing ever lands, so the inactivity clock is never reset. Just before the
+    // 12s cutoff it is still pending — and 12s is already INSIDE the old 20s wall.
+    await vi.advanceTimersByTimeAsync(11_000);
     expect(onError).not.toHaveBeenCalled();
 
-    // Deadline: the run aborts its in-flight requests and settles to error.
-    await vi.advanceTimersByTimeAsync(1_500);
+    // Past the cutoff: the run aborts its in-flight requests and settles to error.
+    await vi.advanceTimersByTimeAsync(1_500); // t≈12.5s (the old wall was 20s)
     await handle.done;
     expect(onError).toHaveBeenCalledTimes(1);
     expect(onSnapshot).not.toHaveBeenCalled();
     expect(mockNet.abortedRequests).toBeGreaterThan(0);
+    expect(handle.madeProgress()).toBe(false); // nothing landed
+    vi.useRealTimers();
+  });
+
+  it('a slow-but-MOVING network completes the full 40 in ONE run, though it runs past the old 20s wall', async () => {
+    vi.useFakeTimers();
+    // Each request takes 3s but keeps landing; an empty-wallet full scan is many
+    // sequential waves, so the run runs well past the old 20s wall — yet every
+    // landing resets the 12s inactivity clock, so it is NEVER cut. This is the
+    // owner's field case: "scan slow and consistently" instead of a burst-then-stop.
+    mockNet.responseDelayMs = 3_000;
+    const flags: boolean[] = [];
+    const onError = vi.fn();
+    const handle = startDiscovery({
+      network: 'testnet',
+      waveDelayMs: 0,
+      onSnapshot: (_s, c) => flags.push(c),
+      onError,
+    });
+
+    // Well past the old 20s wall the run is STILL going (the fixed wall WOULD
+    // have cut it here) — but it is neither cut nor errored.
+    await vi.advanceTimersByTimeAsync(21_000);
+    expect(onError).not.toHaveBeenCalled();
+    expect(flags).toEqual([false]); // phase 1 painted; phase 2 still crawling
+
+    // Given enough time it finishes the whole scan in this SINGLE run.
+    await vi.advanceTimersByTimeAsync(60_000);
+    await handle.done;
+    expect(flags).toEqual([false, true]); // phase 1 then a COMPLETE phase 2
+    expect(mockNet.statsCalls.length).toBe(40); // full empty-wallet scan, exactly once
+    expect(mockNet.abortedRequests).toBe(0); // nothing was ever cut
+    vi.useRealTimers();
+  });
+
+  it('a stall AFTER progress is cut at the inactivity cutoff, keeping the phase-1 partial (incomplete cue)', async () => {
+    vi.useFakeTimers();
+    // Phase 1 (10 requests) lands instantly; everything after stalls. The last
+    // landing was phase 1, so the inactivity clock fires ~12s later and cuts
+    // phase 2 — keeping the phase-1 partial, never an error.
+    mockNet.hangAfter = 10;
+    const flags: boolean[] = [];
+    const onError = vi.fn();
+    const handle = startDiscovery({
+      network: 'testnet',
+      onSnapshot: (_s, c) => flags.push(c),
+      onError,
+    });
+
+    await vi.advanceTimersByTimeAsync(12_500); // past the 12s inactivity cutoff
+    await handle.done;
+    expect(flags).toEqual([false]); // phase-1 kept, phase-2 cut → still incomplete
+    expect(onError).not.toHaveBeenCalled(); // a landed phase-1 result is never an error
+    expect(mockNet.abortedRequests).toBeGreaterThan(0);
+    expect(handle.madeProgress()).toBe(true); // phase 1 landed → progress
+    vi.useRealTimers();
+  });
+
+  it('a drip-feed that keeps landing inside the inactivity window forever is settled by the HARD CAP', async () => {
+    vi.useFakeTimers();
+    // Each response lands every 100ms — always inside the (injected) 300ms
+    // inactivity window, so THAT cutoff never fires — but the run is far longer
+    // than the (injected) 950ms hard cap, which must settle it. Phase 1 lands
+    // first (partial kept); phase 2 is cut by the cap.
+    mockNet.responseDelayMs = 100;
+    const flags: boolean[] = [];
+    const onError = vi.fn();
+    const handle = startDiscovery({
+      network: 'testnet',
+      waveDelayMs: 0,
+      inactivityMs: 300,
+      hardCapMs: 950,
+      onSnapshot: (_s, c) => flags.push(c),
+      onError,
+    });
+
+    // Phase 1 (5 waves × 100ms = 500ms) has painted; the run is still going and
+    // the inactivity cutoff has NOT fired (landings come every 100ms < 300ms).
+    await vi.advanceTimersByTimeAsync(900);
+    expect(flags).toEqual([false]);
+
+    // The hard cap (950ms) settles the never-completing run. The inactivity clock
+    // would not fire until ~1200ms (last landing 900 + 300), so settling by 1100ms
+    // proves the CAP did it: phase-1 kept, no error.
+    await vi.advanceTimersByTimeAsync(200); // t≈1100ms, past the 950ms cap
+    await handle.done;
+    expect(flags).toEqual([false]); // never reached a complete phase-2
+    expect(onError).not.toHaveBeenCalled();
+    expect(mockNet.abortedRequests).toBeGreaterThan(0);
+    vi.useRealTimers();
   });
 });
 

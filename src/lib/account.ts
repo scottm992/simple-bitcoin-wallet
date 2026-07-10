@@ -200,9 +200,13 @@ export interface DiscoveryOptions {
    * Delay (ms, plus jitter) inserted BETWEEN scan waves within a chain (Stage 2,
    * v1.1.1). Paces a full run over several seconds so the request pattern stops
    * looking like a burst. Default {@link PACING_WAVE_DELAY_MS}; tests pass 0.
-   * Safe only WITH the cross-run cache (§1b): a slower run cut by the deadline
-   * resumes rather than restarts. The overall run stays bounded by
-   * `DISCOVERY_DEADLINE_MS` (20s) — the pacing never lengthens the deadline.
+   * Safe only WITH the cross-run cache (§1b): a slower run cut short resumes
+   * rather than restarts. The overall run stays bounded by the orchestrator's
+   * INACTIVITY cutoff + HARD CAP (v1.1.2 — `DISCOVERY_INACTIVITY_MS` /
+   * `DISCOVERY_HARD_CAP_MS` in `actions.ts`, replacing the old fixed 20s wall);
+   * pacing never lengthens either, and a slow-but-MOVING run — each landed
+   * response resets the inactivity clock — now finishes in ONE run instead of
+   * being guillotined mid-scan.
    */
   readonly waveDelayMs?: number;
   /**
@@ -222,6 +226,22 @@ export interface DiscoveryOptions {
    * HOW requests are made (the handoff §8 do-nots hold).
    */
   readonly onProgress?: (checked: number, estimatedTotal: number) => void;
+  /**
+   * Engine-internal hook fired once per api response that LANDS from the network
+   * — a cache MISS that hit the wrapped api and resolved (stats, utxos, or txs).
+   * The discovery orchestrator ({@link startDiscovery} in `actions.ts`) uses it
+   * to (1) reset its INACTIVITY cutoff — every landed response proves the run is
+   * still moving, so a slow-but-moving network isn't guillotined mid-scan — and
+   * (2) count forward progress so a cut-but-progressing run earns a quick
+   * automatic retry while a totally-stalled run walks the full backoff ladder.
+   *
+   * This is NOT a UI concern and NOT display: a cache HIT does not fire it (no
+   * network response landed — a fully-cached re-walk finishes well inside the
+   * inactivity window regardless), and it changes NOTHING about WHEN or HOW
+   * requests are made — it is a passive observation of the wrapped api, wired
+   * only when a {@link ScanCache} is present. Absent ⇒ no-op (byte-identical).
+   */
+  readonly onResponse?: () => void;
 }
 
 /**
@@ -510,7 +530,7 @@ export async function discoverAccount(
   options: Partial<DiscoveryOptions> = {},
 ): Promise<AccountSnapshot> {
   const opts: DiscoveryOptions = { ...DEFAULT_DISCOVERY_OPTIONS, ...options };
-  const cachedApi = opts.cache ? withScanCache(api, opts.cache) : api;
+  const cachedApi = opts.cache ? withScanCache(api, opts.cache, opts.onResponse) : api;
 
   // ---- Scan-progress aggregation (optional; onProgress absent ⇒ no-op) ------
   // discoverAccount owns the aggregation across the two CONCURRENTLY-scanning
@@ -608,8 +628,14 @@ export async function discoverAccount(
  * for the cross-run cache, across runs (a resumed run pays only the remainder).
  * A hit older than the cache's TTL is ignored and re-fetched, so a stale
  * "unused" answer can never be served past its lifetime.
+ *
+ * `onResponse` (optional) is fired once per NETWORK response that LANDS (a cache
+ * miss whose wrapped-api call resolved) — never on a cache hit. The discovery
+ * orchestrator uses it to reset its inactivity cutoff and count forward progress
+ * (see {@link DiscoveryOptions.onResponse}); it observes the api passively and
+ * changes nothing about request timing or counts.
  */
-function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
+function withScanCache(api: AccountApi, cache: ScanCache, onResponse?: () => void): AccountApi {
   /** Returns a still-fresh cached value, or undefined (miss or expired). */
   function fresh<T>(entry: CacheEntry<T> | undefined): T | undefined {
     if (entry === undefined) return undefined;
@@ -650,6 +676,11 @@ function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
       const gen = cache.generation;
       cache.recordFetch(); // F17: a real network hit — this wave paces.
       const value = await api.getAddressStats(network, address, signal);
+      // A network response LANDED: reset the run's inactivity cutoff and count
+      // forward progress. Fired BEFORE the write guard (the response arrived
+      // regardless of whether this superseded run may still cache it); the
+      // orchestrator's own hook is a no-op once its run has settled/aborted.
+      onResponse?.();
       if (cache.generation === gen && signal?.aborted !== true) {
         cache.stats.set(address, { value, storedAt: cache.now() });
       }
@@ -661,6 +692,7 @@ function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
       const gen = cache.generation;
       cache.recordFetch();
       const value = await api.getUtxos(network, address, signal);
+      onResponse?.(); // a network response landed (see getAddressStats above)
       if (cache.generation === gen && signal?.aborted !== true) {
         cache.utxos.set(address, { value, storedAt: cache.now() });
       }
@@ -672,6 +704,7 @@ function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
       const gen = cache.generation;
       cache.recordFetch();
       const value = await api.getAddressTxs(network, address, signal);
+      onResponse?.(); // a network response landed (see getAddressStats above)
       if (cache.generation === gen && signal?.aborted !== true) {
         cache.txs.set(address, { value, storedAt: cache.now() });
       }

@@ -44,8 +44,49 @@ const FAST_GAP_LIMIT = 5;
 /** Gap window for the full correctness scan (phase 2; BIP44 standard, F8). */
 const FULL_GAP_LIMIT = 20;
 
-/** Overall deadline for one discovery run: the skeleton is NEVER open-ended. */
-const DISCOVERY_DEADLINE_MS = 20_000;
+// ---------------------------------------------------------------------------
+// Progress-aware run deadline (v1.1.2) — replaces the single fixed 20s wall.
+//
+// Field report (owner's phone, 2026-07-10): a scan reached "22 of ~40", stopped
+// on the "may be behind" wait state for ~a minute, then finished. Diagnosis: the
+// network served slowly (a decaying mempool.space throttle — a stalled request
+// eats the 8s api timeout), and the FIXED 20s `DISCOVERY_DEADLINE_MS` cut the run
+// mid-phase-2. A single fixed wall can't tell "slow but still landing" from
+// "wedged": it guillotines a run that is genuinely making progress. Pacing the
+// run slower under that same wall would only cut it EARLIER — not the fix.
+//
+// Two timers now bound a run, both aborting the SAME AbortController the old
+// deadline used (so the settle semantics are unchanged — a landed phase-1 result
+// is kept, nothing → onError, a superseded run stays silent):
+//   • an INACTIVITY cutoff, reset by every landed api response, so a
+//     slow-but-MOVING run completes in ONE run and only a genuine stall is cut;
+//   • a HARD CAP that a run never outlives regardless of activity, preserving the
+//     round-5 F12 property that the run settles deterministically — the skeleton
+//     is NEVER open-ended.
+// ---------------------------------------------------------------------------
+
+/**
+ * Inactivity cutoff for a discovery run: it is aborted only after this long with
+ * NO api response landing. Every landed response resets it (via the engine's
+ * `onResponse` hook), so a network that serves each wave in a few seconds but
+ * keeps landing finishes the whole scan in one run instead of being cut at "22
+ * of ~40". Chosen at 12s — comfortably ABOVE the api layer's 8s per-request
+ * timeout (a single slow-but-successful request can't trip it) yet BELOW the old
+ * fixed 20s wall, so a true total stall is now cut FASTER than before, not slower.
+ */
+const DISCOVERY_INACTIVITY_MS = 12_000;
+
+/**
+ * Hard overall cap on a discovery run: it NEVER lives past this, regardless of
+ * activity. This is what preserves round-5 F12's load-bearing property now that
+ * the primary cutoff is activity-based — the run settles deterministically and
+ * the skeleton is never open-ended. Sized generously (2 min) so a genuinely
+ * slow-but-moving deep scan still completes in one run; a PATHOLOGICAL drip that
+ * keeps landing just inside the inactivity window forever is settled here. A
+ * capped run keeps its landed phase-1 result and resumes from the cross-run
+ * cache — it pays only the shrinking remainder, never a restart.
+ */
+const DISCOVERY_HARD_CAP_MS = 120_000;
 
 /** Concurrency for the cheap poll's stats re-checks. */
 const POLL_CONCURRENCY = 4;
@@ -151,8 +192,17 @@ export async function loadAccount(network: Network): Promise<AccountSnapshot> {
 
 /** A handle on an in-flight discovery run. */
 export interface DiscoveryHandle {
-  /** Settles when the run is finished (full scan done, deadline hit, or error). */
+  /** Settles when the run is finished (full scan done, cut short, or error). */
   readonly done: Promise<void>;
+  /**
+   * Whether this run LANDED at least one new api response (a network fetch that
+   * resolved — cache hits don't count). Read by {@link DiscoveryController} once
+   * the run settles to gate the backoff ladder: a cut-but-PROGRESSING run earns
+   * a quick automatic retry (the cross-run cache means its resume pays only the
+   * shrinking remainder), while a totally-stalled run (nothing landed) walks the
+   * full ladder so a wedged network's offered load still decays.
+   */
+  madeProgress(): boolean;
   /** Aborts the run: every in-flight request is cancelled. */
   abort(): void;
 }
@@ -175,9 +225,12 @@ function persistScanMarks(network: Network, snap: AccountSnapshot): void {
  *   run-scoped cache (only the window EXTENSION costs new requests), and
  *   dispatches the merged snapshot.
  *
- * The whole run is bounded by {@link DISCOVERY_DEADLINE_MS}: at the deadline it
- * settles deterministically — a completed phase-1 result stays on screen, and
- * with no result at all `onError` fires. The skeleton is never open-ended.
+ * The run is bounded by TWO timers (v1.1.2), both aborting the same
+ * AbortController: an {@link DISCOVERY_INACTIVITY_MS} cutoff reset by every
+ * landed response (so a slow-but-moving network completes in one run), and a
+ * {@link DISCOVERY_HARD_CAP_MS} wall it never outlives. Either way it settles
+ * deterministically — a completed phase-1 result stays on screen, and with no
+ * result at all `onError` fires. The skeleton is never open-ended (F12).
  */
 export function startDiscovery(params: {
   network: Network;
@@ -198,6 +251,15 @@ export function startDiscovery(params: {
    * or cross-run count can leak past an abort (F13-style).
    */
   onProgress?: (checked: number, estimatedTotal: number) => void;
+  /** Inactivity cutoff (ms); omitted → {@link DISCOVERY_INACTIVITY_MS}. Tests
+   *  inject a small value to exercise the stall path deterministically. */
+  inactivityMs?: number;
+  /** Hard overall cap (ms); omitted → {@link DISCOVERY_HARD_CAP_MS}. The legacy
+   *  name `deadlineMs` still sets this (back-compat for existing tests that
+   *  inject a single wall). */
+  hardCapMs?: number;
+  /** @deprecated Alias for {@link hardCapMs} — kept so pre-v1.1.2 tests that
+   *  inject a small fixed wall keep working. `hardCapMs` takes precedence. */
   deadlineMs?: number;
   /** Inter-wave pacing delay (Stage 2); omitted → the production default. Tests
    *  pass 0 to keep request-count assertions fast and deterministic. */
@@ -205,12 +267,35 @@ export function startDiscovery(params: {
 }): DiscoveryHandle {
   const { network, onSnapshot, onError } = params;
   const controller = new AbortController();
-  const deadline = setTimeout(() => controller.abort(), params.deadlineMs ?? DISCOVERY_DEADLINE_MS);
+  const inactivityMs = params.inactivityMs ?? DISCOVERY_INACTIVITY_MS;
+  const hardCapMs = params.hardCapMs ?? params.deadlineMs ?? DISCOVERY_HARD_CAP_MS;
   let gotSnapshot = false;
   // An externally aborted (superseded) run must stay silent: the aborter owns
-  // the UI state now. Only a deadline expiry / genuine failure with no result
-  // may settle the UI to the error state.
+  // the UI state now. Only a cutoff / genuine failure with no result may settle
+  // the UI to the error state.
   let externallyAborted = false;
+  // Guards late callbacks: once the run has settled or been aborted, a straggler
+  // response landing must not re-arm the inactivity timer (a leaked timer) or
+  // touch progress. Set in `finally` and in `abort()`.
+  let settled = false;
+  // §b progress signal: count of api responses that LANDED during this run (real
+  // network fetches that resolved — cache hits don't count). ≥1 ⇒ the run made
+  // forward progress; the controller reads this via {@link DiscoveryHandle.madeProgress}.
+  let landedResponses = 0;
+
+  // The HARD CAP: an unconditional wall so the run always settles (F12). Never
+  // reset — a run never outlives it regardless of activity.
+  const hardCap = setTimeout(() => controller.abort(), hardCapMs);
+  // The INACTIVITY cutoff: (re-)armed on every landed response. A total stall
+  // (nothing lands) fires it after one full window — faster than the old fixed
+  // wall; a slow-but-moving run keeps resetting it and completes uncut.
+  let inactivity = setTimeout(() => controller.abort(), inactivityMs);
+  const onResponse = (): void => {
+    if (settled) return;
+    landedResponses++;
+    clearTimeout(inactivity);
+    inactivity = setTimeout(() => controller.abort(), inactivityMs);
+  };
 
   const done = (async () => {
     try {
@@ -225,6 +310,11 @@ export function startDiscovery(params: {
         ...(params.waveDelayMs !== undefined ? { waveDelayMs: params.waveDelayMs } : {}),
         signal: controller.signal,
         cache,
+        // Engine-internal landing hook: reset the inactivity cutoff + count
+        // progress on every response that lands (see startDiscovery's timers and
+        // {@link DiscoveryOptions.onResponse}). Covers stats AND the utxo/txs
+        // fetches uniformly, since all three go through `withScanCache`.
+        onResponse,
         // Scan-progress (display-only): forward each aggregated tick to the
         // caller, but ONLY while this run still owns the UI. A superseded/aborted
         // run must fall silent (same rule as the onSnapshot dispatches below,
@@ -260,21 +350,26 @@ export function startDiscovery(params: {
       persistScanMarks(network, full);
       onSnapshot(full, true);
     } catch {
-      // Deadline expiry or network failure. With a phase-1 result already on
-      // screen we keep it; with nothing, settle to error so the UI never sits
+      // Inactivity/cap cutoff or network failure. With a phase-1 result already
+      // on screen we keep it; with nothing, settle to error so the UI never sits
       // on an open-ended skeleton. A superseded (externally aborted) run stays
       // silent — its replacement owns the UI state.
       if (!gotSnapshot && !externallyAborted) onError();
     } finally {
-      clearTimeout(deadline);
+      settled = true;
+      clearTimeout(hardCap);
+      clearTimeout(inactivity);
     }
   })();
 
   return {
     done,
+    madeProgress: (): boolean => landedResponses > 0,
     abort: (): void => {
       externallyAborted = true;
-      clearTimeout(deadline);
+      settled = true;
+      clearTimeout(hardCap);
+      clearTimeout(inactivity);
       controller.abort();
     },
   };
