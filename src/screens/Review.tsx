@@ -4,7 +4,7 @@ import { strings } from '../strings';
 import { Chrome } from '../components/Chrome';
 import { AddressChunk, CheckRow, Sheet, Toast, copyToClipboard } from '../components/ui';
 import { fmtBtc, fmtSats, fmtUsd } from '../display';
-import { MAX_FEE_ABSOLUTE_SATS, type Network } from '../lib';
+import { ApiResponseError, MAX_FEE_ABSOLUTE_SATS, type Network } from '../lib';
 import type { FeeTier, PendingSend } from '../state';
 
 /**
@@ -27,6 +27,23 @@ function tierTime(tier: FeeTier): string {
     : tier === 'economy'
       ? strings.send.feeEconomyTime
       : strings.send.feeStandardTime;
+}
+
+/**
+ * Whether a broadcast failure is the node REJECTING the transaction because
+ * its fee rate is below the node's minimum relay fee — reachable now that a
+ * custom rate may go sub-1 sat/vB and the node's floor can rise when the
+ * network gets busy. Recognizes Bitcoin Core's two message forms ("min relay
+ * fee not met" and "mempool min fee not met"), which Esplora relays verbatim
+ * in the error body. Deliberately NARROW: anything unrecognized keeps the
+ * generic connection-problem sheet (with its safe retry) — the raw error is
+ * classified here, never swallowed into a different failure story.
+ */
+export function isFeeBelowRelayFloorError(err: unknown): boolean {
+  return (
+    err instanceof ApiResponseError &&
+    /min relay fee not met|mempool min fee not met/i.test(err.body)
+  );
 }
 
 /**
@@ -57,7 +74,11 @@ export function Review(props: {
   const live = props.network === 'mainnet';
   const [checked, setChecked] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [failed, setFailed] = useState(false);
+  // Broadcast-failure state: null = no failure sheet. 'fee-too-low' is the
+  // node rejecting the fee rate (below its relay floor) — a DIFFERENT sheet
+  // from the generic connection failure, because retrying the identical bytes
+  // is guaranteed the identical rejection.
+  const [failed, setFailed] = useState<'generic' | 'fee-too-low' | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
   // F4: a failed dry-run blocks the whole screen. Render a recheck state with no
@@ -129,13 +150,16 @@ export function Review(props: {
   async function send(): Promise<void> {
     if (!canSend) return;
     setBusy(true);
-    setFailed(false);
+    setFailed(null);
     try {
       await props.onConfirm();
       // On success the parent navigates away; nothing more to do here.
-    } catch {
-      // Broadcast failed: money did NOT leave. Offer a safe retry.
-      setFailed(true);
+    } catch (err) {
+      // Broadcast failed: money did NOT leave, either way. A recognized
+      // fee-below-relay-floor rejection gets its own sheet (no retry — the
+      // identical bytes would get the identical answer; the fix is a higher
+      // fee); everything else keeps the generic sheet with its safe retry.
+      setFailed(isFeeBelowRelayFloorError(err) ? 'fee-too-low' : 'generic');
       setBusy(false);
     }
   }
@@ -166,7 +190,18 @@ export function Review(props: {
           <div className="rev-row">
             <span className="rev-row__k">{strings.review.feeLabel}</span>
             <span className="rev-row__v">
-              {strings.review.feeValue(fmtUsd(feeSats, props.btcUsd), tierTime(props.pending.feeTier))}
+              {props.pending.feeTier === 'custom'
+                ? // A custom rate can't honestly promise an arrival time, so the
+                  // row shows the rate itself — String() of the SAME number the
+                  // build will consume (feeRateSatVb), never a re-derivation.
+                  strings.review.feeValueCustom(
+                    fmtUsd(feeSats, props.btcUsd),
+                    String(props.pending.feeRateSatVb),
+                  )
+                : strings.review.feeValue(
+                    fmtUsd(feeSats, props.btcUsd),
+                    tierTime(props.pending.feeTier),
+                  )}
             </span>
           </div>
           <div className="rev-row rev-row--total">
@@ -207,21 +242,32 @@ export function Review(props: {
         </div>
       </div>
 
-      {failed ? (
+      {failed !== null ? (
         <Sheet>
           <h2 className="sheet__title">{strings.review.failHeading}</h2>
-          <p className="sheet__body">{strings.review.failBody}</p>
+          <p className="sheet__body">
+            {failed === 'fee-too-low' ? strings.review.failFeeTooLowBody : strings.review.failBody}
+          </p>
           <div className="sheet__actions">
-            <button
-              className="btn btn--primary btn--block"
-              onClick={() => {
-                setFailed(false);
-                void send();
-              }}
-            >
-              {strings.common.tryAgain}
-            </button>
-            <button className="btn btn--text btn--block" onClick={() => setFailed(false)}>
+            {failed === 'fee-too-low' ? (
+              // No retry here: re-broadcasting the identical transaction is
+              // guaranteed the identical rejection. The way forward is a
+              // higher fee, so the primary action goes back to compose.
+              <button className="btn btn--primary btn--block" onClick={props.onBack}>
+                {strings.review.goBack}
+              </button>
+            ) : (
+              <button
+                className="btn btn--primary btn--block"
+                onClick={() => {
+                  setFailed(null);
+                  void send();
+                }}
+              >
+                {strings.common.tryAgain}
+              </button>
+            )}
+            <button className="btn btn--text btn--block" onClick={() => setFailed(null)}>
               {strings.common.goBack}
             </button>
           </div>

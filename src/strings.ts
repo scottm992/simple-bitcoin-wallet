@@ -178,6 +178,30 @@ export const strings = {
     // used. Shown only once real estimates have loaded (no estimates → the chip
     // degrades to no rate, exactly as before).
     feeRate: (rate: number): string => `${rate} sat/vB`,
+    // --- Custom fee rate (the fourth chip; owner request 2026-07-10) ---
+    // The one place the app ASKS for a sat/vB number, so the unit appears in
+    // the copy here — everywhere else it stays a small technical footnote.
+    feeCustom: 'Custom',
+    feeCustomSub: 'you choose',
+    customFeeLabel: 'Your fee rate',
+    customFeeUnit: 'sat/vB',
+    customFeePlaceholder: 'e.g. 2.5',
+    // Helper under the input while it is empty or valid-and-ordinary. min/max
+    // are passed in from the REAL validation constants (never re-typed here).
+    customFeeExplainer: (min: string, max: string): string =>
+      `Set your own rate for the bitcoin network — any number from ${min} to ${max}. Higher usually confirms faster.`,
+    // Rejection messages (reject, never clamp: a typed money number is either
+    // used exactly as entered or refused with a reason — never silently edited).
+    customFeeMalformed: "That doesn't look like a number. Plain digits work best, like 5 or 2.5.",
+    customFeeOutOfRange: (min: string, max: string): string =>
+      `This wallet sends at rates between ${min} and ${max} sat/vB. Pick a number in that range.`,
+    // Sub-1 sat/vB "slow lane" hint — informational only, never a consent gate
+    // (the 25% fee-vs-amount rule stays the only consent flow). Honest about
+    // accepted ≠ confirmed: the node takes sub-1 payments (verified live
+    // 2026-07-10), but a busy network can leave one waiting or drop it — and
+    // Speed up is the rescue, so we point at it.
+    customFeeSlowHint:
+      "A rate below 1 is the network's slow lane. Your payment may wait a very long time, and if the network gets busy it could be refused or dropped. If it gets stuck, you can speed it up from Activity.",
     review: 'Review',
     totalLine: (amount: string, fee: string, total: string): string =>
       `You'll send ${amount} + ${fee} fee = ${total} total`,
@@ -207,6 +231,13 @@ export const strings = {
     copy: 'Copy',
     feeLabel: 'Network fee',
     feeValue: (fee: string, time: string): string => `${fee} · arrives in ${time}`,
+    // The fee row when the rate was typed by the user (feeTier 'custom'):
+    // a custom rate can't honestly promise an arrival time, so the row shows
+    // the rate itself instead — the SAME number carried in
+    // PendingSend.feeRateSatVb that the build will sign (displayed =
+    // transmitted, the fee-display honesty property).
+    feeValueCustom: (fee: string, rate: string): string =>
+      `${fee} · at your rate of ${rate} sat/vB`,
     totalLabel: 'Total leaving your wallet',
     warningLive:
       'Sending bitcoin cannot be undone. If the address is wrong, your money is gone for good. Take a moment to compare the address above with the one you were given.',
@@ -219,6 +250,12 @@ export const strings = {
     failHeading: "We couldn't send that just now",
     failBody:
       'Your bitcoin is safe and still in your wallet — nothing was sent. This is usually a connection problem. Check your internet and try again.',
+    // Broadcast REJECTED because the fee rate is under the node's relay floor
+    // (possible with a sub-1 custom rate when the network is busy). Unlike the
+    // generic failure there is no retry offered — re-sending the identical
+    // payment gets the identical answer — so the copy points back to the fee.
+    failFeeTooLowBody:
+      'The bitcoin network turned this payment down because its fee rate is below what it accepts right now. Your bitcoin is safe and nothing was sent. Go back and pick a higher fee, then try again.',
     // Dry-run failure: the amounts couldn't be worked out. Block sending; send
     // them back to re-check. Honest variants (F10/F11): only a genuine build
     // failure blames the balance; a fee-guard trip explains the fee with the
