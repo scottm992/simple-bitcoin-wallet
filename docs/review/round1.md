@@ -1470,3 +1470,61 @@ executed, and were deleted; the only file modified is this `docs/review/round1.m
 committed on `scan-continuity` (not pushed). Gates re-confirmed after deletion:
 `tsc --noEmit` clean, `npm test` = 274 passing, `npm run build` clean, `dist` CSP
 `script-src 'self'`. Next finding number: **F19**._
+
+---
+
+# Round 11 closure — F18 re-check
+
+**F18 CLOSED. New findings: 0. Ship recommendation: SHIP `scan-continuity`.**
+
+Re-audit of the one fix commit, `97ff595` (F18 — budget the quick-retry privilege):
+`QUICK_RETRY_BUDGET = 5`, a `quickRetriesGranted` counter on `DiscoveryController`,
+`settleIncomplete` grants quick only while `madeProgress && quickRetriesGranted <
+QUICK_RETRY_BUDGET` (spending one unit), everything else — no progress OR budget spent —
+escalates the full ladder one rung; only `resetBackoff` (a COMPLETE snapshot) refills the
+budget, alongside the ladder and any pending quick window. `tsc --noEmit` clean, `npm test`
+= **276 passing**, `npm run build` clean, `dist` CSP unchanged (`script-src 'self'`), no
+source touched by the review. Verified with throwaway `round11close.review.test.ts`
+(3 cases, executed, deleted).
+
+- **The F18 adversary is dead — CLOSED.** Re-ran the EXACT Round-11 measurement (the
+  one-landing-per-run TTL-churn adversary, 1s probe cadence, 10 simulated minutes) against
+  the committed code: **exactly 5 quick windows granted, never a 6th** — run-start gaps of
+  `[20, 20, 20, 20, 20]`s (the quick cadence, ≈100s ≈ one cache TTL, exactly the documented
+  bound) followed by `[77, 138, 256]`s (strictly growing full-ladder rungs, levels 1→3 +
+  jitter). **Total offered load: 38 requests / 10 min (pre-fix measurement: 122,
+  time-unbounded), 9 runs (was 30), trickle extinguished after ~100s** — the 30s window
+  series collapses to zeros between rungs. Guaranteed decay is restored: the over-budget
+  branch escalates on EVERY cut, progress or not.
+- **The field case is unaffected — HOLDS.** A genuinely converging resume (progress-cut,
+  then the healthy resume completes) still heals on the ~8s quick cadence — grant #1 of 5,
+  budget barely touched — and its complete snapshot resets everything (the very next tick
+  runs the ungated 2-request cheap poll). Refill proven independently: after a completion,
+  the SAME adversary run again gets a fresh budget of exactly 5 quick windows, then gates.
+  The shipped budget tests (exactly-5-then-ladder; refill) pin both behaviours in the 276.
+- **Docs no longer overclaim — CONFIRMED.** The two flagged comments are rewritten
+  ("usually pays only the shrinking remainder"; the `settleIncomplete` doc now states the
+  TRUE worst-case bound and names the TTL-churn mechanism); the only surviving
+  "self-limiting" string is the corrective text quoting the old claim. `ENGINE.md` carries
+  the budget constant and the honest bound (≈ budget × (12s cut + 8s window) ≈ 100s of
+  quick cadence, then guaranteed ladder decay) — measured 5 × 20s = 100s, so the audit
+  trail's invariant is now accurate, not aspirational.
+- **No regression — GREEN.** Full suite 276 passing (all Round-11 pins intact); the
+  Round-11 full-wedge decay timeline re-run against the fixed code is unchanged (12s first
+  cut, no quick window ever granted, ≤7 runs / 12 min, zero landings, load non-growing).
+  One benign note, not a finding: the budget (like the pre-existing ladder state) is
+  per-controller, not per-network — a spent budget briefly gates the OTHER network's
+  automatic path after a switch until its (ungated, manual) switch-refresh completes and
+  refills it; direction is conservative (less load), consistent with the ladder's existing
+  scope.
+
+**SHIP.** The fix is minimal, correct, and does exactly what the finding asked: the quick
+privilege is now provably bounded (≤5 windows ≈ 100s between complete snapshots), the
+pathological trickle cannot sustain, the real-world resume path is untouched, and the
+in-code/ENGINE.md claims now match measured reality.
+
+_Round-11-closure throwaway tests used the `.review.test.ts` suffix, were executed, and
+were deleted; the only file modified is this `docs/review/round1.md`, committed on
+`scan-continuity` (not pushed). Gates re-confirmed after deletion: `tsc --noEmit` clean,
+`npm test` = 276 passing, `npm run build` clean, `dist` CSP `script-src 'self'`. Next
+finding number: **F19**._
