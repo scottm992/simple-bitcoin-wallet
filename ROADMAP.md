@@ -18,10 +18,11 @@ network — F17); and the `isEmpty` Home flicker fix. History and design
 constraints: **`docs/HANDOFF-discovery-throttle.md`** (status updated) and
 review rounds 9 + closure in `docs/review/round1.md`.
 
-- **Stage 3 (v1.1.2, needs owner sign-off — NOT started):** pull the v1.2
-  second-source item forward — `blockstream.info` failover. Verified identical
-  Esplora shape. Now safe to consider since the loop fix shipped; still a
-  trust-model change awaiting Scott's explicit go-ahead.
+- **Stage 3 — DEFERRED by owner 2026-07-10:** the `blockstream.info` failover
+  stays on the v1.2 shelf for now (owner chose to hold off; scanning-progress
+  communication prioritized instead). Verified identical Esplora shape; still
+  failover-only if/when revisited; still requires explicit owner sign-off
+  (trust-model change) and a review round.
 
 ## v1.1 — Feels like a real app (near-term, small pieces)
 
@@ -61,7 +62,9 @@ review rounds 9 + closure in `docs/review/round1.md`.
   same relay-floor questions, so decide the floor once, for both.
 
 - **Scan progress on the "Checking for updates…" cue** *(owner request,
-  2026-07-10)* — show progress so an in-flight scan doesn't read as stuck.
+  2026-07-10 — PRIORITIZED as the next work item, ahead of the blockstream
+  failover; owner specifically wants the cue to say which address the scan is
+  on)* — show progress so an in-flight scan doesn't read as stuck.
   Design note: a strict percent is dishonest — the gap-limit scan's total
   grows when it finds a used address — so use "checked N of ~M addresses"
   (or a never-decreasing clamped percent) from a progress callback threaded
