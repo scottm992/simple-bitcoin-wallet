@@ -307,7 +307,14 @@ export function Send(props: {
           </p>
           <div className="fees">
             {feeChips.map((c) => {
-              const rate = props.fees ? feeRateForTier(props.fees, c.tier) : 1;
+              // The clamped rate this tier would actually use — the SAME value
+              // feeRateForTier feeds the engine (its second F1 guard), so the
+              // sat/vB shown on the chip can never disagree with the rate that
+              // gets signed. Null until real estimates load: the chip then omits
+              // the rate line and falls back to a typical-size USD placeholder
+              // (unchanged prior behavior — display degrades, never crashes).
+              const tierRate = props.fees ? feeRateForTier(props.fees, c.tier) : null;
+              const rate = tierRate ?? 1;
               const chipFeeSats = BigInt(Math.ceil(TYPICAL_VSIZE * rate));
               const chipFeeUsd = props.btcUsd === null ? '' : fmtUsd(chipFeeSats, props.btcUsd);
               return (
@@ -323,6 +330,9 @@ export function Send(props: {
                     <br />
                     {chipFeeUsd ? `≈ ${chipFeeUsd}` : ''}
                   </div>
+                  {tierRate !== null ? (
+                    <div className="fee__rate">{strings.send.feeRate(tierRate)}</div>
+                  ) : null}
                 </button>
               );
             })}
