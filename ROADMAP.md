@@ -107,9 +107,16 @@ network behaves byte-identically to v1.1.1.
 - **Scan QR to send** — camera-based address scanning on the Send screen
   (today it's paste-only). Needs a QR-decode dependency, so the supply-chain
   bar applies: tiny, audited, zero-dep library or nothing.
-- **Fresh address nudge** — after a receive address gets used, rotate the
-  Receive screen to the next one automatically (with the old one still valid).
-  Improves privacy for free.
+- **Fresh address nudge** — ✅ **shipped 2026-07-10** (v1.2.2; security review
+  round 15 + F22 closure). Rotation already worked (Receive follows the
+  snapshot's next-unused address); what shipped is the missing explanation — a
+  one-time notice when the address rotates mid-visit ("has been used… here's a
+  fresh one… the old address still works"), display-only, zero new requests.
+  Shipped alongside: **the custom-send gate relaxation** (owner decision) — a
+  validated custom sat/vB rate can now send while fee estimates are
+  unavailable; tier sends still require live estimates, tier chips disable and
+  go dark (F21 law), and the F10 25% consent flow was proven to still trip
+  during an outage.
 
 - **Show fee rates in sat/vB** — ✅ **shipped 2026-07-10** (owner request;
   security review round 12, 0 findings). Each fee tier chip on Send now shows
