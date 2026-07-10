@@ -41,7 +41,14 @@ the mnemonic in at call time and let it go out of scope.
 
 **Fee-sanity constants (F1/F10)**: `MAX_FEE_RATE_SAT_VB = 500` (HARD), `MAX_FEE_ABSOLUTE_SATS = 1_000_000n` (HARD), `MAX_FEE_FRACTION = 0.25` (informed-consent).
 
-**Errors**: `InsufficientFundsError` (`.available`, `.required`), `InvalidRecipientError`, `InvalidTxParamsError`, `FeeTooHighError` (`.feeSats`, `.feeRateSatVb`, `.comparedToSats`).
+**RBF signaling (BIP125)**: `RBF_SEQUENCE = 0xfffffffd` — `buildAndSignTx` sets this `nSequence` on **every** input, so every payment signals opt-in Replace-By-Fee (`nSequence < 0xfffffffe`). `0xfffffffd` is `MAX_BIP125_RBF_SEQUENCE` (the largest RBF-signaling value; its BIP68 disable bit `0x80000000` stays set → no relative timelock). It is committed in the BIP143 sighash, so it is authenticated by every signature and lands in the final signed tx; it does not change vsize, so fee estimates are unaffected. Makes a stuck, under-priced payment rescuable by the Speed-up (fee-bump) flow.
+
+**RBF fee bump (Speed-up)**: `INCREMENTAL_RELAY_SAT_VB = 1` (the BIP125 rule-4 relay floor).
+- `estimateBumpFee({ utxos, recipientAmountSats, hasChangeOutput, oldFeeSats, oldVsize, feeRateSatVb }): BumpFeeEstimate` — pure dry-run of a replacement: SAME inputs (exactly the original outpoints; v1 adds none, keeping the BIP125 conflict set identical) and SAME recipient. The fee increase comes out of change; a no-change (sweep) original reduces the recipient amount instead (`reducesRecipientBy > 0` → the UI must collect explicit consent). Change squeezed sub-dust folds into the fee (same dust rule as sends). Enforces the BIP125 floors — new fee ≥ old fee + `INCREMENTAL_RELAY_SAT_VB` × new vsize AND effective rate strictly > old rate — by RAISING the fee to the floor and reporting it (`rateWasRaised`); never describes a replacement relays would reject. Verifies the caller's numbers reconcile (`inputs = amount + change + fee`, else `InvalidTxParamsError`) and bounds `oldVsize` to a plausible window. Throws `CannotBumpError('insufficient-change')` when nothing in the payment can absorb any increase. Computes `needsHighFeeConsent` and `exceedsRateCeiling` for the build to enforce.
+- `buildRbfBumpTx({ mnemonic; network; utxos; recipient; recipientAmountSats; changeAddress: string | null; oldFeeSats; oldVsize; feeRateSatVb; allowHighFee? }): BuiltTx` — CONSUMES `estimateBumpFee` (never a parallel computation, F11) and signs the replacement; every input re-signals `RBF_SEQUENCE`, so a bump can itself be re-bumped. All send fee guards apply unchanged (F1/F10): requested rate > `MAX_FEE_RATE_SAT_VB` — **hard**; floors pushing the fee past that ceiling for the replacement's size (`exceedsRateCeiling`) — **hard**; fee > `MAX_FEE_ABSOLUTE_SATS` — **hard**; the 25% consent rule bypassable **only** via `allowHighFee` (compared to amount + fee, or total input for a sweep — same semantics as sends).
+- `CannotBumpError` (`.reason`) — machine-readable dead-ends: `'confirmed' | 'not-signaling' | 'foreign-inputs' | 'insufficient-change' | 'unsupported-shape'`.
+
+**Errors**: `InsufficientFundsError` (`.available`, `.required`), `InvalidRecipientError`, `InvalidTxParamsError`, `FeeTooHighError` (`.feeSats`, `.feeRateSatVb`, `.comparedToSats`), `CannotBumpError` (`.reason`).
 
 `buildAndSignTx` rejects (with `FeeTooHighError`):
 - a fee rate above `MAX_FEE_RATE_SAT_VB` — **hard, never bypassable**;
@@ -79,6 +86,8 @@ Every call takes `network: Network` first. GETs retry once on transport failure 
 - `getFeeEstimates(network): Promise<FeeEstimates>`
 - `broadcastTx(network, txHex): Promise<string>` — returns txid; surfaces API error text.
 - `getAddressTxs(network, address, signal?): Promise<AddressTx[]>`
+- `getTransaction(network, txid, signal?): Promise<ApiTransaction>` — one transaction by id (the Speed-up flow's data source; ONE request). The txid ARGUMENT is validated (64-hex) BEFORE the URL is built (status-400 `ApiResponseError`, no request made). F2 ingest validation on every consumed field: `status.confirmed` boolean; `fee` sat-range; `weight` positive integer ≤ 4M (vsize = `ceil(weight/4)`); vin/vout arrays 1–200 entries; per-vin 64-hex txid, non-negative vout, u32 `sequence`, no duplicate outpoints; sat-range values; length-capped address strings. `vin[].prevout` (absent on coinbase) and address fields (absent on nonstandard scripts) are OPTIONAL by type — the same esplora shape serves both networks (live-verified), so validation is never flaky across networks. Cross-field integrity: the response's txid must equal the request, and when every input carries a prevout, `fee` must equal inputs − outputs exactly.
+  - `ApiTransaction { txid; confirmed; feeSats: bigint; weight; vsize; vin: ApiTxVin[]; vout: ApiTxVout[] }`; `ApiTxVin { txid; vout; sequence; prevout?: ApiTxPrevout }`; `ApiTxPrevout { value: bigint; address? }`; `ApiTxVout { value: bigint; address? }`
 - `getBtcUsdPrice(): Promise<number>` — always mainnet `/v1/prices`.
 
 ---
@@ -168,3 +177,25 @@ BIP44/F8), `DISCOVERY_DEADLINE_MS = 20_000`, `POLL_CONCURRENCY = 4`.
   idempotent on retry (same UTXO set + params ⇒ same signed tx; mempool.space
   treats re-broadcast of an accepted tx as success). `allowHighFee` bypasses only
   the 25% consent rule, never the hard rate/absolute caps (F10).
+- `prepareBump(network, txid, account, signal?): Promise<PreparedBump>` — the
+  Speed-up flow's gather step. Costs exactly ONE network request
+  (`getTransaction`); the input/output ownership mapping is LOCAL derivation
+  only (`deriveAddressRange` over both chains, index 0 → high-water mark +
+  gap-20 — zero requests, so the burst budget is untouched). Typed
+  `CannotBumpError` dead-ends, in order: `confirmed`; `not-signaling` (EVERY
+  input must carry sequence < 0xfffffffe — pre-v1.1 sends don't);
+  `foreign-inputs` (an input's prevout address isn't one we derive);
+  `unsupported-shape` (not this wallet's send shape: >2 outputs, >1 foreign
+  output, an address-less output, or an ambiguous self-send). Output
+  classification: the foreign output is the recipient and the owned one is
+  change; a SELF-SEND resolves as receive-chain output = recipient,
+  change-chain output = change; a single all-ours output = recipient
+  (self-sweep). `PreparedBump { txid; utxos; recipient; recipientAmountSats;
+  changeAddress: string | null; oldFeeSats; oldVsize; oldRateSatVb }` — the
+  ORIGINAL recipient/change addresses are reused verbatim in the replacement.
+- `bumpAndBroadcast({ network, prepared, feeRateSatVb, allowHighFee })` — reads
+  the mnemonic at call time, builds via `buildRbfBumpTx`, broadcasts, returns
+  the new txid. Same idempotency argument as `signAndBroadcast` (deterministic
+  signatures ⇒ a retry re-broadcasts the identical replacement). The new fee
+  rate comes from the existing `loadFees`/`feeRateForTier` path (already
+  clamped, F1).

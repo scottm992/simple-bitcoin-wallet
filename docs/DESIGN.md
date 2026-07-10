@@ -495,6 +495,51 @@ send or receive.
 *(load error):* **Couldn't load your activity. Check your connection and pull to
 refresh.**
 
+#### Speed up a stuck payment (added v1.1)
+
+> Post-v1.0 addition (per the status note at the top of this file): not in the
+> original v1.0 spec. It lives entirely inside the Activity detail sheet; the
+> code and `src/strings.ts` (`speedUp` group) are the truth.
+
+When a payment you **sent** is still **Waiting to confirm**, its detail sheet
+gains a **[Speed up this payment]** button — a plain-English wrapper over an
+opt-in Replace-By-Fee fee bump (the word "RBF" never appears). It is shown only
+for pending, outgoing items — never for received or already-confirmed ones.
+
+- **Entry point → loading.** Tapping it does one network look-up of the pending
+  payment (busy label: *Checking…*), then the sheet becomes an offer or an
+  honest dead-end.
+- **Offer.** Three rows — **Fee paid so far**, **New fee**, **Extra cost**
+  (USD hero, sats beneath) — showing the *effective* numbers the build will use.
+  The new fee comes from the current **Faster** fee estimate; the network may
+  raise it to the minimum a replacement is allowed to pay, and we display that
+  raised figure, never our own arithmetic. Primary: **[Speed up — pay {extra}
+  more]**; text: **[Not now]**.
+  - *Full-balance send (a sweep, so the fee must come out of the amount sent):* a
+    warning strip — *"…whoever you're paying will receive {X} less."* — gated
+    behind a required checkbox (**I understand they'll receive less.**), the same
+    deliberate treatment as the Live-mode Send review.
+  - *Fee is a big share of the payment (the 25% rule):* the same informed-consent
+    treatment as Send (F10) — the real numbers plus a required acknowledgment
+    before the bump is allowed (which sets `allowHighFee`).
+- **Dead-ends** (no action, a single **[Close]**, always honest — the original
+  payment still goes through, it may just be slow): already-confirmed; sent
+  before speed-up existed; nothing left over to raise the fee from; a shape we
+  can't bump; or a fee that would exceed the wallet's hard safety ceiling
+  (no-recovery copy consistent with Review's hard-block state).
+- **Network hiccup (while checking, or broadcasting).** A non-destructive sheet —
+  *your bitcoin is safe, nothing was sent* — with **[Try again]**, mirroring
+  Send's broadcast-failure pattern.
+- **Success.** *On its way — we gave your payment a boost.* We keep this
+  confirmation on screen (rather than snapping the sheet shut) and refresh the
+  account underneath, so the moment the old payment is replaced by a new one (a
+  fresh id) never flashes a scary "it vanished" state. Dismissing with **[Done]**
+  returns to the refreshed Activity list.
+
+Double-submission is prevented with the Review screen's synchronous busy-flag:
+the confirm button is disabled and shows *Speeding up…* the instant it is
+tapped, so a second tap can't fire a second bump.
+
 ---
 
 ### Screen 10 — Settings

@@ -235,6 +235,64 @@ export const strings = {
     otherPartyLabel: 'To / from this address',
   },
 
+  // Speed up a stuck payment (opt-in Replace-By-Fee fee bump), added v1.1. Lives
+  // inside the Activity detail sheet. No jargon: "speed up", "network fee",
+  // never "RBF" / "sat/vB" / "mempool". USD is the hero, sats the secondary.
+  speedUp: {
+    // Entry-point button (pending, outgoing payments only).
+    cta: 'Speed up this payment',
+    // The header used across every state of the flow.
+    title: 'Speed up this payment',
+    // Short body under the offer rows.
+    offerBody:
+      'Paying a little more to the bitcoin network can help a slow payment go through sooner.',
+    // Busy label while we look up the payment (one network request).
+    checking: 'Checking…',
+    // Offer rows (each shows USD, with sats beneath).
+    feePaidLabel: 'Fee paid so far',
+    newFeeLabel: 'New fee',
+    extraCostLabel: 'Extra cost',
+    // Primary button; `extra` is the extra cost (USD, or sats when the price is
+    // unavailable).
+    confirm: (extra: string): string => `Speed up — pay ${extra} more`,
+    // Busy label on the confirm button while the boosted payment is sent.
+    confirming: 'Speeding up…',
+    notNow: 'Not now',
+    close: 'Close',
+    // Full-balance (sweep) original: the extra fee has to come out of the amount
+    // being sent, so the recipient receives less. `less` is USD (or sats).
+    reducesWarning: (less: string): string =>
+      `This payment sent your full balance, so the extra fee comes out of the amount being sent — whoever you're paying will receive ${less} less.`,
+    reducesCheckbox: "I understand they'll receive less.",
+    // Informed consent when the new fee is a big share of the payment (the same
+    // 25% rule as Send, F10). `fee` is USD (or sats); `pct` is a whole number.
+    highFeeNotice: (fee: string, pct: string): string =>
+      `Heads up: the new fee is about ${fee} — that's ${pct}% of what you're paying. Speeding up a small payment costs proportionally more.`,
+    highFeeCheckbox: 'I understand the fee is a large part of this payment.',
+    // Dead-ends: no action, a single Close, always honest (the original payment
+    // still goes through — it may just be slow).
+    deadConfirmed: 'Good news — this payment just went through. Nothing to speed up.',
+    deadNotSignaling:
+      "This payment was sent before speed-up existed, so it can't be sped up from here. It will still go through — it just may take a while.",
+    deadInsufficientChange:
+      "There isn't enough left over in this payment to raise its fee. It will still go through — it just may take a while.",
+    deadCannot:
+      "This payment can't be sped up from here. It will still go through — it just may take a while.",
+    deadFeeCap:
+      'Speeding this up would cost more than this wallet will ever send — that usually means the network fee estimate is off right now. This payment will still go through on its own — it just may take a while.',
+    // Network failure while looking up the payment (nothing was sent).
+    errorHeading: "We couldn't check this just now",
+    errorBody:
+      'Your bitcoin is safe and nothing has changed. This is usually a connection problem. Check your internet and try again.',
+    // Success.
+    successHeading: 'On its way',
+    successBody: 'We gave your payment a boost. It should confirm sooner now.',
+    // Broadcast failure at confirm time (mirrors Send's broadcast-failure sheet).
+    failHeading: "We couldn't speed it up just now",
+    failBody:
+      'Your bitcoin is safe and still on its way — nothing changed. This is usually a connection problem. Check your internet and try again.',
+  },
+
   settings: {
     title: 'Settings',
     heading: 'Settings',

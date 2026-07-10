@@ -682,3 +682,146 @@ binaries were declared out of scope and are replaced by the designer's icons bef
 
 _The F14 closure test used the `.review.test.ts` suffix, was executed, and was deleted; no
 source files were modified._
+
+---
+
+# Round 8 — RBF Speed-up (signaling + bump engine + sheet)
+
+**SHIP-BLOCKING ISSUES: 1 / new findings: 1**
+
+`npm test` = 212 passing, `tsc --noEmit` clean, `npm run build` clean, prod CSP still
+`script-src 'self'` (verified in `dist/index.html`), and the PWA surface is untouched
+(`git diff` on `public/`, `index.html`, `src/main.tsx`, `vite.config.ts` is empty). The
+engine work is careful and largely excellent — the fee-guard reuse (F1/F10), the F11
+single-code-path property, BIP125 floor math, the change-address ownership proof, and the
+F2-style ingest validation all hold up under test. But the bump flow introduces the first
+code path in this wallet where **the client signs a transaction whose destination address
+comes from the untrusted API instead of from the user** — and there is no local cross-check
+or on-screen re-confirmation of that address. A hostile/compromised mempool.space endpoint
+can therefore redirect the full amount of a sped-up payment to an attacker (F15). Verified
+by test: the built, signed replacement pays the API-supplied recipient with valid signatures
+and no guard trips.
+
+## Per-area verdicts
+
+- **a. Hostile-API change theft — CHANGE is SOUND; RECIPIENT is NOT (F15, ship-blocking).**
+  The *change* address is provably ours: `classifyBumpOutputs` only ever assigns change to
+  an owned output, so swapping our change for an attacker address yields two foreign outputs
+  → `unsupported-shape` honest failure (test-verified). But the *recipient* is the foreign
+  output, reused verbatim from `getTransaction` with **no local verification and no
+  re-confirmation in the offer sheet** (the sheet shows only fee rows). A hostile endpoint
+  that keeps the real owned inputs + real owned change but substitutes the recipient address
+  (value unchanged, so the `inputs − outputs = fee` cross-check still passes) makes the
+  wallet build, sign, and broadcast a valid BIP125 replacement paying the attacker.
+  **Verified by test:** `prepareBump` returned `recipient = <attacker>`, and the broadcast
+  replacement's first output was the attacker's P2WPKH script funded with the full 80,000
+  sats. See F15.
+- **b. Hard caps under bump — SOUND.** `buildRbfBumpTx` enforces, *before* the `allowHighFee`
+  gate: requested rate > `MAX_FEE_RATE_SAT_VB` → hard `FeeTooHighError`; `exceedsRateCeiling`
+  (the BIP125 floors pushing the fee past what 500 sat/vB pays for this size) → hard;
+  `newFeeSats > MAX_FEE_ABSOLUTE_SATS` → hard. `allowHighFee` bypasses only the 25% rule
+  (F10 semantics preserved). The shipped suite proves each cap holds *with* `allowHighFee`
+  set. The dust-fold effective-rate slop (≤ `DUST_LIMIT_SATS`) mirrors the accepted
+  `selectCoins` behaviour and stays bounded by the absolute cap — not a new issue.
+- **c. Accounting identity — SOUND (byte-parse-verified).** Change-absorbs: `sum(outputs) +
+  fee == sum(inputs)` and the recipient output is never reduced. Sweep: single output,
+  `recipient + fee == inputs`, and `reducesRecipientBy == newFee − oldFee` exactly, matching
+  the built output to the satoshi. Dust-fold: change dropped, recipient untouched, residue
+  folded to fee. All three reconcile.
+- **d. BIP125 economics — SOUND.** `bumpFeeFloor` takes `max(requested, oldFee + 1×vsize,
+  ⌈oldFee×newVsize/oldVsize⌉+1)`, so a boundary bump clears both the incremental-relay floor
+  and the strictly-greater-effective-rate rule (test: a requested rate *below* the original's
+  still produces `newFee ≥ oldFee + vsize` and `newFee/newVsize > oldFee/oldVsize`, with
+  `rateWasRaised` reported). The −31 vB (`OUTPUT_VB`) change-fold adjustment is correct — one
+  P2WPKH output is 31 vB — and the folded fee provably still clears every floor at the smaller
+  vsize (all three floors shrink with vsize while the folded fee only grows).
+- **e. Ownership / mapping — SOUND.** A foreign input can pass as ours only if its prevout
+  address collides with one we derive over both chains [0 … high-water + gap-20] — a
+  local-derivation-only map, no network — which is cryptographically impossible; otherwise
+  `foreign-inputs`. The self-send classification claim holds: when every output is ours, any
+  misclassification of recipient-vs-change only shifts value between our own outputs and the
+  fee (both destinations are ours), never to a third party. The `chain-0 = recipient` /
+  `chain-1 = change` / single-output-= recipient rules are exhaustive; anything else
+  dead-ends `unsupported-shape`.
+- **f. Ingest — SOUND.** The shipped `api.tx.test.ts` fuzzes response-txid≠request, duplicate
+  outpoints, out-of-range/float/negative/undefined `sequence` (u32), float/negative/
+  over-supply values, oversized/ wrong-type addresses, empty/oversized vin·vout vectors,
+  zero/over-max weight, and the `fee = inputs − outputs` cross-field identity in both
+  directions — comprehensive. Reasoned about the one intentional gap: the fee cross-check is
+  skipped when any input lacks a prevout, but such a transaction always dead-ends
+  `foreign-inputs` in `prepareBump` (no owned prevout address), so an unvalidated fee can
+  never reach the bump math. The `txidArg` is 64-hex-validated before the URL is built.
+- **g. Consent paths — SOUND.** `allowHighFee` is passed as `consents.highFee` and the confirm
+  button is disabled until the matching checkbox is ticked (and `confirmBump` re-checks before
+  awaiting), so consent can't be set silently; it bypasses only the 25% rule. The sweep
+  (`reducesLess`) checkbox gates the button independently. The hard-cap dead-end (`fee-cap`)
+  offers a single Close — no bait button — mirroring Review's hard-block. The checkbox-vs-Send's-
+  button affordance difference preserves F10's "explicit, informed, per-attempt" property.
+  (Minor, non-finding: the notice's displayed `pct` uses `newFee/newRecipient` while the rule
+  compares against `recipient+fee`/`totalInput`; the copy reads "% of what you're paying," a
+  defensible framing — magnitude only, no safety impact.)
+- **h. Idempotency / double-submission — SOUND.** The synchronous `submitting` flag (set before
+  the await, the Review-house standard) plus the `confirmBump` early-return prevent a second
+  bump from one sheet; only one detail sheet exists at a time. Deterministic RFC6979 signatures
+  + mempool.space's accept-on-rebroadcast make a retry (the fail-state "Try again," same
+  captured `offer.feeRate`) re-emit the *identical* replacement — no two distinct replacements,
+  no double-spend. `aliveRef` guards post-dismiss `setState`.
+- **i. Burst discipline — SOUND.** `prepareBump` is exactly one `getTransaction` (plus
+  local-only derivation for the owned-address map — zero requests); nothing loops, polls, or
+  retries beyond api.ts's standard single transport retry. Sheet dismissal aborts the in-flight
+  fetch via `abortRef` on unmount. The discovery single-flight/budget discipline is untouched.
+- **j. UI honesty — SOUND (except the recipient omission → F15).** Every number shown is read
+  straight off the one `BumpFeeEstimate` the build consumes (F11) — no UI arithmetic on
+  money. Dead-end copy maps 1:1 to true machine reasons via `deadEndFromReason`/`isHardFeeCap`.
+  The post-success transition keeps the confirmation on screen and refreshes underneath, so
+  the old-txid→replacement swap never flashes a wrong intermediate. The one honesty gap is
+  substantive, not cosmetic: the sheet never shows the *destination* of the payment being sped
+  up (F15).
+- **k. Regression — SOUND.** The only send-path change is `sequence = RBF_SEQUENCE` on every
+  input (0xfffffffd — largest RBF-signaling value, BIP68 disable bit set, no vsize change),
+  byte-verified in the shipped tx tests; normal sends are otherwise identical. PWA/SW/`public/`
+  and the CSP are untouched (diff empty; `dist` CSP still `script-src 'self'`).
+
+## New findings
+
+### F15 — [SEV-High] A hostile API can redirect a sped-up payment's recipient — the client signs an API-supplied destination  *(SHIP-BLOCKING)*
+
+- **Where:** `src/actions.ts` `classifyBumpOutputs` (the foreign output becomes `recipient`,
+  reused verbatim) → `prepareBump` (`recipient: recipient.address`) → `bumpAndBroadcast` →
+  `src/lib/tx.ts` `buildRbfBumpTx` (`scriptForAddress(recipient, network)` validates only
+  form/network, not intent) → `src/screens/Activity.tsx` offer sheet (renders fee rows only —
+  no destination address/amount). The recipient originates entirely from the untrusted
+  `getTransaction` response and is never cross-checked against a locally-known value.
+- **Scenario (verified with a throwaway test):** A compromised or MITM'd mempool.space
+  endpoint (the app's single trusted third party — the exact threat model F1/F2 treat as in
+  scope) serves a `getTransaction` response for the user's pending payment that keeps the real
+  owned inputs and the real owned change output, but substitutes the **recipient address** for
+  an attacker's (leaving the value the same, so the `fee = inputs − outputs` integrity check
+  still passes). `prepareBump` returns `recipient = <attacker>`; the user sees an offer sheet
+  showing only "Fee paid / New fee / Extra cost" and taps "Speed up — pay $X more";
+  `buildRbfBumpTx` builds and signs a valid BIP125 replacement paying the attacker, which
+  `bumpAndBroadcast` broadcasts. **Test result:** the broadcast replacement's first output was
+  the attacker's P2WPKH script funded with the full 80,000-sat recipient amount, with valid
+  signatures — no guard tripped. Because the replacement shares the original's inputs and pays
+  a higher fee, it replaces the honest original and can confirm, sending the funds to the
+  attacker.
+- **Why it matters here:** This breaks the invariant the whole audit trail has defended — a
+  hostile endpoint may *mislead the display* but must never *move funds* (F1 was ship-blocking
+  for exactly this line, and it protected a fee-sized loss; F15 redirects the entire payment
+  amount). Every prior signing path takes its destination from the user, who confirms the
+  address on Review (the cross-check F4/F7 deliberately preserve). The bump flow is the first
+  path that signs a destination chosen by the server, with no user confirmation of it.
+- **Fix:** Restore the "user confirms the destination" property before signing. Minimum:
+  render the recipient address (chunked, as Review does) **and** the amount to that recipient
+  in the Speed-up offer sheet, so a substituted address is visible and the sheet isn't a
+  fee-only cross-check. Stronger (defence in depth): persist each send's `(txid → recipient
+  address, amount)` locally at broadcast time and, in `prepareBump`, hard-fail
+  (`unsupported-shape`/new reason) when the API's recipient/amount don't match the persisted
+  record — so the wallet never signs a bump to an address it didn't itself send to. Until one
+  of these lands, the bump flow should be considered a fund-redirection surface.
+
+_Round-8 throwaway tests used the `.review.test.ts` suffix, were executed, and were deleted; no
+source files were modified. Empirically verified: the recipient-substitution redirect (built +
+signed replacement pays the attacker), the change-swap fail-safe, the change-absorbs and sweep
+accounting identities (byte-parsed, `reducesRecipientBy` exact), and the BIP125 boundary-bump
+floors; ingest validation was confirmed against the shipped `api.tx.test.ts` fuzz suite._

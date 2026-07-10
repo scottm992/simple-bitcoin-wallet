@@ -6,14 +6,18 @@
 import {
   broadcastTx,
   buildAndSignTx,
+  buildRbfBumpTx,
+  CannotBumpError,
   createScanCache,
   deriveAddress,
+  deriveAddressRange,
   discoverAccount,
   getAddressStats,
   getAddressTxs,
   getBtcUsdPrice,
   getCachedHighWater,
   getFeeEstimates,
+  getTransaction,
   getUtxos,
   mapWithConcurrency,
   MAX_ACCEPTED_FEE_RATE,
@@ -21,6 +25,7 @@ import {
   setCachedHighWater,
   setCachedReceiveIndex,
   type AccountSnapshot,
+  type ApiTxVout,
   type FeeEstimates,
   type Network,
   type WalletUtxo,
@@ -339,6 +344,231 @@ export async function signAndBroadcast(params: {
     feeRateSatVb: params.feeRateSatVb,
     changeAddress: params.changeAddress,
     sendMax: params.sendMax,
+    allowHighFee: params.allowHighFee,
+  });
+  return broadcastTx(params.network, built.txHex);
+}
+
+// ---------------------------------------------------------------------------
+// Speed-up (RBF fee bump)
+// ---------------------------------------------------------------------------
+
+/** The BIP125 signaling boundary: an input signals RBF iff sequence < this. */
+const BIP125_NON_SIGNALING_MIN = 0xfffffffe;
+
+/**
+ * Everything the Speed-up sheet and the bump build need about one pending
+ * payment, assembled by {@link prepareBump}. Carries no secrets.
+ */
+export interface PreparedBump {
+  /** The pending transaction being replaced. */
+  readonly txid: string;
+  /** EXACTLY the original inputs, mapped to our derivation paths for signing. */
+  readonly utxos: readonly WalletUtxo[];
+  /** The original recipient address (reused verbatim in the replacement). */
+  readonly recipient: string;
+  /** The amount the original pays that recipient, in sats. */
+  readonly recipientAmountSats: bigint;
+  /** The original change address (ours), or null when the original has none. */
+  readonly changeAddress: string | null;
+  /** The fee the original pays, in sats. */
+  readonly oldFeeSats: bigint;
+  /** The original's actual vsize, in vBytes. */
+  readonly oldVsize: number;
+  /** The original's effective fee rate (display only), in sat/vB. */
+  readonly oldRateSatVb: number;
+}
+
+/** An owned address's derivation info, keyed by address in the local map. */
+interface OwnedAddressInfo {
+  readonly path: string;
+  readonly chain: 0 | 1;
+}
+
+/**
+ * Builds the address → derivation-path map used to recognize our own inputs
+ * and outputs — by LOCAL derivation only, zero network requests. Covers both
+ * chains from index 0 through the account's high-water mark plus the full
+ * BIP44 gap window, which by construction contains every address discovery
+ * has ever marked used (any input/output of our own pending tx is used, so it
+ * lies at or below the mark).
+ */
+function ownedAddressMap(network: Network, account: AccountSnapshot): Map<string, OwnedAddressInfo> {
+  const mnemonic = getMnemonic();
+  const map = new Map<string, OwnedAddressInfo>();
+  const receiveCount = Math.max(account.receiveHighWater, -1) + 1 + FULL_GAP_LIMIT;
+  const changeCount = Math.max(account.changeHighWater, -1) + 1 + FULL_GAP_LIMIT;
+  for (const d of deriveAddressRange(mnemonic, network, 0, 0, receiveCount)) {
+    map.set(d.address, { path: d.path, chain: 0 });
+  }
+  for (const d of deriveAddressRange(mnemonic, network, 1, 0, changeCount)) {
+    map.set(d.address, { path: d.path, chain: 1 });
+  }
+  return map;
+}
+
+/** One classified output of the transaction being bumped. */
+interface ClassifiedVout {
+  readonly value: bigint;
+  readonly address: string;
+  readonly owned: OwnedAddressInfo | undefined;
+}
+
+/**
+ * Splits the original's outputs into (recipient, change) — the shape contract
+ * this wallet's own builder guarantees: exactly one recipient plus at most one
+ * change output.
+ *
+ * Classification rules (each violation → {@link CannotBumpError}
+ * `unsupported-shape`, an honest dead-end — never a guess):
+ * - every output must carry an address (we never build OP_RETURN-style outputs);
+ * - at most 2 outputs, at most 1 of them foreign;
+ * - 1 foreign output → it is the recipient; the remaining (ours) is change —
+ *   whichever chain it is on: it is our money either way, and treating it as
+ *   change (where the fee increase lands) can only move value between our own
+ *   pocket and the fee, never to a third party;
+ * - 0 foreign outputs (a self-send): the RECEIVE-chain output is the
+ *   recipient — Receive only ever shows chain-0 addresses, so that is the
+ *   output the user asked for — and the change-chain output is change. A
+ *   single all-ours output is simply the recipient (self-sweep). Anything
+ *   else (two same-chain outputs) is ambiguous → unsupported.
+ */
+function classifyBumpOutputs(
+  vouts: readonly ApiTxVout[],
+  owned: Map<string, OwnedAddressInfo>,
+): { recipient: ClassifiedVout; change: ClassifiedVout | null } {
+  if (vouts.length === 0 || vouts.length > 2) {
+    throw new CannotBumpError('unsupported-shape', 'Not a transaction shape this wallet builds');
+  }
+  const classified: ClassifiedVout[] = vouts.map((o) => {
+    if (o.address === undefined) {
+      throw new CannotBumpError('unsupported-shape', 'Transaction has an output without an address');
+    }
+    return { value: o.value, address: o.address, owned: owned.get(o.address) };
+  });
+
+  const foreign = classified.filter((c) => c.owned === undefined);
+  if (foreign.length > 1) {
+    throw new CannotBumpError('unsupported-shape', 'Transaction pays more than one recipient');
+  }
+
+  if (foreign.length === 1) {
+    const recipient = foreign[0];
+    const change = classified.find((c) => c.owned !== undefined) ?? null;
+    if (recipient === undefined) {
+      throw new CannotBumpError('unsupported-shape', 'Could not identify the recipient output');
+    }
+    return { recipient, change };
+  }
+
+  // Self-send: every output is ours.
+  const only = classified.length === 1 ? classified[0] : undefined;
+  if (only !== undefined) {
+    return { recipient: only, change: null };
+  }
+  const chain0 = classified.filter((c) => c.owned?.chain === 0);
+  const chain1 = classified.filter((c) => c.owned?.chain === 1);
+  const recipient = chain0.length === 1 ? chain0[0] : undefined;
+  const change = chain1.length === 1 ? chain1[0] : undefined;
+  if (recipient === undefined || change === undefined) {
+    throw new CannotBumpError('unsupported-shape', 'Ambiguous self-send output shape');
+  }
+  return { recipient, change };
+}
+
+/**
+ * Gathers everything needed to speed up (fee-bump) a pending payment. Costs
+ * exactly ONE network request — `getTransaction` — plus local-only address
+ * derivation (no bursts; the discovery budget discipline is untouched).
+ *
+ * Checks, in order (each failure → typed {@link CannotBumpError}):
+ * 1. the payment is still unconfirmed (`confirmed`);
+ * 2. EVERY input signals BIP125 (sequence < 0xfffffffe) (`not-signaling`) —
+ *    our own v1.1+ sends signal on all inputs, and only txs this wallet built
+ *    are bumpable here;
+ * 3. every input spends an address WE derive (both chains, index 0 through the
+ *    high-water mark + gap — local derivation only) (`foreign-inputs`);
+ * 4. the outputs match this wallet's own send shape (`unsupported-shape` —
+ *    see {@link classifyBumpOutputs}, including the self-send rules).
+ *
+ * @throws {CannotBumpError} Per the checks above.
+ * @throws {ApiResponseError | ApiNetworkError} From the single fetch.
+ */
+export async function prepareBump(
+  network: Network,
+  txidToBump: string,
+  account: AccountSnapshot,
+  signal?: AbortSignal,
+): Promise<PreparedBump> {
+  const tx = await getTransaction(network, txidToBump, signal);
+
+  if (tx.confirmed) {
+    throw new CannotBumpError('confirmed', 'The payment has already confirmed');
+  }
+  for (const vin of tx.vin) {
+    if (vin.sequence >= BIP125_NON_SIGNALING_MIN) {
+      throw new CannotBumpError('not-signaling', 'An input does not signal BIP125 replaceability');
+    }
+  }
+
+  const owned = ownedAddressMap(network, account);
+
+  const utxos: WalletUtxo[] = tx.vin.map((vin) => {
+    const address = vin.prevout?.address;
+    const info = address !== undefined ? owned.get(address) : undefined;
+    if (vin.prevout === undefined || address === undefined || info === undefined) {
+      throw new CannotBumpError('foreign-inputs', 'An input does not belong to this wallet');
+    }
+    return {
+      txid: vin.txid,
+      vout: vin.vout,
+      value: vin.prevout.value,
+      path: info.path,
+      address,
+    };
+  });
+
+  const { recipient, change } = classifyBumpOutputs(tx.vout, owned);
+
+  return {
+    txid: tx.txid,
+    utxos,
+    recipient: recipient.address,
+    recipientAmountSats: recipient.value,
+    changeAddress: change?.address ?? null,
+    oldFeeSats: tx.feeSats,
+    oldVsize: tx.vsize,
+    oldRateSatVb: Number(tx.feeSats) / tx.vsize,
+  };
+}
+
+/**
+ * Builds, signs, and broadcasts the replacement for a prepared bump. Reads the
+ * mnemonic at call time; never returns it.
+ *
+ * Idempotency: `buildRbfBumpTx` over the same prepared data + rate yields the
+ * identical signed replacement (RFC6979 deterministic signatures), and
+ * mempool.space treats a re-broadcast of an already-accepted tx as success —
+ * so a retry cannot double-spend. `allowHighFee` bypasses only the 25% consent
+ * rule, never the hard rate/absolute caps (F10).
+ */
+export async function bumpAndBroadcast(params: {
+  network: Network;
+  prepared: PreparedBump;
+  feeRateSatVb: number;
+  allowHighFee: boolean;
+}): Promise<string> {
+  const mnemonic = getMnemonic();
+  const built = buildRbfBumpTx({
+    mnemonic,
+    network: params.network,
+    utxos: params.prepared.utxos,
+    recipient: params.prepared.recipient,
+    recipientAmountSats: params.prepared.recipientAmountSats,
+    changeAddress: params.prepared.changeAddress,
+    oldFeeSats: params.prepared.oldFeeSats,
+    oldVsize: params.prepared.oldVsize,
+    feeRateSatVb: params.feeRateSatVb,
     allowHighFee: params.allowHighFee,
   });
   return broadcastTx(params.network, built.txHex);

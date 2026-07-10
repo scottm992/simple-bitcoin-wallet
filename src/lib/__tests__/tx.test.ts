@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { hex } from '@scure/base';
 import {
   buildAndSignTx,
   estimateSendFee,
@@ -9,6 +10,7 @@ import {
   FeeTooHighError,
   MAX_FEE_RATE_SAT_VB,
   DUST_LIMIT_SATS,
+  RBF_SEQUENCE,
   type WalletUtxo,
 } from '../tx';
 import { deriveReceiveAddress } from '../wallet';
@@ -475,5 +477,175 @@ describe('scriptForAddress', () => {
   it('rejects empty and garbage input', () => {
     expect(() => scriptForAddress('', 'mainnet')).toThrow(InvalidRecipientError);
     expect(() => scriptForAddress('not-an-address', 'mainnet')).toThrow(InvalidRecipientError);
+  });
+});
+
+// --- Phase A: BIP125 opt-in RBF signaling -----------------------------------
+
+/**
+ * Reads a Bitcoin varint from `view` at byte offset `o`.
+ * @returns The decoded value and the offset just past it.
+ */
+function readVarint(view: DataView, o: number): { value: number; next: number } {
+  const first = view.getUint8(o);
+  if (first < 0xfd) return { value: first, next: o + 1 };
+  if (first === 0xfd) return { value: view.getUint16(o + 1, true), next: o + 3 };
+  if (first === 0xfe) return { value: view.getUint32(o + 1, true), next: o + 5 };
+  // 0xff (8-byte) inputs counts / script lengths never occur in these small test txs.
+  throw new Error('varint too large for this test parser');
+}
+
+/**
+ * Parses the RAW wire bytes of a serialized (signed) transaction and returns
+ * every input's nSequence as an unsigned 32-bit number. This walks the byte
+ * stream itself — version, optional SegWit marker/flag, input vector — and never
+ * consults the `Transaction` object that produced the hex. So an assertion on
+ * its output proves the sequence actually landed in the FINAL signed tx, not
+ * merely in the input object we handed to the builder.
+ */
+function nSequencesFromTxHex(txHex: string): number[] {
+  const b = hex.decode(txHex);
+  const view = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  let o = 0;
+  o += 4; // version (int32 LE)
+  // Optional SegWit marker (0x00) + flag (0x01) precede the input count.
+  if (view.getUint8(o) === 0x00 && view.getUint8(o + 1) === 0x01) o += 2;
+  const count = readVarint(view, o);
+  o = count.next;
+  const seqs: number[] = [];
+  for (let i = 0; i < count.value; i++) {
+    o += 32; // prev txid (32 bytes)
+    o += 4; // prev vout (uint32 LE)
+    const scriptSig = readVarint(view, o);
+    o = scriptSig.next + scriptSig.value; // skip scriptSig bytes (empty for native P2WPKH)
+    seqs.push(view.getUint32(o, true)); // nSequence (uint32 LE)
+    o += 4;
+  }
+  return seqs;
+}
+
+/** Builds `txHex`, byte-parses it, and asserts every input signals RBF. */
+function expectEveryInputSignalsRbf(txHex: string, expectedInputs: number): void {
+  const seqs = nSequencesFromTxHex(txHex);
+  expect(seqs).toHaveLength(expectedInputs);
+  for (const seq of seqs) {
+    expect(seq).toBe(RBF_SEQUENCE);
+    expect(seq).toBeLessThan(0xfffffffe); // BIP125: replaceable iff < 0xfffffffe
+  }
+}
+
+// Testnet fixtures (own addresses + a valid on-network recipient/change).
+const tAddr0 = deriveReceiveAddress(ABANDON, 'testnet', 0);
+const tAddr1 = deriveReceiveAddress(ABANDON, 'testnet', 1);
+const TEST_RECIPIENT = deriveReceiveAddress(ABANDON, 'testnet', 5).address;
+const TEST_CHANGE = deriveReceiveAddress(ABANDON, 'testnet', 2).address;
+
+function testnetUtxos(): WalletUtxo[] {
+  return [
+    { txid: 'a'.repeat(64), vout: 0, value: 100_000n, path: tAddr0.path, address: tAddr0.address },
+    { txid: 'b'.repeat(64), vout: 1, value: 50_000n, path: tAddr1.path, address: tAddr1.address },
+  ];
+}
+
+describe('buildAndSignTx — BIP125 RBF signaling (Phase A)', () => {
+  it('exports RBF_SEQUENCE as the canonical MAX_BIP125_RBF_SEQUENCE (0xfffffffd)', () => {
+    expect(RBF_SEQUENCE).toBe(0xfffffffd);
+    // Signals replaceability (< 0xfffffffe) while keeping the BIP68 disable bit set
+    // (0x80000000), so it enables no relative timelock.
+    expect(RBF_SEQUENCE).toBeLessThan(0xfffffffe);
+    expect(RBF_SEQUENCE >>> 31).toBe(1); // high (BIP68 "disable") bit set → no relative timelock
+  });
+
+  it('mainnet single-input send: the one input signals RBF in the signed tx', () => {
+    const res = buildAndSignTx({
+      mnemonic: ABANDON,
+      network: 'mainnet',
+      utxos: utxos(),
+      recipient: RECIPIENT,
+      amountSats: 60_000n, // one 100k UTXO suffices → 1 input, 2 outputs
+      feeRateSatVb: 10,
+      changeAddress: CHANGE,
+    });
+    expect(res.totalInputSats).toBe(100_000n);
+    expectEveryInputSignalsRbf(res.txHex, 1);
+  });
+
+  it('mainnet multi-input send: EVERY input signals RBF in the signed tx', () => {
+    const res = buildAndSignTx({
+      mnemonic: ABANDON,
+      network: 'mainnet',
+      utxos: utxos(),
+      recipient: RECIPIENT,
+      amountSats: 120_000n, // needs both UTXOs → 2 inputs
+      feeRateSatVb: 10,
+      changeAddress: CHANGE,
+    });
+    expect(res.totalInputSats).toBe(150_000n);
+    expectEveryInputSignalsRbf(res.txHex, 2);
+  });
+
+  it('mainnet sendMax sweep: every swept input signals RBF (no change output)', () => {
+    const res = buildAndSignTx({
+      mnemonic: ABANDON,
+      network: 'mainnet',
+      utxos: utxos(),
+      recipient: RECIPIENT,
+      amountSats: 0n,
+      feeRateSatVb: 5,
+      changeAddress: CHANGE,
+      sendMax: true,
+    });
+    expect(res.changeSats).toBe(0n);
+    expectEveryInputSignalsRbf(res.txHex, 2);
+  });
+
+  it('testnet multi-input send: EVERY input signals RBF in the signed tx', () => {
+    const res = buildAndSignTx({
+      mnemonic: ABANDON,
+      network: 'testnet',
+      utxos: testnetUtxos(),
+      recipient: TEST_RECIPIENT,
+      amountSats: 120_000n, // needs both UTXOs → 2 inputs
+      feeRateSatVb: 10,
+      changeAddress: TEST_CHANGE,
+    });
+    expect(res.totalInputSats).toBe(150_000n);
+    expectEveryInputSignalsRbf(res.txHex, 2);
+  });
+
+  it('testnet sendMax sweep: every swept input signals RBF (no change output)', () => {
+    const res = buildAndSignTx({
+      mnemonic: ABANDON,
+      network: 'testnet',
+      utxos: testnetUtxos(),
+      recipient: TEST_RECIPIENT,
+      amountSats: 0n,
+      feeRateSatVb: 5,
+      changeAddress: TEST_CHANGE,
+      sendMax: true,
+    });
+    expect(res.changeSats).toBe(0n);
+    expectEveryInputSignalsRbf(res.txHex, 2);
+  });
+
+  it('RBF signaling does not change vsize/fee: build fee still matches the estimate', () => {
+    const utxoSet = utxos();
+    const params = {
+      mnemonic: ABANDON,
+      network: 'mainnet' as const,
+      utxos: utxoSet,
+      recipient: RECIPIENT,
+      amountSats: 60_000n,
+      feeRateSatVb: 10,
+      changeAddress: CHANGE,
+    };
+    const built = buildAndSignTx(params);
+    const est = estimateSendFee({ utxos: utxoSet, amountSats: 60_000n, feeRateSatVb: 10 });
+    // nSequence is always 4 bytes, so vsize is unchanged and the fee identity holds.
+    expect(built.feeSats).toBe(est.feeSats);
+    expect(built.feeSats).toBe(BigInt(Math.ceil(built.vsize * 10)));
+    // Same 1-in/2-out size band the deterministic test asserts (~141 vB).
+    expect(built.vsize).toBeGreaterThan(100);
+    expect(built.vsize).toBeLessThan(160);
   });
 });
