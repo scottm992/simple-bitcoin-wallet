@@ -1095,3 +1095,97 @@ _Round-9 throwaway tests used the `.review.test.ts` suffix, were executed, and w
 only file modified is this `docs/review/round1.md`. Gates re-confirmed after deletion:
 `tsc --noEmit` clean, `npm test` = 256 passing, `npm run build` clean, `dist` CSP
 `script-src 'self'`._
+
+---
+
+# Round 9 closure — F16 / F17 re-check
+
+**Both findings CLOSED. New findings: 0. Ship recommendation: SHIP v1.1.1.**
+
+Re-audit of the three fix commits on `discovery-throttle`: `a61f53b` (F16 — monotonic
+generation counter on `ScanCache`), `8e5614b` (F17 — pace only waves that hit the network via a
+real-fetch counter), `77b76b1` (test-only flake fix in `App.poll.test.tsx`). `tsc --noEmit`
+clean, `npm test` = **261 passing**, `npm run build` clean, prod CSP unchanged (`dist/index.html`
+still `script-src 'self'`; `connect-src 'self' https://mempool.space`), no `console.*` in source,
+and `account.ts`/`actions.ts` contain no cache serialization (generation/fetches are plain
+closure counters behind getters — never persisted). Verified with throwaway
+`round9close.review.test.ts` (10 cases, executed, deleted). Both fixes are correct, minimal, and
+preserve every prior invariant; the engineer-flagged shared-counter residual is over-pace-only
+and benign.
+
+## Per-check evidence
+
+- **F16 — reproduce 36/40, confirm 40/40 — CLOSED.** Re-ran the exact broadcast-gap interleaving
+  (wave-1 responses resolve → `invalidateScanCache` bumps the generation with NO synchronous
+  abort → continuations run one microtask later while the run's own signal is still un-aborted →
+  the delayed `refreshAll` abort lands last). The next run now re-fetches everything and its
+  **complete** snapshot reports the true `10_000` (Round 9 reported `$0`); request count is above
+  the poisoned 36 (a 1-used-address wallet's cold scan is 41, all fresh) — no landing survived
+  the invalidation. The generation guard (`cache.generation === gen && signal?.aborted !== true`)
+  is what catches it; the shipped `discovery.test.ts` F16 case (40/40, empty wallet) is green.
+- **F16 — superseded-but-NOT-invalidated run still resumes — CLOSED.** A deadline-cut run
+  (10 landed) that is superseded WITHOUT an invalidation keeps the generation unchanged, so only
+  the signal guard applies: the resumed run reuses the 10 cached landings and pays exactly the
+  remaining 30 (not a restart). The resume optimisation (round-5 semantics) survives the new
+  fence. White-box confirmed too: a write whose generation goes stale mid-await is dropped even
+  though its signal never aborted.
+- **F16 — never-persist holds — CLOSED.** After full scans on both networks plus an
+  invalidation, no `localStorage` value contains `generation`, `fetches`, `storedAt`, or any
+  stats field; grep confirms zero `JSON.*`/`localStorage.*`/`indexedDB`/`structuredClone` in
+  `account.ts`/`actions.ts`. The counters live only in `createScanCache`'s closure.
+- **F17 — ~80 used: phase 2 completes, cue clears — CLOSED.** With ~80 funded receive
+  addresses and production pacing (250 ms/wave), the run now reaches a `complete=true` snapshot
+  within the 20 s deadline and never fires `onError` (Round 9: phase 2 never completed). Phase
+  1's cold fetch is still paced; phase 2's `0..high-water` re-walk is all cache hits, so it is no
+  longer paced and lands in time.
+- **F17 — ~155+ used: phase 1 paints — CLOSED.** With ~155 funded receive addresses over a warm
+  cache, a paced run paints phase 1 well inside 2 s (Round 9: never painted → false network
+  error). The cache-hit re-walk is unpaced.
+- **F17 — anti-burst retained for cold scans — HOLDS.** On a genuinely cold scan, wave 1 fires
+  immediately, wave 2 is held for the full `PACING_WAVE_DELAY_MS` (no requests inside the window,
+  verified to the millisecond), then fires — real bursts are still spaced. A fully-cached re-walk
+  issues zero fetches and inserts zero delay (verified: complete snapshot, 0 new requests).
+- **F17 — shared-counter residual (engineer-flagged) — over-pace-only, benign.** Both chains
+  share one `fetches` counter, so during a mixed transition (one chain cache-hitting while the
+  other fetches) a cache-hit wave can see the counter advance from the *other* chain's fetch and
+  be spuriously paced. Direction is provably over-pace only: a genuine fetch wave ALWAYS calls
+  `recordFetch` and thus advances the counter itself, so the wave after any real burst is always
+  paced — a real burst can never be under-paced (anti-burst safety intact), and funds are always
+  found (no correctness impact). The only cost is an occasional extra ~250 ms pause on an
+  otherwise-free wave, bounded by the shallower chain's fetch count × wave delay; it does not
+  reintroduce F17-scale starvation for realistic wallets (change chains are typically shallow,
+  and within one `discoverAccount` call both chains sit at the same cache warmth). Noted as a
+  benign, safe-direction limitation, not a finding; a future per-chain counter would remove even
+  the spurious pause if deep mixed-depth wallets ever matter.
+- **F12 / F13 / §7 invariants — still green.** An ahead high-water mark still cannot hide
+  low-index funds and self-corrects the mark (F12); a poll-detected change invalidates then
+  refreshes and the rescan sees the funds, per-network keyed (F13/§7). Both re-verified under the
+  new guards; the shipped suite's F12/F13/§7 cases remain green in the 261.
+- **Flake-fix commit scope — confirmed test-only.** `git show 77b76b1 --stat` = 1 file changed
+  (`src/__tests__/App.poll.test.tsx`, +45/−5); no source touched. The §1d assertions are intact —
+  both cases still `mockClear()` after `bootToHome()` then advance exactly `30_000` and assert
+  `toHaveBeenCalledTimes(1)`. The new `settle()` loop runs only inside `bootToHome()` (before the
+  counting window), advances ≤5 ms of fake time per iteration and exits early on DOM-ready, so it
+  cannot fire the 30 s interval or inflate the per-cycle counts. The one-fetch-per-cycle property
+  still measures exactly one.
+
+## Gates
+
+`tsc --noEmit` clean · `npm test` = **261 passing** (26 files) · `npm run build` clean · `dist`
+CSP `default-src 'self'; connect-src 'self' https://mempool.space; …; script-src 'self'; …` ·
+no `console.*` in `src/` · scan cache never serialized.
+
+## Ship recommendation
+
+**SHIP v1.1.1.** Both Round-9 findings are closed with correct, minimal fixes that preserve every
+prior invariant (F12/F13/§7, resume semantics, never-persist, anti-burst). The generation counter
+makes invalidation authoritative on its own — removing the "every future call site must abort in
+the same frame" fragility — and the fetch-gated pacing restores deep-wallet sync without weakening
+the anti-burst behaviour the PM validated. The one residual (shared-counter spurious over-pacing)
+is safe-direction and bounded. No ship-blocker, no new finding.
+
+_Round-9-closure throwaway tests used the `.review.test.ts` suffix, were executed, and were
+deleted (a stray `round9closure.review.test.ts` from a parallel run was also removed); the only
+file modified is this `docs/review/round1.md`. Not committed, not pushed. Gates re-confirmed after
+deletion: `tsc --noEmit` clean, `npm test` = 261 passing, `npm run build` clean, `dist` CSP
+`script-src 'self'`._
