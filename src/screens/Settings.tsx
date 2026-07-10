@@ -5,7 +5,7 @@ import { Chrome } from '../components/Chrome';
 import { CheckRow, PasswordInput, Sheet } from '../components/ui';
 import type { Network } from '../lib';
 
-const APP_VERSION = '1.1.2';
+const APP_VERSION = '1.2.0';
 
 type SettingsSheet = 'none' | 'reauth' | 'switch' | 'delete' | 'safety' | 'faceid';
 
