@@ -895,3 +895,203 @@ check-5-verified `PreparedBump`, F15 reopens — keep the single-path invariant 
 
 _Round-8-closure throwaway tests used the `.review.test.ts` suffix, were executed, and were
 deleted; no source files were modified._
+
+---
+
+# Round 9 — Re-audit of the v1.1.1 discovery-throttle hotfix (backoff + cross-run cache + pacing)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 2 (F16 Low, F17 Medium)**
+
+`npm test` = 256 passing, `tsc --noEmit` clean, `npm run build` clean, prod CSP unchanged
+(`dist/index.html`: `default-src 'self'; connect-src 'self' https://mempool.space; …;
+script-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'`), no `console.*`
+in source, and the scan cache is never serialized (the only `localStorage` tokens in
+`account.ts`/`actions.ts` are comments asserting the never-persist guarantee; `clear()` only
+touches in-memory `Map`s). Reviewed the full `main..discovery-throttle` diff (3 commits),
+`docs/ENGINE.md`, the new/changed tests, and verified every risk area with instrumented
+throwaway tests (`round9.review.test.ts`, executed, deleted).
+
+The fix is strong. Stage 1 (backoff ladder + cross-run cache + discovery-GET retry removal +
+price/fees dedup + `isEmpty` fix) is well-built and closes the self-DoS cleanly; the
+invalidation invariant is wired at every poll/broadcast/switch/lock site, the never-persist
+and per-network-keying (F13) guarantees hold, and F12's "evaluate from 0 / complete only from
+a full gap-20" property survives. Two defects: **F16** — the post-abort write guard keys on
+the run's own signal, but the two *broadcast* paths invalidate in an async frame that is NOT
+paired with a synchronous abort, so an in-flight paced run can repopulate the just-invalidated
+cache with pre-broadcast data (display overstate, self-corrects within ~30s, no fund risk).
+**F17** — Stage-2 pacing makes a *moderately* deep wallet (≈80+ used receive addresses) unable
+to ever complete phase 2, and a very deep one (≈155+) unable to paint at all, on a perfectly
+healthy network, with no in-app recovery (manual refresh is paced too) — a functional
+regression introduced by this change that reintroduces the exact "cue never clears" symptom the
+hotfix exists to cure.
+
+## Per-area verdicts
+
+- **1. Invalidation completeness — SOUND except the broadcast async-gap (F16).** Poll-changed
+  (`invalidateScanCache(network)` then `onChanged`, synchronous, and no discovery run is ever
+  in flight during a poll — `pollTick` requires `current === null`), network switch
+  (`abort()` *then* `invalidateScanCache(to)` — abort is synchronous so the write guard blocks
+  any landing), and lock (`abort()` then `invalidateScanCache()` all-networks) are all safe.
+  The **broadcast** paths are not: `signAndBroadcast`/`bumpAndBroadcast` invalidate in their own
+  async frame and the aborting `refreshAll` only runs after the caller's `await` resumes — a
+  one-microtask gap in which an in-flight run's already-resolved continuation writes a
+  pre-broadcast response into the freshly invalidated cache. Reproduced (test A): 36 not 40
+  requests on the next run, and the *complete* snapshot reported `$0` for a wallet that had just
+  been funded. See F16.
+- **2. Abort-coupling residual — this IS the F16 hole.** The guard (`signal?.aborted !== true`
+  before every `cache.set`) is correct for every invalidation that is *paired with a
+  synchronous abort of the in-flight run* — which is all of them EXCEPT the broadcast case,
+  where invalidate and abort straddle an `await`. Verdict: a real defect requiring a
+  generation-counter (or a synchronous abort inside the broadcast helpers), but Low severity —
+  bounded by the next uncached 30s poll (which re-detects and re-invalidates), display-only, no
+  signing/fund impact (a stale UTXO at worst yields a network-rejected send, per area 3).
+- **3. Stale cache vs money paths — SOUND.** `prepareBump`'s single `getTransaction` is
+  UNCACHED (direct `getTransaction`, not through `withScanCache`) and still F2-validated; the
+  F1/F10 fee guards, F11 single-path selection, and F15 bump verification are untouched by the
+  diff (`tx.ts`/`sendLog.ts` unchanged). A stale cached UTXO set can only feed *compose/display*
+  and at worst produces a network-rejected replacement/send (already-spent inputs) — never a
+  signed overspend or wrong recipient. OVERSTATE bound (verified, test D): a same-seed-elsewhere
+  spend leaves our cache fresh, but the next cheap poll reads `getAddressStats` UNCACHED,
+  detects the delta, invalidates, and the rescan lands reality — the overstate window is one
+  ~30s poll cycle, never the ~100s TTL. (F16 is the one exception where the window is a stale
+  post-broadcast snapshot, still bounded by the next poll.)
+- **4. F12 survives — SOUND.** Phase 2 is a fresh `discoverAccount(gapLimit:20)` that EVALUATES
+  every index from 0 (only response REUSE changed); `complete=true` only ever from a full
+  gap-20 pass; the round-5 "ahead high-water can't hide funds" property still holds
+  (shipped test green). Backoff honesty holds: Home shows the "Checking for updates…" cue on
+  `account !== null && !accountComplete`, independent of the ladder, so an incomplete snapshot
+  is never presented as settled while backed off. (F17 is the dark side of this: for a deep
+  wallet the cue becomes *permanently* stuck because phase 2 can never complete.)
+- **5. F13 survives — SOUND.** Cache keyed per network (`Map<Network, ScanCache>`, verified
+  test); `switchNetwork` invalidates the DESTINATION before the new run; an aborted run's
+  landings never cross networks (a from-network run writes only its own network's cache and its
+  post-abort writes are guard-blocked); the resolve-then-abort-synchronously race stays silent
+  (shipped F13 test, updated for the new wave counts, green).
+- **6. The ladder — SOUND (one blessed deviation).** Manual `refresh` is never gated (verified:
+  a manual run fires instantly while backed off). Superseded runs touch neither the ladder nor
+  cache-validity (`if (this.current !== handle) return` in the `done.finally`; verified test F —
+  a supersede leaves `backoffLevel = 0`, and a superseded run inside an escalated window leaves
+  the level unchanged). Escalation on error AND incomplete-cut; any complete snapshot resets.
+  `Date.now()` gating cannot wedge: only `pollTick` reads the gate, `refresh` never does, and
+  `resetBackoff` (on any complete run) or a manual refresh always clears it — a backward clock
+  jump can delay only the automatic poll, never the always-available manual path. **Blessed
+  deviation:** first post-failure eligibility is ~60–70s (level 1 = 30s·2¹ + 0–10s jitter), not
+  the brief's "30s" — verified (test B: gated at +45s, eligible by +61s) — i.e. slightly MORE
+  conservative than the brief. Fine.
+- **7. Stage-2 pacing — the F17 hole.** `pacedDelay` resolves early on abort (verified in the
+  shipped suite), waves never launch after abort, and peak in-flight ≈ 4 (2/chain × 2 chains,
+  shipped test). BUT the pacing is applied to EVERY wave including cache-HIT waves (the source
+  comment "Cached-only waves still pause" is accurate), and phase 1 AND phase 2 each re-walk the
+  0..high-water range under pacing within the SINGLE 20s deadline. So a paced full run does NOT
+  fit the deadline for a deep wallet, and a deadline-cut paced run does NOT usefully RESUME
+  (the resumed run re-walks the same paced range and starves at the same point). Measured
+  (throwaway, fake timers, 250 ms/wave): phase 2 fails to complete at receive high-water ≈80
+  (cue stuck forever); phase 1 fails to paint at all at ≈155–170 (error state on a healthy
+  network); a shallow wallet is unaffected. Pacing does not starve phase-1 first paint for
+  normal wallets, but it does for deep ones. See F17.
+- **8. api.ts retry-removal scope — SOUND.** Only the three discovery GETs pass `retry: false`
+  (`getAddressStats`/`getUtxos`/`getAddressTxs`); `getFeeEstimates`/`getBtcUsdPrice`/
+  `getTransaction` keep the default single retry (verified: `getTransaction` calls `getJson(url,
+  {signal})` with no `retry` override → `maxAttempts = 2`); broadcast still uses `fetchOnce`
+  (no retry). F2 ingest validation on every touched path is unchanged (shipped `api.test.ts`
+  §1c cases green).
+- **9. Self-DoS regression math — SOUND (accepted residual).** Under a wedged network the
+  automatic account path decays via the ladder (verified: full runs get exponentially rarer;
+  the `accountStatus='error'` state is gated behind the same ladder so nothing hammers behind
+  the banner). The only surviving offered load is the 30s price/fees pair — each a single
+  spaced GET that keeps its one retry, so ≤4 requests/30s under total wedge, non-growing, and
+  skipped entirely while any run is `busy`. Adjudication: **acceptable** — field data shows
+  singles/small-spaced requests are tolerated by the stall-throttler; these two are genuinely
+  needed and never form a burst. No path re-creates an unbounded 30s full-rescan loop.
+
+## New findings
+
+### F16 — [SEV-Low] The broadcast-path invalidation is not paired with a synchronous abort — an in-flight run can repopulate the just-invalidated cache with pre-broadcast data
+
+- **Where:** `src/actions.ts` `signAndBroadcast` (`invalidateScanCache(params.network)` at
+  ~:530, inside the async fn, after `await broadcastTx`) and `bumpAndBroadcast` (~:806); the
+  paired abort happens only later, in `src/App.tsx` `confirmSend`/`speedUpConfirm`
+  (`await signAndBroadcast(...); … void refreshAll()` → `refreshAccount` → `discovery().refresh`
+  → `this.current?.abort()`). The post-abort write guard in `src/lib/account.ts` `withScanCache`
+  (~:500/:507/:514, `if (signal?.aborted !== true) cache.stats.set(...)`) keys on the *run's own*
+  signal, which is not yet aborted during the microtask gap.
+- **Scenario (verified, throwaway test A):** a paced discovery run R is in flight when the user
+  confirms a send (nothing gates `confirmSend` on `discovery().busy`). One of R's
+  `getAddressStats` responses resolves (pre-broadcast data — the queued continuation). Then
+  `signAndBroadcast` invalidates the cache and returns. Before `confirmSend` resumes and aborts
+  R, R's continuation runs — R's signal is not yet aborted, so the guard passes and it writes a
+  fresh-stamped PRE-broadcast response into the just-cleared cache. The post-send `refreshAll`
+  (R2) reads that poisoned entry. In the test, R2 paid 36 not 40 requests and its **complete**
+  snapshot reported `confirmedSats = 0` for an address that had just been funded — i.e. the
+  cache un-detected the change, the exact §7-forbidden pattern, here for a broadcast-detected
+  (not poll-detected) change. Because it is a post-send snapshot it can also OVERSTATE (show a
+  spent UTXO as still present), contradicting the "understate-only" claim in the handoff.
+- **Why it's Low, not blocking:** it is display-only and self-corrects within one ~30s poll
+  cycle — the next `pollTick` reads `getAddressStats` UNCACHED, detects the discrepancy against
+  R2's stale numbers, invalidates, and refreshes to reality (the ladder is reset by R2's
+  complete snapshot, so the poll is not gated). No signing impact: the stalest thing it can feed
+  a *new* send is an already-spent UTXO, which the network rejects (area 3). The race window is
+  one microtask plus any already-queued continuation, so it fires only occasionally per send.
+- **Fix:** add a generation counter to `ScanCache` — bump it in `clear()`, capture it in
+  `withScanCache` at request start, and write only if unchanged (`cache.gen === startGen &&
+  signal?.aborted !== true`). That makes any invalidation — synchronously abort-paired or not —
+  drop all in-flight landings, closing the last hole in the load-bearing invalidation invariant.
+  (Cheaper alternative: have `signAndBroadcast`/`bumpAndBroadcast` synchronously
+  `discovery().abort()` before invalidating — but the generation counter is the robust, general
+  fix and removes the "every invalidation must be abort-paired" fragility the engineer flagged.)
+
+### F17 — [SEV-Medium] Stage-2 pacing starves discovery for moderately-deep and deep wallets on a healthy network, with no in-app recovery — a regression that reintroduces the "cue never clears" symptom
+
+- **Where:** `src/lib/account.ts` `scanChain` (~:336, `if (!firstWave && waveDelayMs > 0) await
+  pacedDelay(waveDelayMs, opts.signal)`) paces EVERY wave, including cache-HIT waves (comment at
+  :332–335 confirms this is intentional); `PACING_WAVE_DELAY_MS = 200` + up to 100 ms jitter
+  (avg ~250 ms/wave), `concurrency = 2`, `DISCOVERY_DEADLINE_MS = 20_000` (`src/actions.ts`).
+  Within one run, phase 1 walks `0..highWater+5` and phase 2 (`discoverAccount(gapLimit:20)`)
+  RE-walks `0..highWater+20` from index 0, both under the single 20s deadline; the cross-run
+  cache saves REQUESTS on the re-walk but not the per-wave DELAY.
+- **Scenario (verified, throwaway tests, fake timers @250 ms/wave):**
+  - **Moderately deep (~80+ used receive addresses):** phase 1 paints, but phase 2 never reaches
+    `complete=true` within 20s — every run is deadline-cut incomplete, so the "Checking for
+    updates…" cue is PERMANENT and the automatic self-heal escalates the ladder to its ~8m
+    cap. Measured: high-water 20 completes; high-water 80 does not. Any funds in the
+    `highWater+6 .. highWater+20` gap band are perpetually understated; even when the balance is
+    correct, the honest F12 incompleteness signal becomes a permanent false alarm.
+  - **Deep (~155+):** phase 1 itself cannot paint within 20s → the run settles to the
+    `accountStatus='error'` "We couldn't reach the bitcoin network" state on a perfectly healthy
+    connection. Measured: high-water 140 still paints phase 1; 170 does not.
+  - **No in-app recovery:** the manual "Try again" / `refresh` path is paced identically, so it
+    starves the same way — the user cannot force a complete scan. The same wallet syncs fine
+    UNPACED (verified — this is the pre-Stage-2 behaviour), confirming pacing is the cause.
+- **Why it matters:** this is a functional regression introduced by the change under review. It
+  does not lose or overstate-into-loss funds (understate/blocked-spend direction, recoverable by
+  a future fix or restore elsewhere), so it is not fund-safety ship-blocking — but for a wallet
+  with a few dozen-plus used receive addresses it re-creates the precise headline symptom the
+  hotfix exists to eliminate (a stuck "checking" cue, and at the extreme the network-error
+  banner), with no way for the user to clear it. The PM's hands-on pass exercised only empty/
+  shallow wallets, so it would not have surfaced this.
+- **Fix (cheap, preserves the anti-burst goal):** do NOT pace a wave that issued zero network
+  requests (a fully-cached wave has nothing to burst) — pass the pacing decision the count of
+  actual fetches in the wave, or move `pacedDelay` to fire only when the wave hit the network.
+  This lets phase 2's cache-hit re-walk and any resumed run converge immediately while still
+  spacing genuine request waves. Additionally/alternatively: skip pacing for indices at/below
+  the high-water mark (those are known-used, must be scanned regardless, and spacing them buys
+  nothing), and/or raise `concurrency` for the below-high-water portion. Any of these keeps the
+  empty/shallow-wallet pacing the PM validated while restoring deep-wallet sync.
+
+## Ship recommendation
+
+**Ship Stage 1; fix F17 before relying on Stage 2 pacing (or ship with F17 as a documented,
+tracked fast-follow); fix F16 as a fast-follow.** Stage 1 (backoff ladder, cross-run cache,
+discovery-retry removal, price/fees dedup, `isEmpty` fix) is correct, well-tested, and resolves
+the self-DoS for the empty/shallow wallets that are the actual field case — that part is a clear
+improvement over `main` and should ship. F16 is a genuine but Low, self-correcting, display-only
+residual with no fund risk. F17 is a Medium functional regression that only bites wallets with
+~80+ used receive addresses (uncommon for this app, and not the owner's empty wallet), has no
+fund-safety impact, and has a trivial fix (don't pace cache-hit waves) that also improves the
+common case — the PM should decide pre-ship-fix vs. tracked fast-follow based on how much of the
+user base is expected to be that deep. No fund-safety ship-blocker found.
+
+_Round-9 throwaway tests used the `.review.test.ts` suffix, were executed, and were deleted; the
+only file modified is this `docs/review/round1.md`. Gates re-confirmed after deletion:
+`tsc --noEmit` clean, `npm test` = 256 passing, `npm run build` clean, `dist` CSP
+`script-src 'self'`._
