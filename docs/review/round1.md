@@ -2175,3 +2175,204 @@ test), `tsc --noEmit` clean, `npm run build` clean. Throwaway
 `round14closure.review.test.tsx` (4 probes) executed and deleted.
 
 **SHIP** stands. Next finding number: **F22**.
+
+---
+
+# Round 15 — Fresh-address nudge + relaxed custom-send gate
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 1 (F22 Info)**
+
+One round over the TWO merges sitting unpushed on local main: `4b3c94f`
+(address-nudge — display-only Receive callout) and `9e3f205` (custom-send-gate —
+owner-decided removal of the fail-closed estimates rail for VALIDATED custom
+rates). Combined diff = `src/App.tsx` (comment-only), `src/screens/Receive.tsx`,
+`src/screens/Send.tsx`, `src/strings.ts`, plus the two shipped test files.
+Gates on the merged tree: `npm test` = **331 passing**, `tsc --noEmit` clean,
+`npm run build` clean, dist CSP byte-identical to Round 13/14
+(`connect-src 'self' https://mempool.space https://blockstream.info;
+script-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'`),
+no `console.*` in `src/`, no new deps (`package.json`/lock zero-diff),
+`public/` untouched (no `CACHE_NAME` bump owed). Zero live API calls.
+**Money-surface zero-diff verified independently:** `git diff origin/main..main`
+over `src/lib/ src/actions.ts src/session.ts src/display.ts src/components/
+src/screens/Activity.tsx src/screens/Review.tsx package.json package-lock.json
+public/ index.html` contains NO hunks — engine, api, vault, sendLog, actions,
+Review, and the Speed-up path are byte-untouched. Verified with throwaway
+`round15.review.test.tsx` (15 probes: A1–A7, B1–B8; executed, deleted).
+
+## Feature A — fresh-address nudge (Receive, display-only)
+
+- **1. Seam honesty (fallback→snapshot) — ADJUDICATED, one Info finding
+  (F22).** The reachable seam: unlock, tap Receive before discovery lands →
+  fallback address at the CACHED next-unused index (`receiveDisplayAddress`,
+  App.tsx:445); first snapshot lands with a HIGHER index (a payment arrived
+  since last session) → address swaps in place, guards pass (same network,
+  both non-empty), notice fires (probe A1). The copy's substantive claims all
+  hold in that case — the shown address really WAS used (the index advanced
+  past it), the replacement really is next-unused, and "the old address still
+  works" is true — but "was **just** used" asserts a recency the app cannot
+  know: the payment may be days old and discovery only just noticed. Honest in
+  substance, wrong on the one temporal word. Info, not blocking (F22 below).
+  The exotic REVERSE seam (snapshot index BELOW the cache, so the notice fires
+  while the screen swaps TO a previously-used address captioned "fresh") is
+  unreachable from honest chain data — a used address's history is immutable,
+  so a fresh honest scan can never report a lower first-unused than a prior
+  one; it requires a lying/inconsistent endpoint or a deep reorg, is
+  display-only, and falls under Round 13's endpoint-trust verdict. No number.
+- **2. Re-announce behavior — SOUND, pinned at the DOM level.** Once fired,
+  the `role="status"` element keeps its NODE IDENTITY (probe A2: same element
+  reference across unchanged re-renders AND across a second rotation — `===`,
+  byte-identical textContent, exactly one `[role=status]` on screen), so the
+  live region never mutates after the first insert — nothing to re-announce.
+  Second rotations call `setRotated(true)` into an already-true state (React
+  bails, no commit). Exactly one notice per visit (probes A1/A2; shipped
+  no-stacking test agrees). The conditional occupies a stable child slot, so
+  the Qr/AddressChunk siblings never remount around it. StrictMode's double
+  effect is inert (first run writes the ref to identical values).
+- **3. Guards under hostile interleavings — HOLD.** mainnet→testnet→mainnet
+  at a DIFFERENT mainnet index: silent at every step (probe A3 — the ref
+  records the testnet hop, so the return leg fails the same-network check;
+  missing a real rotation here is the fail-safe direction for a display-only
+  cue). Lock/unlock = unmount/remount: ref re-seeds from current props, silent
+  (probe A4). Empty→address fill-in: silent, and a LIVE rotation after the
+  fill-in still fires — the guard does not over-suppress (probe A5).
+  Whitespace-only previous address treated as empty (probe A6). A
+  practice-side rotation fires on testnet — correct, it is a real rotation on
+  that chain (probe A7). Network-switch-while-mounted is unreachable today
+  (Settings is another screen; switchNetwork navigates home in the same
+  commit) — the guard is belt-and-braces exactly as commented.
+- **4. Zero network behavior — CONFIRMED by diff.** The Receive hunks add
+  `useEffect`/`useRef` state tracking and one conditional callout render;
+  imports gain nothing network-shaped; strings.ts adds copy; App.tsx's change
+  is comment-only (below). No request path is touched anywhere in Feature A.
+
+## Feature B — relaxed custom-send gate (money-path gating)
+
+- **1. F10 consent through the REAL flow — PROVEN end-to-end during the
+  outage.** Probe B8 (full App, real engine, estimates mocked to FAIL
+  permanently): create → fund 50k sats → Send shows the outage helper → $5 at
+  custom 30 sat/vB → the ~4,230-sat fee (>25%) trips the REAL notice, Review
+  is held, "Send anyway" composes `allowHighFee: true`, Review renders the
+  dry-run's REAL numbers (`at your rate of 30 sat/vB`, no recheck state), the
+  Live checkbox still gates, and ONE signed tx reaches the mocked relay — the
+  consent flag rode compose → dry-run → broadcast with `state.feeEstimates`
+  null for the entire session. The engineer's claim that dropping `highFee`'s
+  `props.fees !== null &&` short-circuit is LOAD-BEARING is correct: with
+  fees null and a valid custom rate, the old term would have forced
+  `highFee=false` while the new `canReview` no longer blocks on fees — the
+  25% consent would have been silently skipped. With fees PRESENT the dropped
+  term is a tautology (feeSelection requires a non-null feeRate, which on the
+  tier path requires fees), so tier behavior is formula-identical — probe B1
+  pinned both tier legs (normal send transmits the medium estimate exactly;
+  small-amount fast-tier send trips the same notice and transmits
+  `allowHighFee: true`).
+- **2. No PendingSend without a rate — AIRTIGHT under interleavings.**
+  `review()`'s re-guard mirrors `canReview` exactly (addressReady +
+  amountReady + `feeRate !== null`, then the highFee/allowHighFee check), and
+  covers BOTH entry buttons. Probes: custom typed during outage then
+  estimates arrive then tier clicked → transmits the TIER rate, never the
+  stale custom text (B2 — the inert-custom-text property survives the relaxed
+  gate); blanking/malforming/out-ranging the rate under an OPEN high-fee
+  notice collapses "Send anyway" and holds Review in the same commit, zero
+  composes (B3); fees reverting to null with a tier selected re-holds Review
+  and re-disables the chips — fails closed even though App can't produce that
+  transition today (feesLoaded only ever sets estimates; a network switch
+  blanks state and remounts Send via the home navigation) (B4); disabled tier
+  chips are click-dead, so a tier cannot displace a custom selection during
+  an outage (B7); sendMax + custom + outage composes an honest sweep with the
+  exact typed rate (B6). The default-tier outage state (standard selected,
+  chips disabled, Review held) is pinned by the shipped test.
+- **3. F21 law on the newly-dark tier previews — HOLDS, render swept.** With
+  fees null and a tier selected: zero `.fee__rate` nodes, no `≈ $` chip cost,
+  no `sat/vB` text anywhere on the screen, no total line with an amount
+  typed, and the sendMax conversion line goes dark rather than painting the
+  fabricated `$0.00` (probe B5 — the F21 fix's gate covers the new
+  tier-with-no-fees null source too, since both flow through the same
+  `feeRate`/`feeSats` null). The one number that still paints during an
+  outage is the custom chip's own preview once the TYPED rate validates —
+  user-authored, displayed == transmitted, correct. The outage helper line
+  names the state and points at Custom; it contains no numbers.
+- **4. Downstream trace — INDEPENDENT, matches the engineer's.**
+  `state.feeEstimates` has exactly two render consumers: App.tsx:737 (Send)
+  and App.tsx:799 (Activity — the Speed-up sheet's tier-only path, `FeeTier`
+  excludes 'custom', and Activity.tsx is zero-diff this round).
+  `reviewNumbers`/`getMnemonicBuild` (App.tsx:471/509) and `confirmSend`
+  (App.tsx:526) consume ONLY `pending` + `state.account` + the session
+  mnemonic — no fees term exists on the dry-run or broadcast path, which is
+  why probe B8 and the shipped full-flow test broadcast successfully with
+  estimates failing for the whole session. App.tsx's diff is comment-only:
+  the single hunk rewrites the `loadFees` catch comment (3 lines of block
+  comment replacing 1), zero code tokens changed.
+- **5. Residual risk of the removed rail — ADJUDICATED, see below.**
+
+## New findings
+
+### F22 — [SEV-Info] The rotation notice claims "just used" at the stale-cache seam, where recency is unknowable
+
+- **Where:** `src/strings.ts` (`receive.rotatedNotice`) as fired by
+  `src/screens/Receive.tsx:43-54` across the fallback→snapshot seam
+  (`receiveDisplayAddress`, `src/App.tsx:445`).
+- **Scenario (probed, A1):** A payment lands while the app is closed. Next
+  session the user opens Receive before discovery finishes → fallback shows
+  the CACHED next-unused address (now stale) → the first snapshot advances the
+  index → the notice fires: "the address you were showing was just used". The
+  use is real (the index provably advanced past it) but may be days old —
+  "just" asserts a recency the app cannot know at this seam. Every other
+  claim in the copy is true, and in the mounted-visit case (30s poll) "just"
+  is accurate. Reassurance-display only; no money path, no action taken on it.
+- **Fix:** one-word hedge, e.g. "was just used" → "has been used" (or "was
+  used since you last checked"). Keeps the live-rotation case honest and
+  makes the seam case exactly true. Copy-only.
+
+## Adjudications (as briefed)
+
+- **Seam-copy honesty — ACCEPTABLE (with F22's copy hedge recommended).** The
+  engineer's "approximately true" is the right description: the notice's
+  substantive claims (address was used; replacement is fresh; old address
+  still works) are provably true whenever the guards pass on honest chain
+  data, in both the live-rotation and stale-cache cases — including the
+  fresh-restore variant (no cache → index-0 fallback → first snapshot jumps
+  to the real next-unused; index 0 genuinely was used). Only the temporal
+  adverb overclaims, and only at the seam. The failure direction is benign
+  over-reassurance, not a safety or money claim. The reverse seam (a used
+  address captioned fresh) requires dishonest/inconsistent endpoint data and
+  is already covered by Round 13's trust verdict — the wallet cannot
+  distinguish that world from truth at any copy wording.
+- **Removed-rail residual risk — ACCEPTED AS SCOPED (owner decision,
+  2026-07-10).** What the old `props.fees !== null` rail actually provided
+  was availability gating, NOT a magnitude check: even with estimates
+  present, a custom 400 sat/vB against a 2 sat/vB market has never drawn a
+  comparative warning (Round 14 shipped that surface). So the delta this
+  change opens is narrow: during an outage the user also loses the AMBIENT
+  market signal of the priced tier chips sitting next to the input. The
+  remaining backstops bind exactly as claimed and were re-verified this
+  round: the [0.1, 500] reject-never-clamp window (`classifyCustomFeeRate`,
+  unchanged), the F10 25% consent (now PROVEN to trip during the outage,
+  probe B8 — note it only guards fee-vs-amount, so a large send at a
+  needlessly high rate passes without consent by design), and the engine's
+  hard caps (500 sat/vB, 1M-sat absolute — `src/lib/tx.ts` zero-diff, still
+  above `allowHighFee`). Worst honest case: a typed 400 sat/vB on a $1,000
+  send overpays ~$30-ish with no warning — user-authored, inside every
+  audited bound, and identical to what the wallet already permitted with
+  estimates up. The trade (self-directed sending keeps working when
+  mempool.space stalls, which Round 9 showed it does) is a defensible owner
+  call; a future compare-to-market hint when estimates ARE present would
+  shrink the pre-existing half of this surface and is out of scope here.
+
+## Ship recommendation
+
+**SHIP** (push deploys both merges). Feature A is exactly its display-only
+claim — zero request-path hunks, guards hold under every probed interleaving,
+the live region cannot re-announce, and the one copy wobble is an Info-level
+temporal hedge. Feature B's relaxation is surgical: the whole gate collapsed
+into one audited null-check whose two arms were probed independently, the F10
+consent flow demonstrably survives the outage it used to be short-circuited
+around, no PendingSend can exist without a user-chosen rate, the F21 law now
+covers the tier-dark state it newly created, and the engine beneath is
+byte-identical. F22 is copy-only and non-blocking.
+
+_Round-15 throwaway tests used the `.review.test.tsx` suffix, were executed,
+and were deleted; the only file modified is this `docs/review/round1.md`,
+committed on local main (not pushed). Zero live API calls this round. Gates
+re-confirmed after deletion: `tsc --noEmit` clean, `npm test` = 331 passing,
+`npm run build` clean, dist CSP unchanged. Next finding number: **F23**._
