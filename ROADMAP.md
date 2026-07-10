@@ -45,6 +45,21 @@ review rounds 9 + closure in `docs/review/round1.md`.
   Receive screen to the next one automatically (with the old one still valid).
   Improves privacy for free.
 
+- **Show fee rates in sat/vB** *(owner request, 2026-07-10)* — display the
+  actual sat/vB rate alongside each recommended fee choice on Send (today the
+  tiers show cost but not the underlying rate). Display-only: the rates already
+  arrive via `getFeeEstimates`/`feeRateForTier`; this just surfaces them.
+
+- **Custom fee rate** *(owner request, 2026-07-10)* — let the sender type
+  their own sat/vB rate as an advanced option next to the recommended tiers.
+  **Money-path change — needs a security review round when built:** the input
+  must clamp into the F1 window (`MIN_ACCEPTED_FEE_RATE`–`MAX_ACCEPTED_FEE_RATE`;
+  the hard 500 sat/vB / 1M-sat caps stay non-overridable) and must flow through
+  the same `estimateSendFee` single path as the tiers (F11 — no parallel fee
+  computation). The 25%-of-amount consent rule applies unchanged. Interacts
+  with the sub-1 sat/vB item below: a custom rate under 1 sat/vB raises the
+  same relay-floor questions, so decide the floor once, for both.
+
 - **Sub-1 sat/vB "super economy" fee** — Bitcoin Core 30 (Oct 2025) lowered the
   default minimum relay feerate to 0.1 sat/vB, so in a quiet mempool a payment
   can confirm for less than the app's current 1 sat/vB floor. The engine's fee
