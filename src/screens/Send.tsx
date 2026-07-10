@@ -403,11 +403,15 @@ export function Send(props: {
               {strings.send.max}
             </button>
           </div>
-          {sendMax ? (
+          {sendMax && feeSats !== null ? (
+            // F21: the sweep amount is spendable-minus-fee, so with no usable
+            // rate (custom chosen, not validly entered) there is no honest
+            // number to show — go dark like every other rate-derived preview,
+            // never a fabricated $0.00.
             <div className="amount-conv">
               {fmtUsd(previewAmountSats, props.btcUsd)} · {fmtBtc(previewAmountSats)} BTC
             </div>
-          ) : conversion ? (
+          ) : !sendMax && conversion ? (
             <div className="amount-conv">{conversion}</div>
           ) : null}
           {amountError ? (

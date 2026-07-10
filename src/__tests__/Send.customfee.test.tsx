@@ -306,6 +306,29 @@ describe('Send — custom fee rate (F11 single path)', () => {
     expect(pending?.feeTier).toBe('custom');
   });
 
+  it('Max + custom-with-no-rate goes DARK — never a fabricated $0.00 sweep amount (F21)', async () => {
+    // The sweep amount is spendable-minus-fee; with no usable rate there is no
+    // honest number, and round 14 caught this one line still painting $0.00.
+    await mountSend(makeAccount([100_000n]), vi.fn());
+    const to = container.querySelector<HTMLInputElement>('#send-to');
+    await act(async () => setNativeValue(to!, RECIPIENT));
+    await act(async () => findButton(strings.send.max)!.click());
+
+    // Tier selected: Max shows a real sweep conversion line.
+    expect(container.querySelector('.amount-conv')).not.toBeNull();
+
+    // Custom with no rate entered: the line disappears entirely — it must not
+    // render a zero (the F21 fabrication) or any other placeholder amount.
+    await pickCustom();
+    expect(container.querySelector('.amount-conv')).toBeNull();
+    expect(container.textContent).not.toContain('$0.00 ');
+
+    // A valid custom rate brings the honest sweep amount back.
+    await pickCustom('2');
+    expect(container.querySelector('.amount-conv')).not.toBeNull();
+    expect(container.querySelector('.amount-conv')!.textContent).not.toContain('$0.00');
+  });
+
   it('no fee/total preview is ever shown at a rate the user did not enter', async () => {
     const onReview = vi.fn<(pending: PendingSend) => void>();
     await mountSend(makeAccount([100_000n]), onReview);
