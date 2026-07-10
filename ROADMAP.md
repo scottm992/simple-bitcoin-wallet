@@ -60,6 +60,17 @@ review rounds 9 + closure in `docs/review/round1.md`.
   with the sub-1 sat/vB item below: a custom rate under 1 sat/vB raises the
   same relay-floor questions, so decide the floor once, for both.
 
+- **Scan progress on the "Checking for updates…" cue** *(owner request,
+  2026-07-10)* — show progress so an in-flight scan doesn't read as stuck.
+  Design note: a strict percent is dishonest — the gap-limit scan's total
+  grows when it finds a used address — so use "checked N of ~M addresses"
+  (or a never-decreasing clamped percent) from a progress callback threaded
+  through `scanChain` → `DiscoveryController` → the Home cue. Pair it with
+  backoff-aware wording ("retrying in Xs — tap to check now") so a
+  deliberately-waiting ladder doesn't look frozen either. Display-only, but
+  it touches the discovery layer: the HANDOFF-discovery-throttle §7/§8
+  invariants bind (no extra requests, no cache/pacing changes).
+
 - **Sub-1 sat/vB "super economy" fee** — Bitcoin Core 30 (Oct 2025) lowered the
   default minimum relay feerate to 0.1 sat/vB, so in a quiet mempool a payment
   can confirm for less than the app's current 1 sat/vB floor. The engine's fee
