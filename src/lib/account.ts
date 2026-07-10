@@ -481,26 +481,37 @@ function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
     if (entry === undefined) return undefined;
     return cache.now() - entry.storedAt < cache.ttlMs ? entry.value : undefined;
   }
+  // POST-ABORT WRITE GUARD (§7): every write is gated on the request's own
+  // signal AFTER the await. A response that resolves just before an abort has
+  // its continuation sitting in the microtask queue; a change signal can
+  // invalidate the cache and abort the run synchronously BEFORE that
+  // continuation executes (exactly the poll's changed → invalidate → refresh →
+  // abort sequence). Writing then would repopulate the freshly invalidated
+  // cache with a fresh-stamped but PRE-change response — hiding, for up to the
+  // TTL, the very change the poll just detected: the "un-detect" the
+  // invalidation rule exists to prevent. So an aborted run's post-abort
+  // landings are returned to their (doomed) scan but never cached: resume
+  // semantics only rely on writes that landed before the abort.
   return {
     getAddressStats: async (network, address, signal) => {
       const hit = fresh(cache.stats.get(address));
       if (hit !== undefined) return hit;
       const value = await api.getAddressStats(network, address, signal);
-      cache.stats.set(address, { value, storedAt: cache.now() });
+      if (signal?.aborted !== true) cache.stats.set(address, { value, storedAt: cache.now() });
       return value;
     },
     getUtxos: async (network, address, signal) => {
       const hit = fresh(cache.utxos.get(address));
       if (hit !== undefined) return hit;
       const value = await api.getUtxos(network, address, signal);
-      cache.utxos.set(address, { value, storedAt: cache.now() });
+      if (signal?.aborted !== true) cache.utxos.set(address, { value, storedAt: cache.now() });
       return value;
     },
     getAddressTxs: async (network, address, signal) => {
       const hit = fresh(cache.txs.get(address));
       if (hit !== undefined) return hit;
       const value = await api.getAddressTxs(network, address, signal);
-      cache.txs.set(address, { value, storedAt: cache.now() });
+      if (signal?.aborted !== true) cache.txs.set(address, { value, storedAt: cache.now() });
       return value;
     },
   };

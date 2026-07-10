@@ -201,7 +201,13 @@ a full gap-20 evaluation.
   void }` — `abort()` cancels every in-flight request and silences the run: a
   superseded run never dispatches a snapshot or an error, even if a phase had
   already resolved with its continuation still queued (F13). `abort()` does NOT
-  clear the cache — a superseding manual refresh must be able to resume.
+  clear the cache — a superseding manual refresh must be able to resume — but an
+  aborted run's POST-abort landings are never written to it: `withScanCache`
+  gates every write on the request's own signal after the await (§7), so a
+  response whose continuation executes after a synchronous invalidate + abort
+  (the poll's changed → invalidate → refresh path) cannot repopulate the freshly
+  invalidated cache with fresh-stamped pre-change data. Resume semantics rely
+  only on writes that landed before the abort.
 - `invalidateScanCache(network?)` — clears the per-network cache (or all networks
   with no arg). The load-bearing invalidation API (see the cross-run-cache note).
 - `pollAccount(network, account, signal?): Promise<boolean>` — the cheap 30-second

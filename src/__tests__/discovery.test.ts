@@ -881,3 +881,64 @@ describe('Stage 2 — single-run pacing', () => {
     vi.useRealTimers();
   });
 });
+
+// ---------------------------------------------------------------------------
+// §7 regression — post-abort cache writes. A response that RESOLVED just before
+// an abort has its continuation queued as a microtask; the poll's changed path
+// runs invalidate → refresh → abort synchronously, so that continuation
+// executes AFTER the invalidation. Without the write guard in withScanCache it
+// would repopulate the freshly invalidated cache with a fresh-stamped but
+// PRE-change response — un-detecting, for up to the TTL, the very change the
+// poll just found.
+// ---------------------------------------------------------------------------
+
+describe('post-abort cache writes (§7 regression)', () => {
+  it("an aborted run's post-abort landings never repopulate an invalidated cache", async () => {
+    mockNet.mode = 'manual';
+    const handle = startDiscovery({
+      network: 'testnet',
+      onSnapshot: vi.fn(),
+      onError: vi.fn(),
+    });
+
+    // Wave 1 in flight: concurrency 2 on each chain = 4 requests.
+    await tick();
+    expect(mockNet.pending.length).toBe(4);
+
+    // The exact §7 interleaving, deterministically (same resolve-then-abort
+    // technique as the F13 test above): the responses RESOLVE — pre-change
+    // server data, continuations now queued — then, before any microtask can
+    // run, a change signal invalidates the cache and aborts the run, exactly
+    // as the poll's changed → invalidate → refresh → abort() sequence does
+    // synchronously.
+    for (const resolve of mockNet.pending.splice(0)) resolve();
+    invalidateScanCache('testnet');
+    handle.abort();
+
+    // Flush: the queued continuations execute AFTER the invalidate + abort.
+    // The write guard must drop them; the aborted run also issues no further
+    // waves (the concurrency pool checks the signal before each pickup).
+    await tick();
+    await tick();
+    await handle.done;
+    const afterAborted = mockNet.statsCalls.length;
+    expect(afterAborted).toBe(4);
+
+    // Therefore a fresh run re-fetches EVERYTHING — the full 40-request scan.
+    // Had any post-abort landing been cached, this run would cost 36 and could
+    // serve fresh-stamped pre-change data for up to the TTL (the forbidden
+    // "un-detect").
+    mockNet.mode = 'instant';
+    let complete = false;
+    const h2 = startDiscovery({
+      network: 'testnet',
+      onSnapshot: (_s, c) => {
+        if (c) complete = true;
+      },
+      onError: vi.fn(),
+    });
+    await h2.done;
+    expect(complete).toBe(true);
+    expect(mockNet.statsCalls.length - afterAborted).toBe(40);
+  });
+});
