@@ -70,7 +70,7 @@ vi.mock('../lib/api', async (importOriginal) => {
   };
 });
 
-import { startDiscovery, pollAccount, DiscoveryController } from '../actions';
+import { startDiscovery, pollAccount, DiscoveryController, invalidateScanCache } from '../actions';
 import { getAddressStats } from '../lib/api';
 import { setUnlocked, lockNow } from '../session';
 import {
@@ -87,8 +87,20 @@ const FAST_KDF = { N: 2 ** 8, r: 8, p: 1, dkLen: 32 };
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
+/** Spins the microtask/timer loop (real timers) until `pred` holds or we give up. */
+async function waitUntil(pred: () => boolean, tries = 100): Promise<void> {
+  for (let i = 0; i < tries; i++) {
+    if (pred()) return;
+    await tick();
+  }
+  throw new Error('waitUntil: condition never held');
+}
+
 beforeEach(() => {
   localStorage.clear();
+  // The scan cache is now cross-run / module-scope (§1b), so it MUST be cleared
+  // between cases or a prior test's cached responses leak in and skew counts.
+  invalidateScanCache();
   mockNet.mode = 'instant';
   mockNet.hangAfter = null;
   mockNet.used.clear();
@@ -310,8 +322,8 @@ describe('startDiscovery — snapshot completeness (F12)', () => {
   });
 });
 
-describe('deadline-cut phase 2 self-heals on the next poll tick (F12)', () => {
-  it('keeps the incomplete phase-1 result at the deadline, then completes via pollTick', async () => {
+describe('deadline-cut phase 2 self-heals — but only after the backoff window (F12 + §1a)', () => {
+  it('keeps the incomplete phase-1 result, suppresses self-heal in the window, then completes', async () => {
     vi.useFakeTimers();
     // Phase 1 (10 stats requests) succeeds instantly; everything after stalls,
     // so the 20s deadline cuts phase 2 off — exactly the throttled-burst case.
@@ -332,10 +344,26 @@ describe('deadline-cut phase 2 self-heals on the next poll tick (F12)', () => {
     expect(onError).not.toHaveBeenCalled();
     expect(controller.busy).toBe(false);
 
-    // Next poll tick: with an incomplete snapshot it self-heals — it requests a
-    // full refresh (onChanged) WITHOUT issuing any requests of its own.
+    // §1a: the cut run ESCALATED the ladder, so the very next poll tick — still
+    // inside the backoff window — must NOT self-heal. It issues nothing, so a
+    // stalled run cannot trigger a second run within the window (this is the
+    // whole fix: no more 30s hammer). This behaviour is a deliberate change from
+    // the pre-v1.1.1 "self-heal on the very next tick".
     const before = mockNet.statsCalls.length;
     const onChanged = vi.fn();
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: false,
+      onChanged,
+    });
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(mockNet.statsCalls.length).toBe(before);
+
+    // Once the window elapses (level-1 = ~60s + up to 10s jitter; advance well
+    // past it), the tick self-heals — a full refresh (onChanged) WITHOUT issuing
+    // any requests of its own.
+    await vi.advanceTimersByTimeAsync(71_000);
     controller.pollTick({
       network: 'testnet',
       account: freshSnapshot(),
@@ -346,7 +374,8 @@ describe('deadline-cut phase 2 self-heals on the next poll tick (F12)', () => {
     expect(mockNet.statsCalls.length).toBe(before);
 
     // The caller reacts by refreshing; the network has recovered, so the run
-    // now finishes with a COMPLETE snapshot — the cue can clear.
+    // now finishes with a COMPLETE snapshot — the cue can clear and the ladder
+    // resets.
     mockNet.hangAfter = null;
     controller.refresh({
       network: 'testnet',
@@ -392,5 +421,352 @@ describe('network switch — no stale dispatch after an eager abort (F13)', () =
     await tick();
     expect(onSnapshot).not.toHaveBeenCalled();
     expect(onError).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §1b — cross-run scan cache: the scan converges across attempts instead of
+// restarting forever.
+// ---------------------------------------------------------------------------
+
+describe('cross-run scan cache (§1b)', () => {
+  it('a run cut mid-scan resumes and pays only the remainder within the TTL', async () => {
+    vi.useFakeTimers();
+    // Empty wallet; the first ~25 requests land, everything after stalls, and the
+    // 20s deadline cuts phase 2 off — exactly the throttled-burst case.
+    mockNet.hangAfter = 25;
+    const flags1: boolean[] = [];
+    const h1 = startDiscovery({
+      network: 'testnet',
+      onSnapshot: (_s, c) => flags1.push(c),
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(20_500);
+    await h1.done;
+    // Phase 1 landed; phase 2 was cut. Exactly 25 responses landed in the cache
+    // (the successful ones; the stalled in-flight requests are never cached).
+    expect(flags1).toEqual([false]); // incomplete — phase 2 never completed
+
+    // Resume immediately (well within the ~100s TTL), network recovered. The
+    // resumed run reuses the 25 cached responses and pays ONLY the remaining 15
+    // of the 40-address full scan — the scan converges instead of restarting.
+    mockNet.hangAfter = null;
+    const before = mockNet.statsCalls.length;
+    const flags2: boolean[] = [];
+    let snap2: AccountSnapshot | null = null;
+    const h2 = startDiscovery({
+      network: 'testnet',
+      onSnapshot: (s, c) => {
+        flags2.push(c);
+        if (c) snap2 = s;
+      },
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(100);
+    await h2.done;
+    const resumedCost = mockNet.statsCalls.length - before;
+    expect(resumedCost).toBe(15); // 40 total − 25 already cached
+    expect(flags2).toEqual([false, true]); // the resumed run completes
+    expect(snap2).not.toBeNull();
+    vi.useRealTimers();
+  });
+
+  it('re-fetches an entry once it is older than the TTL', async () => {
+    vi.useFakeTimers();
+    const h1 = startDiscovery({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(50);
+    await h1.done;
+    const afterFirst = mockNet.statsCalls.length;
+    expect(afterFirst).toBe(40); // cold empty-wallet full run
+
+    // A second run BEFORE the TTL reuses everything (0 new requests)...
+    const h2 = startDiscovery({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(50);
+    await h2.done;
+    expect(mockNet.statsCalls.length - afterFirst).toBe(0);
+
+    // ...but once every entry has aged past the TTL, the next run re-fetches all
+    // 40 — a stale "unused" answer is never served past its lifetime.
+    await vi.advanceTimersByTimeAsync(100_001); // > SCAN_CACHE_TTL_MS
+    const beforeThird = mockNet.statsCalls.length;
+    const h3 = startDiscovery({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(50);
+    await h3.done;
+    expect(mockNet.statsCalls.length - beforeThird).toBe(40);
+    vi.useRealTimers();
+  });
+
+  it('is keyed per network (F13) and invalidation targets one network only', async () => {
+    // Testnet full run: 40 requests, cached under testnet.
+    const t1 = startDiscovery({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await t1.done;
+    expect(mockNet.statsCalls.length).toBe(40);
+
+    // Mainnet uses DIFFERENT addresses and its OWN cache — a testnet response can
+    // never be reused for a mainnet scan, so it pays the full 40 fresh.
+    let n = mockNet.statsCalls.length;
+    const m1 = startDiscovery({ network: 'mainnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await m1.done;
+    expect(mockNet.statsCalls.length - n).toBe(40);
+
+    // Invalidate ONLY testnet: mainnet's cache must survive untouched.
+    invalidateScanCache('testnet');
+    n = mockNet.statsCalls.length;
+    const m2 = startDiscovery({ network: 'mainnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await m2.done;
+    expect(mockNet.statsCalls.length - n).toBe(0); // mainnet still fully cached
+
+    // ...while testnet, having been cleared, pays the full 40 again.
+    n = mockNet.statsCalls.length;
+    const t2 = startDiscovery({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await t2.done;
+    expect(mockNet.statsCalls.length - n).toBe(40);
+  });
+
+  it('invalidateScanCache() with no argument clears every network (lock)', async () => {
+    const t1 = startDiscovery({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await t1.done;
+    const m1 = startDiscovery({ network: 'mainnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await m1.done;
+
+    invalidateScanCache(); // lock / logout clears all
+
+    let n = mockNet.statsCalls.length;
+    const t2 = startDiscovery({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await t2.done;
+    expect(mockNet.statsCalls.length - n).toBe(40);
+    n = mockNet.statsCalls.length;
+    const m2 = startDiscovery({ network: 'mainnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await m2.done;
+    expect(mockNet.statsCalls.length - n).toBe(40);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §7 — the staleness landmine: a poll-detected change must never be un-detected
+// by a cached rescan.
+// ---------------------------------------------------------------------------
+
+describe('cross-run cache staleness (§7)', () => {
+  it('a poll-detected change invalidates the cache so the rescan sees the funds', async () => {
+    const controller = new DiscoveryController();
+    let account1: AccountSnapshot | null = null;
+    controller.refresh({
+      network: 'testnet',
+      onSnapshot: (s, c) => {
+        if (c) account1 = s;
+      },
+      onError: vi.fn(),
+    });
+    await waitUntil(() => account1 !== null && !controller.busy);
+    const snap1 = account1 as unknown as AccountSnapshot;
+    // Empty wallet: the receive tip (index 0) is cached as UNUSED.
+    expect(snap1.confirmedSats).toBe(0n);
+    const tip = snap1.receiveAddress;
+
+    // The tip now RECEIVES a payment on-chain.
+    mockNet.used.add(tip);
+
+    // The cheap poll notices the tip became used and — per §7 — the controller
+    // invalidates the cache BEFORE triggering the refresh, so the rescan fetches
+    // the tip FRESH. Without that, the cached "unused" answer would UN-DETECT the
+    // payment and the balance would wrongly stay $0.
+    let account2: AccountSnapshot | null = null;
+    const onChanged = (): void => {
+      controller.refresh({
+        network: 'testnet',
+        onSnapshot: (s, c) => {
+          if (c) account2 = s;
+        },
+        onError: vi.fn(),
+      });
+    };
+    controller.pollTick({ network: 'testnet', account: snap1, accountComplete: true, onChanged });
+    await waitUntil(() => account2 !== null);
+    expect((account2 as unknown as AccountSnapshot).confirmedSats).toBe(10_000n);
+  });
+
+  it('the self-heal path does NOT invalidate — it resumes from the cache', async () => {
+    vi.useFakeTimers();
+    // Land phase 1 (10), stall the rest so phase 2 is cut → incomplete snapshot.
+    mockNet.hangAfter = 10;
+    const controller = new DiscoveryController();
+    controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(20_500);
+    expect(controller.busy).toBe(false);
+
+    // Recover the network, then let the backoff window elapse and self-heal.
+    mockNet.hangAfter = null;
+    await vi.advanceTimersByTimeAsync(71_000);
+    const before = mockNet.statsCalls.length;
+    let resumed = false;
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: false,
+      onChanged: () => {
+        resumed = true;
+        controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+      },
+    });
+    expect(resumed).toBe(true);
+    await vi.advanceTimersByTimeAsync(100);
+    // The resumed run reused the 10 phase-1 responses (self-heal must NOT nuke
+    // the cache) and paid only the remaining 30 of the 40-address scan.
+    expect(mockNet.statsCalls.length - before).toBe(30);
+    controller.abort();
+    vi.useRealTimers();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §1a/§1f — automatic-refresh backoff ladder.
+// ---------------------------------------------------------------------------
+
+describe('automatic-refresh backoff ladder (§1a/§1f)', () => {
+  it('a manual refresh is always instant, even while backed off', async () => {
+    vi.useFakeTimers();
+    mockNet.mode = 'hang';
+    const controller = new DiscoveryController();
+    controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(20_500); // deadline → error → escalate (backed off)
+    expect(controller.busy).toBe(false);
+
+    // A manual refresh ignores the backoff window entirely — it starts a run now.
+    mockNet.mode = 'instant';
+    const before = mockNet.statsCalls.length;
+    controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockNet.statsCalls.length).toBeGreaterThan(before);
+    controller.abort();
+    vi.useRealTimers();
+  });
+
+  it('the error state does not hammer behind the banner', async () => {
+    vi.useFakeTimers();
+    mockNet.mode = 'hang';
+    const controller = new DiscoveryController();
+    const onError = vi.fn();
+    controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError });
+    await vi.advanceTimersByTimeAsync(20_500);
+    expect(onError).toHaveBeenCalledTimes(1);
+
+    // Behind the error banner the cheap poll is also gated — an immediate tick
+    // issues ZERO requests, so nothing hammers the wedged network.
+    const before = mockNet.statsCalls.length;
+    const onChanged = vi.fn();
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: true,
+      onChanged,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockNet.statsCalls.length).toBe(before);
+    expect(onChanged).not.toHaveBeenCalled();
+    controller.abort();
+    vi.useRealTimers();
+  });
+
+  it('a successful complete snapshot resets the ladder', async () => {
+    vi.useFakeTimers();
+    mockNet.mode = 'hang';
+    const controller = new DiscoveryController();
+    controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(20_500); // escalate → backed off
+
+    // A completing manual refresh resets the ladder...
+    mockNet.mode = 'instant';
+    let completed = false;
+    controller.refresh({
+      network: 'testnet',
+      onSnapshot: (_s, c) => {
+        if (c) completed = true;
+      },
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(completed).toBe(true);
+    expect(controller.busy).toBe(false);
+
+    // ...so the very next poll tick is NO LONGER gated — the cheap 2-request poll
+    // runs immediately (ladder is back to healthy).
+    const before = mockNet.statsCalls.length;
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: true,
+      onChanged: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockNet.statsCalls.length - before).toBe(2); // the two tips
+    controller.abort();
+    vi.useRealTimers();
+  });
+
+  it('offered load decays: full runs get rarer under a persistently wedged network', async () => {
+    vi.useFakeTimers();
+    mockNet.mode = 'hang';
+    const controller = new DiscoveryController();
+    let runsStarted = 0;
+    const startRun = (): void => {
+      runsStarted++;
+      controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    };
+    startRun(); // the initial run
+
+    // Simulate the App's dumb 30s clock for 12 minutes. Every tick tries to
+    // self-heal (the snapshot never completes because the network is wedged).
+    for (let elapsed = 0; elapsed < 12 * 60_000; elapsed += 30_000) {
+      await vi.advanceTimersByTimeAsync(30_000);
+      controller.pollTick({
+        network: 'testnet',
+        account: freshSnapshot(),
+        accountComplete: false,
+        onChanged: startRun,
+      });
+    }
+    // Without backoff the self-heal would fire a fresh 40-request run roughly
+    // every tick (~15+ over 12 min). With the ladder, runs get exponentially
+    // rarer: a small handful.
+    expect(runsStarted).toBeLessThanOrEqual(7);
+    expect(runsStarted).toBeGreaterThanOrEqual(2);
+    controller.abort();
+    vi.useRealTimers();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F12 regression (round 5): a stale/ahead high-water mark can never HIDE funds —
+// phase 2 always evaluates from index 0.
+// ---------------------------------------------------------------------------
+
+describe('high-water mark can never hide funds (F12, round-5 property)', () => {
+  it('an AHEAD mark still finds low-index funds and rewrites the mark down', async () => {
+    await createVault(ABANDON, 'test-password-11', 'testnet', FAST_KDF);
+    // A mark far ahead of reality (e.g. a seed used more heavily elsewhere).
+    setCachedHighWater('testnet', { receive: 30, change: 30 });
+    // But the only funds are at receive index 3.
+    mockNet.used.add(deriveReceiveAddress(ABANDON, 'testnet', 3).address);
+
+    const flags: boolean[] = [];
+    let final: AccountSnapshot | null = null;
+    const handle = startDiscovery({
+      network: 'testnet',
+      onSnapshot: (s, c) => {
+        flags.push(c);
+        if (c) final = s;
+      },
+      onError: vi.fn(),
+    });
+    await handle.done;
+
+    const snap = final as unknown as AccountSnapshot;
+    // The ahead mark forced extra scanning but never hid the funds; the final
+    // (complete) scan found them and corrected the mark to the real high index.
+    expect(flags).toContain(true);
+    expect(snap.confirmedSats).toBe(10_000n);
+    expect(snap.receiveHighWater).toBe(3);
+    expect(getCachedHighWater('testnet')).toEqual({ receive: 3, change: -1 });
   });
 });

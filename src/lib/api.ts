@@ -1,10 +1,14 @@
 /**
  * api.ts — thin REST client for the public mempool.space API.
  *
- * Every call is network-scoped. GETs get a single retry; POST (broadcast) does
- * not retry. All requests are bounded by an AbortController timeout. Errors are
- * typed to distinguish a transport failure ({@link ApiNetworkError}) from an
- * API-level rejection ({@link ApiResponseError}).
+ * Every call is network-scoped. Non-discovery GETs (fees / price / one-tx
+ * fetch) get a single retry on transport failure; the DISCOVERY GETs
+ * (stats / utxos / txs) do NOT retry (§1c, v1.1.1): against a stall-throttler a
+ * per-request retry doubles offered load exactly when we're being punished, and
+ * the run-level self-heal is the retry. POST (broadcast) never retries. All
+ * requests are bounded by an AbortController timeout. Errors are typed to
+ * distinguish a transport failure ({@link ApiNetworkError}) from an API-level
+ * rejection ({@link ApiResponseError}).
  */
 import type { Network } from './wallet';
 import { MAX_SUPPLY_SATS } from './format';
@@ -15,8 +19,9 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 /**
  * Timeout for address-discovery GETs (stats / utxos / txs). Deliberately short:
  * mempool.space stalls burst traffic until the client gives up, so a long
- * timeout turns a throttled burst into minutes of dead air. 8s per request,
- * with one short-backoff retry, keeps a stalled lane from wedging a scan.
+ * timeout turns a throttled burst into minutes of dead air. 8s per request, and
+ * NO per-request retry (§1c) — a retry only piles more load onto a
+ * stall-throttler — keeps a stalled lane from wedging a scan.
  */
 const DISCOVERY_TIMEOUT_MS = 8_000;
 
@@ -265,6 +270,12 @@ export interface ApiTransaction {
 interface GetOpts {
   readonly signal?: AbortSignal | undefined;
   readonly timeoutMs?: number;
+  /**
+   * Whether to retry once on transport failure. Defaults to true. The discovery
+   * GETs (stats / utxos / txs) pass `false` (§1c): retrying a stall-throttled
+   * burst just doubles offered load; the run-level self-heal is their retry.
+   */
+  readonly retry?: boolean;
 }
 
 /**
@@ -307,15 +318,18 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * GET a URL as text, with one retry on transport failure after a short,
- * jittered backoff (300–800 ms) — enough to step out of a throttled burst
- * without piling on. Never retries API rejections, and never retries once the
- * caller's signal has aborted.
+ * GET a URL as text. By default one retry on transport failure after a short,
+ * jittered backoff (300–800 ms) — enough to step out of a blip without piling
+ * on. Callers pass `retry: false` to disable it entirely: the discovery GETs do
+ * (§1c), because retrying a stall-throttled burst only deepens the throttle.
+ * Never retries API rejections, and never retries once the caller's signal has
+ * aborted.
  */
 async function getText(url: string, opts: GetOpts = {}): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxAttempts = opts.retry === false ? 1 : 2;
   let lastErr: unknown;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (attempt > 0) {
       await sleep(300 + Math.floor(Math.random() * 500), opts.signal);
     }
@@ -363,6 +377,7 @@ export async function getAddressStats(
   const raw = await getJson<unknown>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}`, {
     signal,
     timeoutMs: DISCOVERY_TIMEOUT_MS,
+    retry: false,
   });
   const obj = asObject(raw, 'address stats');
   const chain = asObject(obj['chain_stats'], 'chain_stats');
@@ -394,7 +409,7 @@ export async function getUtxos(
 ): Promise<ApiUtxo[]> {
   const raw = await getJson<unknown>(
     `${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/utxo`,
-    { signal, timeoutMs: DISCOVERY_TIMEOUT_MS },
+    { signal, timeoutMs: DISCOVERY_TIMEOUT_MS, retry: false },
   );
   const arr = asArray(raw, 'utxo list');
   return arr.map((entry) => {
@@ -479,7 +494,7 @@ export async function getAddressTxs(
 ): Promise<AddressTx[]> {
   const raw = await getJson<unknown>(
     `${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/txs`,
-    { signal, timeoutMs: DISCOVERY_TIMEOUT_MS },
+    { signal, timeoutMs: DISCOVERY_TIMEOUT_MS, retry: false },
   );
   const arr = asArray(raw, 'tx list');
   return arr.map((entry) => {

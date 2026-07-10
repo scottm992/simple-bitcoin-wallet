@@ -13,7 +13,9 @@ import {
   getFeeEstimates,
   getAddressStats,
   getUtxos,
+  getAddressTxs,
   getBtcUsdPrice,
+  ApiNetworkError,
   ApiResponseError,
   MAX_ACCEPTED_FEE_RATE,
   MIN_ACCEPTED_FEE_RATE,
@@ -143,5 +145,43 @@ describe('getBtcUsdPrice — response validation (F2)', () => {
   it('accepts a plausible price', async () => {
     mockFetchJson({ USD: 62_500 });
     await expect(getBtcUsdPrice()).resolves.toBe(62_500);
+  });
+});
+
+// --- §1c: discovery GETs must NOT retry; other GETs still do ----------------
+
+describe('discovery-GET retry policy (§1c)', () => {
+  it('getAddressStats does NOT retry a transport failure — one attempt, then throws', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('connection stalled');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(getAddressStats('mainnet', 'bc1qexample')).rejects.toBeInstanceOf(ApiNetworkError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('getUtxos and getAddressTxs also do not retry (one attempt each)', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('connection stalled');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(getUtxos('mainnet', 'bc1qexample')).rejects.toBeInstanceOf(ApiNetworkError);
+    await expect(getAddressTxs('mainnet', 'bc1qexample')).rejects.toBeInstanceOf(ApiNetworkError);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // exactly one per call, no retry
+  });
+
+  it('getFeeEstimates STILL retries once on a transport blip (non-discovery GET)', async () => {
+    let n = 0;
+    const fetchMock = vi.fn(async () => {
+      n += 1;
+      if (n === 1) throw new TypeError('transient blip');
+      return new Response(JSON.stringify({ fastestFee: 5, halfHourFee: 3, hourFee: 1 }), {
+        status: 200,
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const fees = await getFeeEstimates('mainnet');
+    expect(fees.fast).toBe(5);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // retried once, then succeeded
   });
 });

@@ -33,19 +33,73 @@ export interface AccountApi {
 }
 
 /**
- * A run-scoped response cache shared between the fast phase-1 scan and the full
- * phase-2 scan of one discovery run, so phase 2 only pays for the EXTENSION of
- * the scan window rather than re-fetching everything phase 1 already saw.
+ * Default per-entry lifetime for a {@link ScanCache}, in milliseconds. Long
+ * enough that a run cut by the deadline can RESUME within a tick or two paying
+ * only for the remainder (the heart of the v1.1.1 fix), short enough that a
+ * cached "unused" response can't mask a landed payment for long — and every
+ * change signal invalidates the cache outright regardless (see the
+ * cross-run cache owner + invalidation API in `actions.ts`). ~100s sits inside
+ * the 90–120s band the hotfix brief specifies.
  */
-export interface ScanCache {
-  readonly stats: Map<string, AddressStats>;
-  readonly utxos: Map<string, ApiUtxo[]>;
-  readonly txs: Map<string, AddressTx[]>;
+export const SCAN_CACHE_TTL_MS = 100_000;
+
+/** One cached response, stamped with the time it was stored, for TTL expiry. */
+interface CacheEntry<T> {
+  readonly value: T;
+  readonly storedAt: number;
 }
 
-/** Creates an empty {@link ScanCache} for one discovery run. */
-export function createScanCache(): ScanCache {
-  return { stats: new Map(), utxos: new Map(), txs: new Map() };
+/**
+ * A response cache shared between the fast phase-1 scan and the full phase-2
+ * scan, so phase 2 only pays for the EXTENSION of the scan window rather than
+ * re-fetching everything phase 1 already saw.
+ *
+ * v1.1.1: this cache now also survives ACROSS runs (the owner in `actions.ts`
+ * holds one per network in memory — never persisted, see the handoff §7/§8), so
+ * a run the deadline cut at 25/40 resumes and pays only the remaining ~15
+ * instead of restarting the 40-request burst forever. Two invariants keep that
+ * safe: every entry carries a {@link SCAN_CACHE_TTL_MS} TTL (a stale response is
+ * ignored and re-fetched), and any on-chain change signal must call the owner's
+ * invalidation API — a cached "unused" response must never un-detect a payment
+ * the cheap poll just found.
+ */
+export interface ScanCache {
+  readonly stats: Map<string, CacheEntry<AddressStats>>;
+  readonly utxos: Map<string, CacheEntry<ApiUtxo[]>>;
+  readonly txs: Map<string, CacheEntry<AddressTx[]>>;
+  /** Per-entry lifetime in ms; a hit older than this is ignored (re-fetched). */
+  readonly ttlMs: number;
+  /** Clock source, injectable for tests; defaults to `Date.now`. */
+  readonly now: () => number;
+  /** Drops every cached entry — call on ANY change signal (see `actions.ts`). */
+  clear(): void;
+}
+
+/**
+ * Creates an empty {@link ScanCache}. `ttlMs`/`now` are injectable for tests;
+ * production uses {@link SCAN_CACHE_TTL_MS} and the wall clock.
+ */
+export function createScanCache(
+  ttlMs: number = SCAN_CACHE_TTL_MS,
+  // Looked up at call time (not captured) so a cache created once at module
+  // scope still reads the live clock — including a test's fake timers.
+  now: () => number = () => Date.now(),
+): ScanCache {
+  const stats = new Map<string, CacheEntry<AddressStats>>();
+  const utxos = new Map<string, CacheEntry<ApiUtxo[]>>();
+  const txs = new Map<string, CacheEntry<AddressTx[]>>();
+  return {
+    stats,
+    utxos,
+    txs,
+    ttlMs,
+    now,
+    clear(): void {
+      stats.clear();
+      utxos.clear();
+      txs.clear();
+    },
+  };
 }
 
 /** Known highest USED index per chain from a previous scan (-1 = none known). */
@@ -359,30 +413,38 @@ export async function discoverAccount(
 }
 
 /**
- * Wraps an {@link AccountApi} with a run-scoped cache so the second (full)
- * phase of a discovery run never re-fetches what the first (fast) phase saw.
+ * Wraps an {@link AccountApi} with a {@link ScanCache} so a scan never re-fetches
+ * a response that is still fresh — within one run (phase 2 reusing phase 1) and,
+ * for the cross-run cache, across runs (a resumed run pays only the remainder).
+ * A hit older than the cache's TTL is ignored and re-fetched, so a stale
+ * "unused" answer can never be served past its lifetime.
  */
 function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
+  /** Returns a still-fresh cached value, or undefined (miss or expired). */
+  function fresh<T>(entry: CacheEntry<T> | undefined): T | undefined {
+    if (entry === undefined) return undefined;
+    return cache.now() - entry.storedAt < cache.ttlMs ? entry.value : undefined;
+  }
   return {
     getAddressStats: async (network, address, signal) => {
-      const hit = cache.stats.get(address);
+      const hit = fresh(cache.stats.get(address));
       if (hit !== undefined) return hit;
       const value = await api.getAddressStats(network, address, signal);
-      cache.stats.set(address, value);
+      cache.stats.set(address, { value, storedAt: cache.now() });
       return value;
     },
     getUtxos: async (network, address, signal) => {
-      const hit = cache.utxos.get(address);
+      const hit = fresh(cache.utxos.get(address));
       if (hit !== undefined) return hit;
       const value = await api.getUtxos(network, address, signal);
-      cache.utxos.set(address, value);
+      cache.utxos.set(address, { value, storedAt: cache.now() });
       return value;
     },
     getAddressTxs: async (network, address, signal) => {
-      const hit = cache.txs.get(address);
+      const hit = fresh(cache.txs.get(address));
       if (hit !== undefined) return hit;
       const value = await api.getAddressTxs(network, address, signal);
-      cache.txs.set(address, value);
+      cache.txs.set(address, { value, storedAt: cache.now() });
       return value;
     },
   };

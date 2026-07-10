@@ -100,3 +100,65 @@ describe('Home — "checking for updates" cue (F12)', () => {
     expect(container.textContent).not.toContain(strings.home.stillChecking);
   });
 });
+
+/** Renders Home with full control over account + status. */
+async function renderHomeStatus(
+  account: AccountSnapshot | null,
+  accountStatus: 'idle' | 'loading' | 'ready' | 'error',
+): Promise<void> {
+  await act(async () => {
+    root = createRoot(container);
+    root.render(
+      <Home
+        network="mainnet"
+        account={account}
+        accountStatus={accountStatus}
+        accountComplete={true}
+        btcUsd={60_000}
+        unit="usd"
+        onCycleUnit={() => {}}
+        firstVisit={false}
+        onReceive={() => {}}
+        onSend={() => {}}
+        onSeeAll={() => {}}
+        onOpenActivity={() => {}}
+        onSettings={() => {}}
+        onRefresh={() => {}}
+      />,
+    );
+  });
+}
+
+const EMPTY_ACCOUNT: AccountSnapshot = {
+  ...ACCOUNT,
+  confirmedSats: 0n,
+  pendingSats: 0n,
+};
+
+describe('Home — no empty-nudge/activity swap during a background refresh (§1e)', () => {
+  it('keeps the empty-wallet nudge when a background refresh flips status to loading', async () => {
+    await renderHomeStatus(EMPTY_ACCOUNT, 'ready');
+    expect(container.textContent).toContain(strings.home.emptyBalanceHeading);
+    expect(container.textContent).not.toContain(strings.home.recentActivity);
+
+    // The 30s poll refresh flips accountStatus to 'loading' while KEEPING the
+    // account snapshot. Pre-§1e this swapped the empty nudge for the activity
+    // block (the symptom-4 flicker); now isEmpty is derived from the account, so
+    // the layout holds.
+    await act(async () => root.unmount());
+    await renderHomeStatus(EMPTY_ACCOUNT, 'loading');
+    expect(container.textContent).toContain(strings.home.emptyBalanceHeading);
+    expect(container.textContent).not.toContain(strings.home.recentActivity);
+  });
+
+  it('keeps the activity block for a funded wallet during a background refresh', async () => {
+    await renderHomeStatus(ACCOUNT, 'ready');
+    expect(container.textContent).toContain(strings.home.recentActivity);
+    expect(container.textContent).not.toContain(strings.home.emptyBalanceHeading);
+
+    await act(async () => root.unmount());
+    await renderHomeStatus(ACCOUNT, 'loading');
+    expect(container.textContent).toContain(strings.home.recentActivity);
+    expect(container.textContent).not.toContain(strings.home.emptyBalanceHeading);
+  });
+});

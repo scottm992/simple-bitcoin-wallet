@@ -65,7 +65,7 @@ the mnemonic in at call time and let it go out of scope.
 
 ## `api.ts` — mempool.space REST client
 
-Every call takes `network: Network` first. GETs retry once on transport failure after a short jittered backoff (300–800 ms); broadcast never retries. Discovery GETs (stats/utxos/txs) use an 8s timeout and accept an optional `AbortSignal` so a whole discovery run can be cancelled; other calls use 15s.
+Every call takes `network: Network` first. Non-discovery GETs (fees / price / one-tx fetch) retry once on transport failure after a short jittered backoff (300–800 ms). **Discovery GETs (stats/utxos/txs) do NOT retry (§1c, v1.1.1)** — against a stall-throttler a per-request retry just doubles offered load; the run-level self-heal is their retry. Broadcast never retries. Discovery GETs use an 8s timeout and accept an optional `AbortSignal` so a whole discovery run can be cancelled; other calls use 15s.
 
 **Types**
 - `AddressStats { confirmedSats; pendingSats; fundedSats; spentSats }` (all `bigint`)
@@ -155,31 +155,64 @@ is single-flight, budget-limited, and deadline-bounded. Any change touching
 discovery must preserve this pattern (see review rounds 5–6, F12/F13).
 
 **Constants**: `FAST_GAP_LIMIT = 5` (phase 1), `FULL_GAP_LIMIT = 20` (phase 2,
-BIP44/F8), `DISCOVERY_DEADLINE_MS = 20_000`, `POLL_CONCURRENCY = 4`.
+BIP44/F8), `DISCOVERY_DEADLINE_MS = 20_000` (do NOT raise — a bigger deadline
+just increases offered load), `POLL_CONCURRENCY = 4`. **Backoff ladder (§1a):**
+`BACKOFF_BASE_MS = 30_000`, `BACKOFF_CAP_MS = 480_000` (~8m), `MAX_BACKOFF_LEVEL
+= 8`, `BACKOFF_JITTER_MS = 10_000`.
+
+**Cross-run scan cache (§1b, v1.1.1) — the heart of the self-DoS fix.** One
+`ScanCache` per network (`account.ts`), held in module memory ONLY — **never
+localStorage / disk / across sessions**. Because it survives across runs, a run
+the deadline cut at 25/40 RESUMES and pays only the remaining ~15 instead of
+re-bursting all 40 forever; the scan converges across attempts. Two safeguards
+keep it honest: every entry carries a `SCAN_CACHE_TTL_MS` (~100s) TTL (a stale
+response is ignored and re-fetched), and **every on-chain change signal must
+call `invalidateScanCache(network?)`** — a cached "unused" answer must never
+un-detect a payment the poll just found (§7). Invalidation call sites: the cheap
+poll detecting movement (BEFORE the refresh it triggers), a successful broadcast
+(`signAndBroadcast`/`bumpAndBroadcast`), a network switch (the target network),
+and lock (all networks, no arg). `pollAccount` reads `getAddressStats` directly
+(UNCACHED) so it always sees fresh movement. Phase 2 still EVALUATES every index
+from 0 (F12) — only response reuse changes; `complete=true` only ever comes from
+a full gap-20 evaluation.
 
 - `startDiscovery({ network, onSnapshot, onError, deadlineMs? }): DiscoveryHandle`
   — one two-phase run. **Phase 1** (first paint): fast gap-5 scan anchored at the
   cached high-water marks. **Phase 2** (correctness): extends to the full gap-20
-  scan from index 0, reusing every phase-1 response via a run-scoped `ScanCache`
-  (only the window extension costs new requests). `onSnapshot(snapshot, complete)`
-  fires per phase — `complete` is `false` for phase 1, `true` for phase 2 (F12;
-  the UI keeps a "Checking for updates…" cue while only an incomplete snapshot is
-  on screen). The run settles deterministically at the deadline: a landed phase-1
-  result is kept; with no result at all, `onError` fires — the skeleton is never
-  open-ended. `DiscoveryHandle { done: Promise<void>; abort(): void }` — `abort()`
-  cancels every in-flight request and silences the run: a superseded run never
-  dispatches a snapshot or an error, even if a phase had already resolved with its
-  continuation still queued (F13).
+  scan from index 0, reusing every response still fresh in the per-network
+  `ScanCache` (only genuinely-new addresses cost requests — within the run AND
+  across a resumed run). `onSnapshot(snapshot, complete)` fires per phase —
+  `complete` is `false` for phase 1, `true` for phase 2 (F12; the UI keeps a
+  "Checking for updates…" cue while only an incomplete snapshot is on screen,
+  INCLUDING while backed off). The run settles deterministically at the deadline:
+  a landed phase-1 result is kept; with no result at all, `onError` fires — the
+  skeleton is never open-ended. `DiscoveryHandle { done: Promise<void>; abort():
+  void }` — `abort()` cancels every in-flight request and silences the run: a
+  superseded run never dispatches a snapshot or an error, even if a phase had
+  already resolved with its continuation still queued (F13). `abort()` does NOT
+  clear the cache — a superseding manual refresh must be able to resume.
+- `invalidateScanCache(network?)` — clears the per-network cache (or all networks
+  with no arg). The load-bearing invalidation API (see the cross-run-cache note).
 - `pollAccount(network, account, signal?): Promise<boolean>` — the cheap 30-second
   poll. Re-checks ONLY known-used addresses plus the two tips (budget: a fresh
-  wallet costs 2 requests), never a rescan; `true` ⇒ caller should full-refresh.
+  wallet costs 2 requests), never a rescan, UNCACHED; `true` ⇒ caller should
+  full-refresh.
 - `DiscoveryController` — the single-flight coordinator; one instance app-wide
-  (`App.tsx` `discoveryRef`). `refresh(params)` aborts any in-flight run and starts
-  fresh. `pollTick(params)` is skipped entirely (zero requests) while a run or a
-  prior poll is in flight — 30s ticks can never pile bursts onto a slow crawl; when
-  the on-screen snapshot is incomplete it self-heals by requesting a full refresh
-  instead of polling (F12). `abort()` on lock/unmount/network switch — on a network
-  switch, call it synchronously BEFORE dispatching `setNetwork` (F13). `busy: boolean`.
+  (`App.tsx` `discoveryRef`). `refresh(params)` — the MANUAL path (Try again /
+  unlock / network switch / post-broadcast) — aborts any in-flight run and starts
+  fresh; it is ALWAYS instant, never gated. Its OUTCOME feeds the backoff ladder:
+  a completed (phase-2) snapshot resets it, an error or a deadline-cut incomplete
+  run escalates it (a superseded run touches neither). `pollTick(params)` — the
+  AUTOMATIC path — is skipped (zero requests) while a run or a prior poll is in
+  flight AND while the ladder says we're not yet eligible (§1a: 30s → 1m → 2m →
+  4m → cap ~8m, +jitter), so a stalled run can't fire a second run within the
+  window and a wedged network's offered load DECAYS. Once eligible: an incomplete
+  snapshot self-heals via a full refresh (which resumes from the cache, no
+  invalidation); otherwise it runs the cheap check and, on detected movement,
+  invalidates the cache then fires `onChanged`. The App's 30s interval stays a
+  dumb clock — the controller decides whether a tick may act. `abort()` on
+  lock/unmount/network switch — on a network switch, call it synchronously BEFORE
+  dispatching `setNetwork` (F13). `busy: boolean`.
 - `loadAccount(network)` — one full single-phase discovery (no deadline/phases).
 - Also here: `loadPrice()` (null on failure — offline-tolerant), `loadFees(network)`,
   `feeRateForTier(fees, tier)` — second independent clamp into

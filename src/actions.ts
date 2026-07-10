@@ -31,6 +31,7 @@ import {
   type ApiTxVout,
   type FeeEstimates,
   type Network,
+  type ScanCache,
   type WalletUtxo,
 } from './lib';
 import type { AddressDeriver } from './lib/account';
@@ -49,6 +50,33 @@ const DISCOVERY_DEADLINE_MS = 20_000;
 /** Concurrency for the cheap poll's stats re-checks. */
 const POLL_CONCURRENCY = 4;
 
+// ---------------------------------------------------------------------------
+// Automatic-refresh backoff ladder (§1a/§1f, v1.1.1)
+//
+// The App's 30s interval is a dumb clock; THIS controller decides whether an
+// automatic (self-heal / poll-triggered) tick may act. A run that ends in error
+// or is cut incomplete escalates the ladder; any successful complete (phase-2)
+// snapshot resets it. The gate sits ONLY on the automatic path — a manual
+// refresh (Try again / unlock / network switch / post-broadcast) is always
+// instant. Without this, an empty wallet re-fired its full 40-request burst
+// every 30s forever, deepening mempool.space's stall-throttle into a self-DoS.
+// ---------------------------------------------------------------------------
+
+/** Base cadence of the automatic path — matches the App's 30s clock. */
+const BACKOFF_BASE_MS = 30_000;
+
+/** Ceiling on the automatic backoff interval (~8 minutes). */
+const BACKOFF_CAP_MS = 480_000;
+
+/** Escalation level cap (guards the `2 ** level` term; the interval caps sooner). */
+const MAX_BACKOFF_LEVEL = 8;
+
+/**
+ * Additive jitter (0..this) on each backoff interval, to de-correlate our retry
+ * cadence from mempool.space's own throttle window so we don't lock-step into it.
+ */
+const BACKOFF_JITTER_MS = 10_000;
+
 /**
  * The concrete api object passed into discovery. We import the named functions
  * from the barrel and shape them into the AccountApi interface.
@@ -58,6 +86,52 @@ const accountApi = {
   getUtxos,
   getAddressTxs,
 };
+
+// ---------------------------------------------------------------------------
+// Cross-run scan cache (§1b, v1.1.1) — the heart of the fix.
+//
+// One ScanCache per network, held in module memory ONLY (NEVER localStorage /
+// disk / across sessions — handoff §7/§8). Because it survives across runs, a
+// run the deadline cut at 25/40 RESUMES and pays only the remaining ~15 instead
+// of restarting the whole 40-request burst forever: the scan converges across
+// attempts. Two safeguards keep it honest — each entry has a TTL
+// (SCAN_CACHE_TTL_MS), and EVERY on-chain change signal must invalidate it via
+// {@link invalidateScanCache}. Keyed per network (F13) so a Live response can
+// never be reused on Practice or vice versa.
+// ---------------------------------------------------------------------------
+
+const scanCaches = new Map<Network, ScanCache>();
+
+/** The (persistent, in-memory) scan cache for a network, created on first use. */
+function scanCacheFor(network: Network): ScanCache {
+  let cache = scanCaches.get(network);
+  if (cache === undefined) {
+    cache = createScanCache();
+    scanCaches.set(network, cache);
+  }
+  return cache;
+}
+
+/**
+ * Invalidates cached discovery responses. This MUST be called on every on-chain
+ * change signal, because a cached "unused" response could otherwise mask a
+ * landed payment — and, worse, a poll-detected change followed by a cached
+ * rescan would *un-detect* it (handoff §7). Call sites:
+ *  - the cheap poll detecting movement — BEFORE it triggers the full refresh;
+ *  - a successful broadcast (signAndBroadcast / bumpAndBroadcast);
+ *  - a network switch (the target network, from `App.switchNetwork`);
+ *  - lock (all networks, from `App`'s lock handler).
+ *
+ * With no argument, clears every network's cache (lock / logout). This never
+ * touches disk — the caches are in-memory only.
+ */
+export function invalidateScanCache(network?: Network): void {
+  if (network === undefined) {
+    for (const cache of scanCaches.values()) cache.clear();
+    return;
+  }
+  scanCaches.get(network)?.clear();
+}
 
 /**
  * Builds a pure address deriver that closes over the current mnemonic. The
@@ -130,7 +204,10 @@ export function startDiscovery(params: {
     try {
       const derive = makeDeriver(network);
       const highWater = getCachedHighWater(network) ?? undefined;
-      const cache = createScanCache();
+      // §1b: the PERSISTENT per-network cache, not a fresh per-run one. A run
+      // the deadline cut short leaves its landed responses here, so the next
+      // run resumes and pays only the remainder instead of re-bursting all 40.
+      const cache = scanCacheFor(network);
       const shared = {
         ...(highWater !== undefined ? { highWater } : {}),
         signal: controller.signal,
@@ -216,24 +293,43 @@ export async function pollAccount(
 }
 
 /**
- * Single-flight coordinator for discovery + polling (Bug A):
+ * Single-flight coordinator for discovery + polling (Bug A + v1.1.1):
  * - at most ONE full discovery run in flight; a new `refresh` aborts the old
  *   run and starts fresh (Try again / unlock / network switch semantics);
  * - `pollTick` is skipped entirely while a discovery or a previous poll is
- *   still running, so 30s ticks can never pile bursts on top of a slow crawl.
+ *   still running, so 30s ticks can never pile bursts on top of a slow crawl;
+ * - the AUTOMATIC path (self-heal / poll) is gated by an exponential backoff
+ *   ladder (§1a/§1f): a run that ends in error or is cut incomplete escalates
+ *   it, any successful complete snapshot resets it, and while backed off the
+ *   automatic tick issues ZERO requests so offered load decays instead of
+ *   growing. `refresh` — the MANUAL path — is never gated.
  *
- * Headless (no React) so the piling/skipping behavior is directly testable.
+ * Headless (no React) so the piling/skipping/backoff behavior is directly
+ * testable.
  */
 export class DiscoveryController {
   private current: DiscoveryHandle | null = null;
   private pollBusy = false;
+
+  /** Backoff ladder state (§1a). Level 0 = healthy; the automatic path is
+   *  suppressed until `Date.now() >= nextEligibleAt`. Manual refresh ignores
+   *  both — it always runs now. */
+  private backoffLevel = 0;
+  private nextEligibleAt = 0;
 
   /** True while a full discovery run is in flight. */
   get busy(): boolean {
     return this.current !== null;
   }
 
-  /** Aborts any in-flight run and starts a fresh two-phase discovery. */
+  /**
+   * Aborts any in-flight run and starts a fresh two-phase discovery. This is
+   * the MANUAL path (Try again / unlock / network switch / post-broadcast) — it
+   * is ALWAYS instant and never gated by the backoff ladder. Its OUTCOME still
+   * feeds the ladder, though: a completed full snapshot resets it, an error or a
+   * deadline-cut incomplete run escalates it — so the automatic path that shares
+   * this controller backs off (or recovers) based on what actually happened.
+   */
   refresh(params: {
     network: Network;
     onSnapshot: (snapshot: AccountSnapshot, complete: boolean) => void;
@@ -241,20 +337,39 @@ export class DiscoveryController {
     deadlineMs?: number;
   }): void {
     this.current?.abort();
-    const handle = startDiscovery(params);
+    // Observe whether this run produces a COMPLETE (phase-2) snapshot, to drive
+    // the ladder when it settles.
+    let sawComplete = false;
+    const handle = startDiscovery({
+      ...params,
+      onSnapshot: (snapshot, complete) => {
+        if (complete) sawComplete = true;
+        params.onSnapshot(snapshot, complete);
+      },
+    });
     this.current = handle;
     void handle.done.finally(() => {
-      if (this.current === handle) this.current = null;
+      // A superseded run (replaced by a newer refresh, or cleared by abort())
+      // must not touch the ladder — its replacement owns the state now.
+      if (this.current !== handle) return;
+      this.current = null;
+      if (sawComplete) this.resetBackoff();
+      else this.escalateBackoff();
     });
   }
 
   /**
-   * One cheap poll tick. Skipped (zero requests) while a discovery run or a
-   * previous poll is still in flight. When the snapshot on screen is
-   * INCOMPLETE (a deadline/abort cut phase 2 short, F12), the tick self-heals
-   * by requesting a full refresh instead of the cheap check. Otherwise it runs
-   * the cheap used+tips check and fires `onChanged` when money moved — the
-   * caller reacts to both by scheduling a full refresh.
+   * One cheap poll tick — the AUTOMATIC path. Skipped (zero requests) while a
+   * discovery run or a previous poll is still in flight, AND while the backoff
+   * ladder says we're not yet eligible (§1a): a stalled run cannot cause a
+   * second run within the backoff window, and a wedged network sees offered load
+   * decay instead of grow. Once eligible:
+   *  - an INCOMPLETE on-screen snapshot (a deadline/abort cut phase 2 short,
+   *    F12) self-heals by requesting a full refresh (which RESUMES via the
+   *    cross-run cache — see §1b); it does NOT invalidate the cache;
+   *  - otherwise it runs the cheap used+tips check and, when money moved,
+   *    invalidates the cache (§1b — so the following rescan re-fetches the moved
+   *    address fresh and can never un-detect the change) and fires `onChanged`.
    */
   pollTick(params: {
     network: Network;
@@ -264,16 +379,27 @@ export class DiscoveryController {
     onChanged: () => void;
   }): void {
     if (this.current !== null || this.pollBusy) return;
+    // Backoff gate: while degraded, the automatic path issues NOTHING — not even
+    // the 2-request cheap poll — so a wedged network's offered load decays.
+    if (Date.now() < this.nextEligibleAt) return;
     if (!params.accountComplete) {
       // Self-heal: the last run never finished its full scan. Complete it now
-      // (this tick issues zero requests itself; the refresh does the work).
+      // (this tick issues zero requests itself; the refresh does the work, and
+      // RESUMES from the cross-run cache rather than re-bursting). No cache
+      // invalidation — resuming is the whole point.
       params.onChanged();
       return;
     }
     this.pollBusy = true;
     void pollAccount(params.network, params.account)
       .then((changed) => {
-        if (changed) params.onChanged();
+        if (changed) {
+          // Something moved on-chain: the cached responses for the moved
+          // address are now stale. Invalidate BEFORE triggering the refresh so
+          // the rescan fetches it fresh and can never un-detect the change (§7).
+          invalidateScanCache(params.network);
+          params.onChanged();
+        }
       })
       .catch(() => {
         /* transient network failure — the next tick simply tries again */
@@ -283,10 +409,28 @@ export class DiscoveryController {
       });
   }
 
-  /** Aborts any in-flight discovery run (e.g. on lock / unmount). */
+  /** Aborts any in-flight discovery run (e.g. on lock / unmount / network
+   *  switch). Does NOT invalidate the cross-run cache — that is a separate
+   *  signal (a superseding manual refresh must be able to RESUME) — nor does it
+   *  touch the ladder (a superseded run is not a real outcome). */
   abort(): void {
     this.current?.abort();
     this.current = null;
+  }
+
+  /** Escalates the automatic-refresh backoff one rung: 30s → 1m → 2m → 4m →
+   *  cap ~8m, plus jitter. Called when a run errors or is cut incomplete. */
+  private escalateBackoff(): void {
+    this.backoffLevel = Math.min(this.backoffLevel + 1, MAX_BACKOFF_LEVEL);
+    const interval = Math.min(BACKOFF_BASE_MS * 2 ** this.backoffLevel, BACKOFF_CAP_MS);
+    this.nextEligibleAt = Date.now() + interval + Math.floor(Math.random() * BACKOFF_JITTER_MS);
+  }
+
+  /** Resets the ladder to healthy — the automatic path may act on the next
+   *  tick. Called whenever a full (complete) snapshot lands. */
+  private resetBackoff(): void {
+    this.backoffLevel = 0;
+    this.nextEligibleAt = 0;
   }
 }
 
@@ -375,6 +519,10 @@ export async function signAndBroadcast(params: {
     allowHighFee: params.allowHighFee,
   });
   const txid = await broadcastTx(params.network, built.txHex);
+  // §1b: a broadcast changes our UTXO set and balances, so every cached
+  // discovery response for this network is now potentially stale. Invalidate so
+  // the post-send refresh re-fetches fresh rather than reusing pre-send data.
+  invalidateScanCache(params.network);
   // The recipient-output value, exactly: inputs − fee − change covers normal
   // sends, sendMax sweeps, and the dust-fold alike.
   const sendRecorded = recordSend(params.network, txid, {
@@ -648,6 +796,9 @@ export async function bumpAndBroadcast(params: {
     allowHighFee: params.allowHighFee,
   });
   const txid = await broadcastTx(params.network, built.txHex);
+  // §1b: same as signAndBroadcast — a broadcast (here, the replacement) moves
+  // our chain state, so drop the stale cached responses for this network.
+  invalidateScanCache(params.network);
   const sendRecorded = recordSend(params.network, txid, {
     recipient: params.prepared.recipient,
     // The replacement's actual recipient-output value (inputs − fee − change):
