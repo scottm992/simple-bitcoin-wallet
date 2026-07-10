@@ -527,9 +527,22 @@ export async function getFeeEstimates(network: Network): Promise<FeeEstimates> {
 
 /**
  * Broadcasts a raw signed transaction. Does not retry.
+ *
+ * F19: the returned string is the RELAY'S ECHO of the txid (an Esplora relay
+ * answers a successful POST /tx with the txid as plain text) — callers must
+ * NEVER treat it as the authoritative transaction id. The txid is derivable
+ * locally from the signed bytes (`BuiltTx.txid`, tx.ts), and trusting a remote
+ * echo for a locally-derivable fact violates the F15
+ * never-trust-the-API-for-derivable-facts principle: a hostile relay could
+ * return a wrong/garbage id, poisoning the displayed id and mis-keying the F15
+ * send record. The broadcast paths in `actions.ts` therefore use `built.txid`
+ * for the record and the returned {@link BroadcastResult}; the body is kept
+ * ONLY for error surfacing on non-2xx (unchanged) and as a diagnostic echo — a
+ * divergent echo on success is deliberately NOT a failure mode.
+ *
  * @param network - The active network.
  * @param txHex - The serialized transaction (hex).
- * @returns The broadcast transaction id.
+ * @returns The relay's response body (its echo of the txid) — diagnostics only.
  * @throws {ApiResponseError} With the API's error text on rejection.
  * @throws {ApiNetworkError} On transport failure.
  */
@@ -543,7 +556,7 @@ export async function broadcastTx(network: Network, txHex: string): Promise<stri
   if (!res.ok) {
     throw new ApiResponseError(res.status, body);
   }
-  return body; // Esplora (mempool.space / blockstream.info) returns the txid as plain text
+  return body; // the relay's txid echo — never authoritative (F19, see above)
 }
 
 /**

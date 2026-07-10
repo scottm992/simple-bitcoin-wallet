@@ -764,7 +764,15 @@ export function feeRateForTier(fees: FeeEstimates, tier: FeeTier): number {
  * the Speed-up flow's verification baseline (F15) — was persisted.
  */
 export interface BroadcastResult {
-  /** The broadcast transaction id. */
+  /**
+   * The broadcast transaction id — computed LOCALLY from the signed bytes
+   * (`BuiltTx.txid`, F19), never taken from the relay's response. The txid is
+   * derivable from what we signed, so trusting a remote echo for it would
+   * violate the F15 never-trust-the-API-for-derivable-facts principle: a
+   * hostile relay returning a wrong/garbage body would otherwise poison the
+   * displayed id AND mis-key the send record, silently voiding this payment's
+   * Speed-up coverage.
+   */
   readonly txid: string;
   /**
    * Whether the local send record (txid → recipient + amount, sendLog.ts) was
@@ -782,15 +790,23 @@ export interface BroadcastResult {
  * tx, broadcasts it, and returns the txid. The mnemonic is not returned.
  *
  * Idempotency: buildAndSignTx over the same UTXO set + params yields the same
- * signed tx, and mempool.space treats a re-broadcast of an already-accepted tx
- * as success (returns the same txid), so a retry cannot double-spend (and its
- * record write just rewrites identical data).
+ * signed tx, and an Esplora relay treats a re-broadcast of an already-accepted
+ * tx as success, so a retry cannot double-spend (and its record write just
+ * rewrites identical data).
  *
  * F15: immediately after a successful broadcast, the send is recorded locally
- * (returned txid → the USER-confirmed recipient + the exact amount the signed
- * tx pays them, from the engine's own accounting). This record is what lets
- * the Speed-up flow later prove the chain API isn't lying about where the
- * payment goes.
+ * (txid → the USER-confirmed recipient + the exact amount the signed tx pays
+ * them, from the engine's own accounting). This record is what lets the
+ * Speed-up flow later prove the chain API isn't lying about where the payment
+ * goes.
+ *
+ * F19: the txid used for the record AND the returned {@link BroadcastResult} is
+ * the LOCALLY computed `built.txid` (deterministic from the signed bytes) — the
+ * relay's response body is a diagnostic echo only, never an identifier. The
+ * txid is derivable from what we signed; trusting a remote echo for a derivable
+ * fact violates the F15 principle, and a hostile relay's wrong/garbage echo
+ * would mis-key the record and silently void Speed-up coverage. A divergent
+ * echo on success is NOT a failure mode — ours is simply authoritative.
  */
 export async function signAndBroadcast(params: {
   network: Network;
@@ -816,18 +832,21 @@ export async function signAndBroadcast(params: {
     sendMax: params.sendMax,
     allowHighFee: params.allowHighFee,
   });
-  const txid = await broadcastTx(params.network, built.txHex);
+  // F19: the response body (the relay's txid echo) is deliberately IGNORED as an
+  // identifier — broadcastTx still reads it for error surfacing on non-2xx, but
+  // on success the authoritative txid is built.txid (see the doc comment above).
+  await broadcastTx(params.network, built.txHex);
   // §1b: a broadcast changes our UTXO set and balances, so every cached
   // discovery response for this network is now potentially stale. Invalidate so
   // the post-send refresh re-fetches fresh rather than reusing pre-send data.
   invalidateScanCache(params.network);
   // The recipient-output value, exactly: inputs − fee − change covers normal
-  // sends, sendMax sweeps, and the dust-fold alike.
-  const sendRecorded = recordSend(params.network, txid, {
+  // sends, sendMax sweeps, and the dust-fold alike. Keyed by the LOCAL txid (F19).
+  const sendRecorded = recordSend(params.network, built.txid, {
     recipient: params.recipient,
     amountSats: built.totalInputSats - built.feeSats - built.changeSats,
   });
-  return { txid, sendRecorded };
+  return { txid: built.txid, sendRecorded };
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,18 +1080,24 @@ export async function prepareBump(
  * mnemonic at call time; never returns it.
  *
  * Idempotency: `buildRbfBumpTx` over the same prepared data + rate yields the
- * identical signed replacement (RFC6979 deterministic signatures), and
- * mempool.space treats a re-broadcast of an already-accepted tx as success —
+ * identical signed replacement (RFC6979 deterministic signatures), and an
+ * Esplora relay treats a re-broadcast of an already-accepted tx as success —
  * so a retry cannot double-spend (and rewrites an identical record).
  * `allowHighFee` bypasses only the 25% consent rule, never the hard
  * rate/absolute caps (F10).
  *
- * F15: the replacement gets its OWN send record under the returned txid — the
- * recipient comes from `prepared`, which `prepareBump` verified against the
+ * F15: the replacement gets its OWN send record under the replacement's txid —
+ * the recipient comes from `prepared`, which `prepareBump` verified against the
  * ORIGINAL's record, and the amount is the replacement's actual
  * recipient-output value (possibly reduced, for a sweep). A bump of a bump
  * therefore verifies against the replacement's own record, keeping the chain
  * of trust unbroken back to the user's original confirmation.
+ *
+ * F19: as in {@link signAndBroadcast}, the record key and the returned txid are
+ * the LOCALLY computed `built.txid` — the relay's echo is never trusted for a
+ * locally-derivable fact, so a hostile relay cannot mis-key the replacement's
+ * record (which would break the bump-of-a-bump chain above) or poison the
+ * displayed id.
  */
 export async function bumpAndBroadcast(params: {
   network: Network;
@@ -1093,15 +1118,17 @@ export async function bumpAndBroadcast(params: {
     feeRateSatVb: params.feeRateSatVb,
     allowHighFee: params.allowHighFee,
   });
-  const txid = await broadcastTx(params.network, built.txHex);
+  // F19: relay echo ignored as an identifier (error surfacing on non-2xx is
+  // unchanged inside broadcastTx); built.txid is authoritative — see the doc.
+  await broadcastTx(params.network, built.txHex);
   // §1b: same as signAndBroadcast — a broadcast (here, the replacement) moves
   // our chain state, so drop the stale cached responses for this network.
   invalidateScanCache(params.network);
-  const sendRecorded = recordSend(params.network, txid, {
+  const sendRecorded = recordSend(params.network, built.txid, {
     recipient: params.prepared.recipient,
     // The replacement's actual recipient-output value (inputs − fee − change):
     // unchanged when change absorbs the bump, reduced for a sweep.
     amountSats: built.totalInputSats - built.feeSats - built.changeSats,
   });
-  return { txid, sendRecorded };
+  return { txid: built.txid, sendRecorded };
 }

@@ -107,7 +107,7 @@ non-2xx.
 - `getAddressStats(network, address, signal?): Promise<AddressStats>`
 - `getUtxos(network, address, signal?): Promise<ApiUtxo[]>`
 - `getFeeEstimates(network): Promise<FeeEstimates>`
-- `broadcastTx(network, txHex): Promise<string>` — returns txid; surfaces API error text.
+- `broadcastTx(network, txHex): Promise<string>` — returns the RELAY'S ECHO of the txid, diagnostics only (**F19**: never authoritative — the true txid is the locally-computed `BuiltTx.txid`, which the `actions.ts` broadcast paths use for the F15 record and the returned `BroadcastResult`; a divergent echo on success is deliberately not a failure mode). Surfaces API error text on non-2xx (unchanged).
 - `getAddressTxs(network, address, signal?): Promise<AddressTx[]>`
 - `getTransaction(network, txid, signal?): Promise<ApiTransaction>` — one transaction by id (the Speed-up flow's data source; ONE request). The txid ARGUMENT is validated (64-hex) BEFORE the URL is built (status-400 `ApiResponseError`, no request made). F2 ingest validation on every consumed field: `status.confirmed` boolean; `fee` sat-range; `weight` positive integer ≤ 4M (vsize = `ceil(weight/4)`); vin/vout arrays 1–200 entries; per-vin 64-hex txid, non-negative vout, u32 `sequence`, no duplicate outpoints; sat-range values; length-capped address strings. `vin[].prevout` (absent on coinbase) and address fields (absent on nonstandard scripts) are OPTIONAL by type — the same esplora shape serves both networks (live-verified), so validation is never flaky across networks. Cross-field integrity: the response's txid must equal the request, and when every input carries a prevout, `fee` must equal inputs − outputs exactly.
   - `ApiTransaction { txid; confirmed; feeSats: bigint; weight; vsize; vin: ApiTxVin[]; vout: ApiTxVout[] }`; `ApiTxVin { txid; vout; sequence; prevout?: ApiTxPrevout }`; `ApiTxPrevout { value: bigint; address? }`; `ApiTxVout { value: bigint; address? }`
@@ -364,11 +364,15 @@ arriving mid-convergence is detected within one poll cycle.
   `[MIN_ACCEPTED_FEE_RATE, MAX_ACCEPTED_FEE_RATE]` (F1), and
   `signAndBroadcast(params): Promise<BroadcastResult>` — reads the mnemonic at
   call time, never returns it; idempotent on retry (same UTXO set + params ⇒
-  same signed tx; mempool.space treats re-broadcast of an accepted tx as
+  same signed tx; an Esplora relay treats re-broadcast of an accepted tx as
   success). `allowHighFee` bypasses only the 25% consent rule, never the hard
   rate/absolute caps (F10). After a successful broadcast it writes the F15 send
-  record (returned txid → user-confirmed recipient + exact recipient-output
-  amount). `BroadcastResult { txid; sendRecorded }` — `sendRecorded: false`
+  record, keyed by the **LOCALLY computed `built.txid`** (**F19** — never the
+  relay's echo; the txid is derivable from the signed bytes, so trusting a
+  remote echo for it would let a hostile relay mis-key the record and silently
+  void Speed-up coverage) → user-confirmed recipient + exact recipient-output
+  amount. `BroadcastResult { txid; sendRecorded }` — `txid` is that same local
+  `built.txid`; `sendRecorded: false`
   means the best-effort record write failed: the payment is unaffected but
   cannot later be sped up (`'unverified'`).
 - `prepareBump(network, txid, account, signal?): Promise<PreparedBump>` — the
@@ -399,7 +403,8 @@ arriving mid-convergence is detected within one poll cycle.
   `buildRbfBumpTx`, broadcasts. Same idempotency argument as `signAndBroadcast`
   (deterministic signatures ⇒ a retry re-broadcasts the identical replacement
   and rewrites an identical record). Writes the replacement's OWN F15 record
-  (returned txid → the verified recipient + the replacement's actual
+  (keyed by the LOCAL `built.txid`, F19 — same rule as `signAndBroadcast` — →
+  the verified recipient + the replacement's actual
   recipient-output amount, reduced for a sweep), so a bump of a bump verifies
   against the replacement's record — the chain of trust runs unbroken back to
   the user's original confirmation. The new fee rate comes from the existing

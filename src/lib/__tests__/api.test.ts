@@ -243,6 +243,29 @@ describe('HTTP 429 (v1.2.0)', () => {
   });
 });
 
+// --- F19: broadcast error surfacing is unchanged -----------------------------
+
+describe('broadcastTx — error surfacing (F19 non-regression)', () => {
+  it('a non-2xx rejection still carries the relay status AND body text exactly as before', async () => {
+    // F19 demotes the SUCCESS body to a diagnostic echo (actions.ts uses the
+    // locally computed BuiltTx.txid); the FAILURE body is still read and
+    // surfaced verbatim — no new failure mode, no changed one.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response('sendrawtransaction RPC error: bad-txns-inputs-missingorspent', {
+            status: 400,
+          }),
+      ),
+    );
+    await expect(broadcastTx('mainnet', 'deadbeef')).rejects.toMatchObject({
+      status: 400,
+      body: 'sendrawtransaction RPC error: bad-txns-inputs-missingorspent',
+    });
+  });
+});
+
 // --- §1c: discovery GETs must NOT retry; other GETs still do ----------------
 
 describe('discovery-GET retry policy (§1c)', () => {
