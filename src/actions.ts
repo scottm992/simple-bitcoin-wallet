@@ -44,8 +44,49 @@ const FAST_GAP_LIMIT = 5;
 /** Gap window for the full correctness scan (phase 2; BIP44 standard, F8). */
 const FULL_GAP_LIMIT = 20;
 
-/** Overall deadline for one discovery run: the skeleton is NEVER open-ended. */
-const DISCOVERY_DEADLINE_MS = 20_000;
+// ---------------------------------------------------------------------------
+// Progress-aware run deadline (v1.1.2) — replaces the single fixed 20s wall.
+//
+// Field report (owner's phone, 2026-07-10): a scan reached "22 of ~40", stopped
+// on the "may be behind" wait state for ~a minute, then finished. Diagnosis: the
+// network served slowly (a decaying mempool.space throttle — a stalled request
+// eats the 8s api timeout), and the FIXED 20s `DISCOVERY_DEADLINE_MS` cut the run
+// mid-phase-2. A single fixed wall can't tell "slow but still landing" from
+// "wedged": it guillotines a run that is genuinely making progress. Pacing the
+// run slower under that same wall would only cut it EARLIER — not the fix.
+//
+// Two timers now bound a run, both aborting the SAME AbortController the old
+// deadline used (so the settle semantics are unchanged — a landed phase-1 result
+// is kept, nothing → onError, a superseded run stays silent):
+//   • an INACTIVITY cutoff, reset by every landed api response, so a
+//     slow-but-MOVING run completes in ONE run and only a genuine stall is cut;
+//   • a HARD CAP that a run never outlives regardless of activity, preserving the
+//     round-5 F12 property that the run settles deterministically — the skeleton
+//     is NEVER open-ended.
+// ---------------------------------------------------------------------------
+
+/**
+ * Inactivity cutoff for a discovery run: it is aborted only after this long with
+ * NO api response landing. Every landed response resets it (via the engine's
+ * `onResponse` hook), so a network that serves each wave in a few seconds but
+ * keeps landing finishes the whole scan in one run instead of being cut at "22
+ * of ~40". Chosen at 12s — comfortably ABOVE the api layer's 8s per-request
+ * timeout (a single slow-but-successful request can't trip it) yet BELOW the old
+ * fixed 20s wall, so a true total stall is now cut FASTER than before, not slower.
+ */
+const DISCOVERY_INACTIVITY_MS = 12_000;
+
+/**
+ * Hard overall cap on a discovery run: it NEVER lives past this, regardless of
+ * activity. This is what preserves round-5 F12's load-bearing property now that
+ * the primary cutoff is activity-based — the run settles deterministically and
+ * the skeleton is never open-ended. Sized generously (2 min) so a genuinely
+ * slow-but-moving deep scan still completes in one run; a PATHOLOGICAL drip that
+ * keeps landing just inside the inactivity window forever is settled here. A
+ * capped run keeps its landed phase-1 result and resumes from the cross-run
+ * cache — it pays only the shrinking remainder, never a restart.
+ */
+const DISCOVERY_HARD_CAP_MS = 120_000;
 
 /** Concurrency for the cheap poll's stats re-checks. */
 const POLL_CONCURRENCY = 4;
@@ -76,6 +117,37 @@ const MAX_BACKOFF_LEVEL = 8;
  * cadence from mempool.space's own throttle window so we don't lock-step into it.
  */
 const BACKOFF_JITTER_MS = 10_000;
+
+/**
+ * Progress-gated quick retry (§b, v1.1.2). When a cut run made progress (landed
+ * ≥1 new response), the automatic self-heal becomes eligible again after just
+ * this long — far shorter than any full ladder rung — because the cross-run cache
+ * means the resume USUALLY pays only the shrinking remainder. ~8s: long enough
+ * not to hammer a recovering connection, short enough that the "may be behind"
+ * wait doesn't linger. HARD guardrails in
+ * {@link DiscoveryController.settleIncomplete} keep this from re-creating the
+ * v1.1.1 self-DoS: quick is granted ONLY on progress; a quick-retried run that
+ * lands NOTHING walks the full ladder; and — because progress alone is NOT proof
+ * of convergence (F18: against a partially-serving network, ~100s cache-TTL
+ * expiry re-fetches can consume each run's landings WITHOUT advancing the scan
+ * frontier, indefinitely) — at most {@link QUICK_RETRY_BUDGET} quick windows are
+ * granted between complete snapshots. True worst case: ≤ budget cycles of
+ * (inactivity cut + this window) of quick cadence — ~100s — then guaranteed
+ * full-ladder decay.
+ */
+const QUICK_RETRY_MS = 8_000;
+
+/**
+ * Budget of quick retries grantable between COMPLETE snapshots (F18). Progress
+ * alone cannot prove convergence — a partially-serving network can land one
+ * response per run forever while TTL churn keeps the frontier still — so the
+ * quick privilege is budgeted. 5 is generous for the real field case (a
+ * genuinely converging resume completes in 1–2 quick retries, each paying only
+ * the remainder) yet forces the F18 adversary onto the decaying full ladder
+ * within about one cache TTL (~5 × ~20s cut+window cycles ≈ 100s). Only a
+ * complete snapshot resets the budget ({@link DiscoveryController.resetBackoff}).
+ */
+const QUICK_RETRY_BUDGET = 5;
 
 /**
  * The concrete api object passed into discovery. We import the named functions
@@ -151,8 +223,17 @@ export async function loadAccount(network: Network): Promise<AccountSnapshot> {
 
 /** A handle on an in-flight discovery run. */
 export interface DiscoveryHandle {
-  /** Settles when the run is finished (full scan done, deadline hit, or error). */
+  /** Settles when the run is finished (full scan done, cut short, or error). */
   readonly done: Promise<void>;
+  /**
+   * Whether this run LANDED at least one new api response (a network fetch that
+   * resolved — cache hits don't count). Read by {@link DiscoveryController} once
+   * the run settles to gate the backoff ladder: a cut-but-PROGRESSING run earns
+   * a quick automatic retry (the cross-run cache means its resume pays only the
+   * shrinking remainder), while a totally-stalled run (nothing landed) walks the
+   * full ladder so a wedged network's offered load still decays.
+   */
+  madeProgress(): boolean;
   /** Aborts the run: every in-flight request is cancelled. */
   abort(): void;
 }
@@ -175,9 +256,12 @@ function persistScanMarks(network: Network, snap: AccountSnapshot): void {
  *   run-scoped cache (only the window EXTENSION costs new requests), and
  *   dispatches the merged snapshot.
  *
- * The whole run is bounded by {@link DISCOVERY_DEADLINE_MS}: at the deadline it
- * settles deterministically — a completed phase-1 result stays on screen, and
- * with no result at all `onError` fires. The skeleton is never open-ended.
+ * The run is bounded by TWO timers (v1.1.2), both aborting the same
+ * AbortController: an {@link DISCOVERY_INACTIVITY_MS} cutoff reset by every
+ * landed response (so a slow-but-moving network completes in one run), and a
+ * {@link DISCOVERY_HARD_CAP_MS} wall it never outlives. Either way it settles
+ * deterministically — a completed phase-1 result stays on screen, and with no
+ * result at all `onError` fires. The skeleton is never open-ended (F12).
  */
 export function startDiscovery(params: {
   network: Network;
@@ -198,6 +282,15 @@ export function startDiscovery(params: {
    * or cross-run count can leak past an abort (F13-style).
    */
   onProgress?: (checked: number, estimatedTotal: number) => void;
+  /** Inactivity cutoff (ms); omitted → {@link DISCOVERY_INACTIVITY_MS}. Tests
+   *  inject a small value to exercise the stall path deterministically. */
+  inactivityMs?: number;
+  /** Hard overall cap (ms); omitted → {@link DISCOVERY_HARD_CAP_MS}. The legacy
+   *  name `deadlineMs` still sets this (back-compat for existing tests that
+   *  inject a single wall). */
+  hardCapMs?: number;
+  /** @deprecated Alias for {@link hardCapMs} — kept so pre-v1.1.2 tests that
+   *  inject a small fixed wall keep working. `hardCapMs` takes precedence. */
   deadlineMs?: number;
   /** Inter-wave pacing delay (Stage 2); omitted → the production default. Tests
    *  pass 0 to keep request-count assertions fast and deterministic. */
@@ -205,12 +298,35 @@ export function startDiscovery(params: {
 }): DiscoveryHandle {
   const { network, onSnapshot, onError } = params;
   const controller = new AbortController();
-  const deadline = setTimeout(() => controller.abort(), params.deadlineMs ?? DISCOVERY_DEADLINE_MS);
+  const inactivityMs = params.inactivityMs ?? DISCOVERY_INACTIVITY_MS;
+  const hardCapMs = params.hardCapMs ?? params.deadlineMs ?? DISCOVERY_HARD_CAP_MS;
   let gotSnapshot = false;
   // An externally aborted (superseded) run must stay silent: the aborter owns
-  // the UI state now. Only a deadline expiry / genuine failure with no result
-  // may settle the UI to the error state.
+  // the UI state now. Only a cutoff / genuine failure with no result may settle
+  // the UI to the error state.
   let externallyAborted = false;
+  // Guards late callbacks: once the run has settled or been aborted, a straggler
+  // response landing must not re-arm the inactivity timer (a leaked timer) or
+  // touch progress. Set in `finally` and in `abort()`.
+  let settled = false;
+  // §b progress signal: count of api responses that LANDED during this run (real
+  // network fetches that resolved — cache hits don't count). ≥1 ⇒ the run made
+  // forward progress; the controller reads this via {@link DiscoveryHandle.madeProgress}.
+  let landedResponses = 0;
+
+  // The HARD CAP: an unconditional wall so the run always settles (F12). Never
+  // reset — a run never outlives it regardless of activity.
+  const hardCap = setTimeout(() => controller.abort(), hardCapMs);
+  // The INACTIVITY cutoff: (re-)armed on every landed response. A total stall
+  // (nothing lands) fires it after one full window — faster than the old fixed
+  // wall; a slow-but-moving run keeps resetting it and completes uncut.
+  let inactivity = setTimeout(() => controller.abort(), inactivityMs);
+  const onResponse = (): void => {
+    if (settled) return;
+    landedResponses++;
+    clearTimeout(inactivity);
+    inactivity = setTimeout(() => controller.abort(), inactivityMs);
+  };
 
   const done = (async () => {
     try {
@@ -225,6 +341,11 @@ export function startDiscovery(params: {
         ...(params.waveDelayMs !== undefined ? { waveDelayMs: params.waveDelayMs } : {}),
         signal: controller.signal,
         cache,
+        // Engine-internal landing hook: reset the inactivity cutoff + count
+        // progress on every response that lands (see startDiscovery's timers and
+        // {@link DiscoveryOptions.onResponse}). Covers stats AND the utxo/txs
+        // fetches uniformly, since all three go through `withScanCache`.
+        onResponse,
         // Scan-progress (display-only): forward each aggregated tick to the
         // caller, but ONLY while this run still owns the UI. A superseded/aborted
         // run must fall silent (same rule as the onSnapshot dispatches below,
@@ -260,21 +381,26 @@ export function startDiscovery(params: {
       persistScanMarks(network, full);
       onSnapshot(full, true);
     } catch {
-      // Deadline expiry or network failure. With a phase-1 result already on
-      // screen we keep it; with nothing, settle to error so the UI never sits
+      // Inactivity/cap cutoff or network failure. With a phase-1 result already
+      // on screen we keep it; with nothing, settle to error so the UI never sits
       // on an open-ended skeleton. A superseded (externally aborted) run stays
       // silent — its replacement owns the UI state.
       if (!gotSnapshot && !externallyAborted) onError();
     } finally {
-      clearTimeout(deadline);
+      settled = true;
+      clearTimeout(hardCap);
+      clearTimeout(inactivity);
     }
   })();
 
   return {
     done,
+    madeProgress: (): boolean => landedResponses > 0,
     abort: (): void => {
       externallyAborted = true;
-      clearTimeout(deadline);
+      settled = true;
+      clearTimeout(hardCap);
+      clearTimeout(inactivity);
       controller.abort();
     },
   };
@@ -325,10 +451,17 @@ export async function pollAccount(
  * - `pollTick` is skipped entirely while a discovery or a previous poll is
  *   still running, so 30s ticks can never pile bursts on top of a slow crawl;
  * - the AUTOMATIC path (self-heal / poll) is gated by an exponential backoff
- *   ladder (§1a/§1f): a run that ends in error or is cut incomplete escalates
- *   it, any successful complete snapshot resets it, and while backed off the
+ *   ladder (§1a/§1f): a complete snapshot resets it, and while backed off the
  *   automatic tick issues ZERO requests so offered load decays instead of
- *   growing. `refresh` — the MANUAL path — is never gated.
+ *   growing. A cut/errored run's escalation is PROGRESS-GATED (§b, v1.1.2): a run
+ *   that LANDED new responses (made progress — the cross-run cache means its
+ *   resume usually pays only the shrinking remainder) earns a QUICK retry instead
+ *   of a full rung — BUDGETED to {@link QUICK_RETRY_BUDGET} grants between
+ *   complete snapshots (F18) — while a run that landed nothing, or any cut once
+ *   the budget is spent, walks the full ladder, so offered load is GUARANTEED to
+ *   decay: a wedged network exactly as before, and a partially-serving one after
+ *   at most the budgeted quick cadence. `refresh` — the MANUAL path — is never
+ *   gated.
  *
  * Headless (no React) so the piling/skipping/backoff behavior is directly
  * testable.
@@ -337,11 +470,19 @@ export class DiscoveryController {
   private current: DiscoveryHandle | null = null;
   private pollBusy = false;
 
-  /** Backoff ladder state (§1a). Level 0 = healthy; the automatic path is
-   *  suppressed until `Date.now() >= nextEligibleAt`. Manual refresh ignores
-   *  both — it always runs now. */
+  /** Backoff ladder state (§1a/§b). Level 0 = healthy; the automatic path is
+   *  suppressed until `Date.now() >= nextEligibleAt`. A progress-cut run sets a
+   *  short {@link QUICK_RETRY_MS} eligibility and resets the level (while the
+   *  F18 budget below lasts); a no-progress or over-budget cut escalates the
+   *  level (30s·2^level, capped). Manual refresh ignores both — it always runs
+   *  now. */
   private backoffLevel = 0;
   private nextEligibleAt = 0;
+
+  /** Quick windows granted since the last COMPLETE snapshot (F18). Once it
+   *  reaches {@link QUICK_RETRY_BUDGET}, every subsequent cut — progress or
+   *  not — walks the full ladder; only a complete snapshot resets it. */
+  private quickRetriesGranted = 0;
 
   /** True while a full discovery run is in flight. */
   get busy(): boolean {
@@ -352,9 +493,11 @@ export class DiscoveryController {
    * Aborts any in-flight run and starts a fresh two-phase discovery. This is
    * the MANUAL path (Try again / unlock / network switch / post-broadcast) — it
    * is ALWAYS instant and never gated by the backoff ladder. Its OUTCOME still
-   * feeds the ladder, though: a completed full snapshot resets it, an error or a
-   * deadline-cut incomplete run escalates it — so the automatic path that shares
-   * this controller backs off (or recovers) based on what actually happened.
+   * feeds the ladder, though: a completed full snapshot resets it; a cut/errored
+   * run either earns a quick retry (it made progress, within the F18 budget) or
+   * escalates the full ladder (it landed nothing, or the budget is spent) — so
+   * the automatic path that shares this controller backs off (or recovers) based
+   * on what actually happened.
    */
   refresh(params: {
     network: Network;
@@ -364,13 +507,15 @@ export class DiscoveryController {
      *  {@link startDiscovery}). */
     onProgress?: (checked: number, estimatedTotal: number) => void;
     /**
-     * Fires exactly once when THIS run settles (complete, error, or
-     * deadline-cut) AND is still the current run — never for a superseded run.
-     * The App clears the stored scan-progress here, so a run the deadline cut
-     * mid-scan can't leave a frozen "address N of ~M" on the cue: with no run in
-     * flight the cue must fall back to its deliberate-wait (State B) text.
+     * Fires exactly once when THIS run settles (complete, error, or cut) AND is
+     * still the current run — never for a superseded run. The App clears the
+     * stored scan-progress here, so a run cut mid-scan can't leave a frozen
+     * "address N of ~M" on the cue: with no run in flight the cue must fall back
+     * to its deliberate-wait (State B) text.
      */
     onSettled?: () => void;
+    inactivityMs?: number;
+    hardCapMs?: number;
     deadlineMs?: number;
     waveDelayMs?: number;
   }): void {
@@ -393,7 +538,9 @@ export class DiscoveryController {
       if (this.current !== handle) return;
       this.current = null;
       if (sawComplete) this.resetBackoff();
-      else this.escalateBackoff();
+      // §b: a cut/errored run is gated by whether it made forward progress —
+      // read the run's landed-response count off the handle.
+      else this.settleIncomplete(handle.madeProgress());
       // Settle signal: only the current run reaches here, so the App can safely
       // drop a stale scan-progress count without racing a newer run's ticks.
       params.onSettled?.();
@@ -403,12 +550,16 @@ export class DiscoveryController {
   /**
    * One cheap poll tick — the AUTOMATIC path. Skipped (zero requests) while a
    * discovery run or a previous poll is still in flight, AND while the backoff
-   * ladder says we're not yet eligible (§1a): a stalled run cannot cause a
+   * ladder says we're not yet eligible (§1a/§b): a stalled run cannot cause a
    * second run within the backoff window, and a wedged network sees offered load
-   * decay instead of grow. Once eligible:
-   *  - an INCOMPLETE on-screen snapshot (a deadline/abort cut phase 2 short,
-   *    F12) self-heals by requesting a full refresh (which RESUMES via the
-   *    cross-run cache — see §1b); it does NOT invalidate the cache;
+   * decay instead of grow. Eligibility is the QUICK window ({@link QUICK_RETRY_MS})
+   * after a progress-cut run, or a full ladder rung after a no-progress one. Once
+   * eligible:
+   *  - an INCOMPLETE on-screen snapshot (a cutoff/abort cut phase 2 short, F12)
+   *    self-heals by requesting a full refresh (which RESUMES via the cross-run
+   *    cache — see §1b); it does NOT invalidate the cache. Because the App's tick
+   *    is a 30s clock, a quick-eligible self-heal is FELT at the next tick edge
+   *    unless a faster follow-up nudge is pending (see `App.tsx`);
    *  - otherwise it runs the cheap used+tips check and, when money moved,
    *    invalidates the cache (§1b — so the following rescan re-fetches the moved
    *    address fresh and can never un-detect the change) and fires `onChanged`.
@@ -460,19 +611,55 @@ export class DiscoveryController {
     this.current = null;
   }
 
+  /**
+   * Accounts a cut/errored (non-complete) run against the backoff ladder,
+   * PROGRESS-GATED (§b, v1.1.2) and BUDGETED (F18):
+   *
+   * - **Made progress** (landed ≥1 new response) AND the quick budget isn't
+   *   spent: grant a QUICK retry ({@link QUICK_RETRY_MS}), reset the ladder
+   *   level, and spend one unit of {@link QUICK_RETRY_BUDGET}. The resume
+   *   usually pays only the shrinking remainder via the cross-run cache.
+   * - **Otherwise** — no progress (a true stall), OR the budget is spent —
+   *   escalate the FULL ladder one rung. Consecutive no-progress runs always
+   *   decay, a wedged network is never quick-retried, and (F18) a
+   *   partially-serving network that lands just enough per run to keep the
+   *   privilege alive — TTL-expired re-fetches count as landings without
+   *   advancing the scan frontier — is cut off after the budget and decays too.
+   *
+   * TRUE worst-case bound (corrects the pre-F18 "self-limiting" claim, which
+   * overlooked TTL churn): at most {@link QUICK_RETRY_BUDGET} quick windows
+   * between complete snapshots — ≈ budget × (inactivity cut + quick window) ≈
+   * 100s of quick cadence — after which EVERY subsequent cut, progress or not,
+   * walks the full ladder until a complete snapshot resets everything (budget
+   * AND ladder, {@link resetBackoff}).
+   */
+  private settleIncomplete(madeProgress: boolean): void {
+    if (madeProgress && this.quickRetriesGranted < QUICK_RETRY_BUDGET) {
+      this.quickRetriesGranted++;
+      this.backoffLevel = 0;
+      this.nextEligibleAt = Date.now() + QUICK_RETRY_MS;
+      return;
+    }
+    this.escalateBackoff();
+  }
+
   /** Escalates the automatic-refresh backoff one rung: 30s → 1m → 2m → 4m →
-   *  cap ~8m, plus jitter. Called when a run errors or is cut incomplete. */
+   *  cap ~8m, plus jitter. Called for a no-progress cut/error (§b). */
   private escalateBackoff(): void {
     this.backoffLevel = Math.min(this.backoffLevel + 1, MAX_BACKOFF_LEVEL);
     const interval = Math.min(BACKOFF_BASE_MS * 2 ** this.backoffLevel, BACKOFF_CAP_MS);
     this.nextEligibleAt = Date.now() + interval + Math.floor(Math.random() * BACKOFF_JITTER_MS);
   }
 
-  /** Resets the ladder to healthy — the automatic path may act on the next
-   *  tick. Called whenever a full (complete) snapshot lands. */
+  /** Resets the ladder to healthy — level 0 and immediately eligible, so the
+   *  automatic path may act on the next tick. This also clears any pending
+   *  quick-retry window (`nextEligibleAt = 0`) AND refills the F18 quick-retry
+   *  budget. Called whenever a full (complete) snapshot lands: a complete
+   *  snapshot resets EVERYTHING. */
   private resetBackoff(): void {
     this.backoffLevel = 0;
     this.nextEligibleAt = 0;
+    this.quickRetriesGranted = 0;
   }
 }
 

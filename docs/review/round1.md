@@ -1294,3 +1294,237 @@ _Round-10 throwaway tests used the `.review.test.ts` suffix, were executed, and 
 the only file modified is this `docs/review/round1.md`. Not committed, not pushed. Gates
 re-confirmed after deletion: `tsc --noEmit` clean, `npm test` = 268 passing, `npm run build`
 clean, `dist` CSP `script-src 'self'`. Next finding number: **F18**._
+
+---
+
+# Round 11 — Progress-aware discovery deadline + progress-gated backoff (scan continuity)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 1 (F18 Info, accepted)**
+
+Full round on the two `scan-continuity` commits — `49298c1` (progress-aware run deadline:
+12s inactivity cutoff + 120s hard cap, replacing the fixed 20s wall) and `93007c3`
+(progress-gated backoff: ~8s quick retry for progress-cut runs + the App-level one-shot
+follow-up) — this changes discovery-layer timing semantics, so every §7/§8 landmine was
+re-adjudicated. `npm test` = **274 passing**, `tsc --noEmit` clean, `npm run build` clean,
+prod CSP unchanged (`dist/index.html`: `default-src 'self'; connect-src 'self'
+https://mempool.space; …; script-src 'self'; object-src 'none'; base-uri 'self';
+form-action 'none'`), no `console.*` in source, nothing serializes the cache or the timers
+(the two run timers and the App one-shot are plain closure-held `setTimeout` handles; grep
+for `JSON.`/`localStorage`/`indexedDB`/`structuredClone` in the touched files finds only the
+pre-existing non-secret scan-mark writes), and the PWA surface is untouched (no `public/`
+change in the diff — no `CACHE_NAME` bump owed). Verified every attack area with throwaway
+`round11.review.test.ts` (13 cases, engine) + `round11app.review.test.tsx` (5 cases, App
+one-shot), executed, deleted.
+
+## §8 adjudication (explicit, as briefed)
+
+The binding do-not reads: *"Do not add retries, longer timeouts, or a bigger deadline as
+THE fix — every one increases offered load against a stall-throttler."* Verdict:
+**COMPLIANT**, with one documented residual (F18).
+
+- Against the field-observed failure mode — the full stall-throttle wedge, where mempool.space
+  hangs TCP and NOTHING lands — this change strictly *reduces* offered load vs v1.1.1: a
+  wedged run is now cut at 12s, not 20s (verified: first cut at ~12.5s), and every
+  no-progress run walks the unchanged full ladder. A 12-minute full-wedge timeline driven at
+  an aggressive 1s probe cadence produced ≤7 runs of ~4 stalled requests each, zero landings,
+  and the quick window was NEVER granted (an +8.5s probe after a no-progress cut is gated) —
+  decay identical to v1.1.1.
+- Runtime extends (up to the 120s cap) ONLY while responses are demonstrably landing — i.e.
+  the server is actively serving. Peak in-flight (~4), Stage-2 pacing, and §1c (discovery
+  GETs never retry per-request) are all untouched, so there is no point in any run where
+  burst pressure exceeds v1.1.1.
+- The quick retry is not a per-request retry and not a bigger deadline for stalls: it is a
+  resume-eligibility change gated on genuine landings, whose failure mode (a quick-retried
+  run that lands nothing) escalates the full ladder — verified, no quick-retry loop exists.
+- Residual: the in-code sizing story ("a quick chain is self-limiting… ~40 × 8s worst case")
+  does not hold against a pathological *partially-serving* network — the ~100s cache TTL can
+  refresh the progress privilege indefinitely (F18). The measured worst case is a paced
+  trickle far below the pre-v1.1.1 bug, so §8's rationale (offered load *growing* against a
+  stall-throttler) is not violated: a throttler that stalls everything gets v1.1.1 decay; a
+  server that keeps serving gets a bounded trickle proportional to what it serves.
+
+## Per-area verdicts
+
+- **1. Self-DoS resurrection — SOUND, one documented residual (F18).**
+  **(a)** Full wedge = v1.1.1 decay, verified (timeline above; total offered load over 12
+  minutes ≤ runs×6 requests, non-growing, `landings = 0` throughout).
+  **(b)** Worst-case quick-retry chain measured (land-exactly-ONE-response-per-run
+  adversary, 1s probe cadence, 10 simulated minutes): 30 runs — one per ~20s cycle (12s
+  inactivity cut + 8s quick window) — **122 total requests, worst 30s window = 9 requests**
+  (the pre-v1.1.1 bug: 44 per 30s), exactly one genuine landing per run. The chain does
+  **not** terminate: once it outlives the ~100s TTL, expired low-index entries are re-fetched
+  and consume the landing budget without advancing the frontier — convergence stalls and the
+  trickle sustains. See F18; adjudicated acceptable. The recovery variant converges
+  correctly: after 3 one-landing cuts, a healed network completes on the next quick retry
+  paying exactly `40 − landed` requests.
+  **(c)** Progress cannot be manufactured: cache hits never fire `onResponse` (cold empty
+  scan = exactly 40 fires; fully-warm re-walk = 0 fires); post-abort straggler resolutions
+  cannot bump `landedResponses` (`settled` guard — verified by aborting with a full pending
+  wave, then resolving it: `madeProgress() === false`); and a superseded run's counter is
+  never read — a progressing run 1 superseded by a no-progress run 2 leaves the gate on the
+  full ~60s rung (probe at +8.5s gated, +75s eligible), proving run 1's progress never
+  leaked into the ladder. F16 interplay confirmed sound: `onResponse` fires after the await
+  but before the write guard by design — a landing counts for its own run's progress even
+  when the generation fence drops its cache write, and that counter dies with the run.
+- **2. 8s api timeout vs 12s inactivity — SOUND.** A production-shaped stall-after-progress
+  (phase-2 requests rejecting at +8s, simulating `DISCOVERY_TIMEOUT_MS`) settles at ~8.2s —
+  the api throw wins the race and the run settles deterministically on whichever path fires
+  first — keeping the phase-1 partial (State B, never error), with `madeProgress() === true`
+  from the pre-throw landings and zero timers left behind. A slow-but-moving network
+  completes the full 40 in ONE run past the old 20s wall (shipped test). A deep (~80-used)
+  fully-cached re-walk under worst-case hidden-tab pacing (1s/wave injected) settles within
+  50ms of fake time with zero new fetches — F17's fetch-gate skips every delay, so the
+  never-reset inactivity clock is simply never consulted. The only path that could stretch a
+  cached re-walk is round-9-closure's shared-counter over-pace residual, which requires the
+  OTHER chain to be fetching — and those fetches either land (resetting the clock) or throw
+  at 8s (ending the run). Every corner resolves to a benign cut-and-resume, never a wedge
+  (round-10's hidden-tab adjudication unchanged).
+- **3. F12 across the hard cap — SOUND.** At production constants, an 11.5s drip (always
+  inside the 12s inactivity window) is settled by the 120s cap: not settled at t=118s,
+  settled by t=121s — the run is never open-ended, at any constant. Cue honesty holds the
+  whole way: scan-progress ticks kept arriving past t=100s of the capped run, and the
+  on-screen balance is the phase-1 partial (understate-only, never inflated). The cap-cut
+  resumed from cache: 38/40 landed pre-cap; the resume paid 6 requests — the 2 never-landed
+  plus 4 first-wave entries the ~100s TTL had already expired (the TTL doing its §7
+  staleness job; a resume, never a restart). The round-5 F12 regression (an ahead high-water
+  mark can never hide funds) is green in the shipped 274.
+- **4. The App one-shot — SOUND.** Verified against the real `<App/>` with fake timers:
+  (i) in State B the nudge fires at cut+8s, the healed run pays exactly the 30-request
+  remainder, and **zero** price/fees fetches occur in the cycle (§1d — the nudge routes
+  `pollTick → onChanged → refreshAccount`, never `refreshAll`); (ii) after a no-progress
+  episode the nudge fires and is a **strict no-op** — zero discovery requests across the
+  nudge AND the next 30s tick (full-ladder gate), and exactly one nudge per State-B episode
+  (no re-fire); (iii) hidden tab: the nudge no-ops at fire time and the later visible 30s
+  tick heals (resume = 30, not a restart); (iv) unmount during the wait: zero requests over
+  the following 120s; (v) StrictMode: exactly one live nudge — heal delta is exactly 30 with
+  no stray follow-up (a leaked duplicate timer would betray itself after completion as a
+  2-request cheap poll; none fired). Empirical note: StrictMode double-invokes only
+  INITIAL-mount effects and boot lands on Unlock, so the load/nudge effects arm on updates
+  (single-invoked) — the double-arm scenario cannot arise, and busy/eligibility guards would
+  collapse it if it did. Two nits, neither a finding: the App.tsx comment claiming State B
+  "is reachable only when a run kept a phase-1 partial" overlooks State B reached via a
+  NO-progress run atop an OLDER partial (`accountError` keeps the old snapshot) — the
+  conclusion is unaffected because that path is exactly the ladder-gated no-op verified in
+  (ii); and a theoretical sub-millisecond race (the nudge firing between a completing run's
+  dispatch and React's ref-update commit) could issue one redundant, fully-cached,
+  zero-request refresh — unreachable in practice, zero-load if reached.
+- **5. Timer-leak audit — SOUND.** `vi.getTimerCount() === 0` after every settle path:
+  normal completion, inactivity cut, external abort (cleared synchronously inside
+  `abort()`), and hard-cap/legacy-`deadlineMs` cut. The reassignment corner is covered: a
+  landing racing the abort re-arms `inactivity` before `finally`, and `finally` clears the
+  reassigned handle (verified by the zero counts). The App one-shot clears on
+  unmount/state-change (area 4); lock flips `selfHealPending` false via the reducer and the
+  callback independently re-checks `isUnlocked()`.
+- **6. Regression sweep — GREEN.** All 274 shipped tests pass: the 40/10/2 request-count
+  pins, resume-remainder, §7 poll-detected-change invalidation (a detected change can never
+  be un-detected), F16 generation fence, F17 fetch-gated pacing (deep wallets), F13 network
+  switch, and the scan-progress N/~M pins. `deadlineMs` back-compat verified: a legacy small
+  wall (500ms, wedged network) still cuts at the wall with the error path and zero leaked
+  timers — old tests still mean what they meant (the one remaining shipped `deadlineMs`
+  injection is 3s, below the 12s inactivity floor, so its semantics are unchanged). No
+  signing, fee, vault, or sendLog surface appears in the diff.
+
+## New findings
+
+### F18 — [SEV-Info] The quick-retry chain is time-unbounded against a partially-serving network — TTL expiry refreshes the progress privilege (rate-bounded; accepted)
+
+- **Where:** `src/actions.ts` `DiscoveryController.settleIncomplete` (progress → level 0 +
+  `QUICK_RETRY_MS` eligibility, unconditionally) interacting with `SCAN_CACHE_TTL_MS`
+  (~100s, `src/lib/account.ts`); plus the in-code sizing claims ("a quick chain is
+  self-limiting", the design brief's "~40 × 8s worst case").
+- **Scenario (measured, throwaway):** an adversarial network that lands exactly ONE
+  response per run and stalls the rest. Each run's single landing re-earns the quick window
+  (level reset + 8s eligibility), and once the chain outlives the ~100s TTL the oldest
+  cached entries expire — their re-fetches land (consuming the run's landing) without
+  advancing the scan frontier, so the scan never converges and the cycle sustains
+  indefinitely. Measured over 10 simulated minutes at a 1s probe cadence (an upper bound on
+  any App timing): 30 runs (~20s cycle), 122 total stats requests, worst 30s window = 9,
+  steady ~12 requests/min, `completed = false` throughout.
+- **Why Info, not higher:** the load is rate-bounded and non-bursty — single-flight, peak
+  in-flight ~4, paced waves, ~5–7× below the pre-v1.1.1 self-DoS (44/30s) — and the
+  privilege is only ever granted while the server demonstrably serves (a fully wedged
+  network never enters this state: verified identical v1.1.1 decay). It requires the app
+  unlocked, visible, and screen-on (ticks and the nudge are visibility-gated; a tab hidden
+  >60s locks). Direction is safe throughout: understated balance plus the honest State-B
+  cue. This is a documentation-vs-reality gap and a pathological-adversary residual, not a
+  reachable field failure.
+- **Fix (optional hardening, PM's call):** a consecutive-quick-retry budget — after N
+  consecutive progress-cut runs with no complete snapshot (say ~5), escalate one full rung
+  anyway; any complete snapshot resets the budget. That preserves the field case (one or
+  two cuts, then done) while restoring guaranteed decay under the pathological adversary.
+  Either way, correct the two in-code sizing comments to describe the real bound.
+
+## Ship recommendation
+
+**SHIP.** The design does what it claims: a wedged network is cut FASTER than v1.1.1 and
+decays identically (the §8 case is airtight); runtime extends only while responses land; the
+quick retry cannot be earned without a genuine network landing and cannot loop on a wedge;
+the run always settles deterministically (12s / 8s-api-throw / 120s — F12 preserved at
+every constant); the App one-shot is provably advance-only (never a new request source);
+no timers leak on any settle path; and every prior pin (F12/F13/F16/F17/§7/§1c/§1d) is
+green. The one finding (F18) is an Info-level, rate-bounded residual against a pathological
+adversary, with an optional hardening the PM can take or leave.
+
+_Round-11 throwaway tests used the `.review.test.ts`/`.review.test.tsx` suffixes, were
+executed, and were deleted; the only file modified is this `docs/review/round1.md`,
+committed on `scan-continuity` (not pushed). Gates re-confirmed after deletion:
+`tsc --noEmit` clean, `npm test` = 274 passing, `npm run build` clean, `dist` CSP
+`script-src 'self'`. Next finding number: **F19**._
+
+---
+
+# Round 11 closure — F18 re-check
+
+**F18 CLOSED. New findings: 0. Ship recommendation: SHIP `scan-continuity`.**
+
+Re-audit of the one fix commit, `97ff595` (F18 — budget the quick-retry privilege):
+`QUICK_RETRY_BUDGET = 5`, a `quickRetriesGranted` counter on `DiscoveryController`,
+`settleIncomplete` grants quick only while `madeProgress && quickRetriesGranted <
+QUICK_RETRY_BUDGET` (spending one unit), everything else — no progress OR budget spent —
+escalates the full ladder one rung; only `resetBackoff` (a COMPLETE snapshot) refills the
+budget, alongside the ladder and any pending quick window. `tsc --noEmit` clean, `npm test`
+= **276 passing**, `npm run build` clean, `dist` CSP unchanged (`script-src 'self'`), no
+source touched by the review. Verified with throwaway `round11close.review.test.ts`
+(3 cases, executed, deleted).
+
+- **The F18 adversary is dead — CLOSED.** Re-ran the EXACT Round-11 measurement (the
+  one-landing-per-run TTL-churn adversary, 1s probe cadence, 10 simulated minutes) against
+  the committed code: **exactly 5 quick windows granted, never a 6th** — run-start gaps of
+  `[20, 20, 20, 20, 20]`s (the quick cadence, ≈100s ≈ one cache TTL, exactly the documented
+  bound) followed by `[77, 138, 256]`s (strictly growing full-ladder rungs, levels 1→3 +
+  jitter). **Total offered load: 38 requests / 10 min (pre-fix measurement: 122,
+  time-unbounded), 9 runs (was 30), trickle extinguished after ~100s** — the 30s window
+  series collapses to zeros between rungs. Guaranteed decay is restored: the over-budget
+  branch escalates on EVERY cut, progress or not.
+- **The field case is unaffected — HOLDS.** A genuinely converging resume (progress-cut,
+  then the healthy resume completes) still heals on the ~8s quick cadence — grant #1 of 5,
+  budget barely touched — and its complete snapshot resets everything (the very next tick
+  runs the ungated 2-request cheap poll). Refill proven independently: after a completion,
+  the SAME adversary run again gets a fresh budget of exactly 5 quick windows, then gates.
+  The shipped budget tests (exactly-5-then-ladder; refill) pin both behaviours in the 276.
+- **Docs no longer overclaim — CONFIRMED.** The two flagged comments are rewritten
+  ("usually pays only the shrinking remainder"; the `settleIncomplete` doc now states the
+  TRUE worst-case bound and names the TTL-churn mechanism); the only surviving
+  "self-limiting" string is the corrective text quoting the old claim. `ENGINE.md` carries
+  the budget constant and the honest bound (≈ budget × (12s cut + 8s window) ≈ 100s of
+  quick cadence, then guaranteed ladder decay) — measured 5 × 20s = 100s, so the audit
+  trail's invariant is now accurate, not aspirational.
+- **No regression — GREEN.** Full suite 276 passing (all Round-11 pins intact); the
+  Round-11 full-wedge decay timeline re-run against the fixed code is unchanged (12s first
+  cut, no quick window ever granted, ≤7 runs / 12 min, zero landings, load non-growing).
+  One benign note, not a finding: the budget (like the pre-existing ladder state) is
+  per-controller, not per-network — a spent budget briefly gates the OTHER network's
+  automatic path after a switch until its (ungated, manual) switch-refresh completes and
+  refills it; direction is conservative (less load), consistent with the ladder's existing
+  scope.
+
+**SHIP.** The fix is minimal, correct, and does exactly what the finding asked: the quick
+privilege is now provably bounded (≤5 windows ≈ 100s between complete snapshots), the
+pathological trickle cannot sustain, the real-world resume path is untouched, and the
+in-code/ENGINE.md claims now match measured reality.
+
+_Round-11-closure throwaway tests used the `.review.test.ts` suffix, were executed, and
+were deleted; the only file modified is this `docs/review/round1.md`, committed on
+`scan-continuity` (not pushed). Gates re-confirmed after deletion: `tsc --noEmit` clean,
+`npm test` = 276 passing, `npm run build` clean, `dist` CSP `script-src 'self'`. Next
+finding number: **F19**._

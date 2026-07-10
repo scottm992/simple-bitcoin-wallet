@@ -155,20 +155,34 @@ is single-flight, budget-limited, and deadline-bounded. Any change touching
 discovery must preserve this pattern (see review rounds 5–6, F12/F13).
 
 **Constants**: `FAST_GAP_LIMIT = 5` (phase 1), `FULL_GAP_LIMIT = 20` (phase 2,
-BIP44/F8), `DISCOVERY_DEADLINE_MS = 20_000` (do NOT raise — a bigger deadline
-just increases offered load), `POLL_CONCURRENCY = 4`. **Backoff ladder (§1a):**
+BIP44/F8), `POLL_CONCURRENCY = 4`. **Progress-aware run deadline (v1.1.2,
+replaces the old fixed `DISCOVERY_DEADLINE_MS = 20_000`):**
+`DISCOVERY_INACTIVITY_MS = 12_000` (a run is cut only after this long with NO
+response landing — every landed response resets it, so a slow-but-MOVING network
+completes in one run instead of being guillotined mid-scan; 12s sits above the
+api layer's 8s per-request timeout and below the old 20s wall, so a true stall is
+cut FASTER than before) and `DISCOVERY_HARD_CAP_MS = 120_000` (a run NEVER
+outlives this regardless of activity — preserves round-5 F12: the run settles
+deterministically, the skeleton is never open-ended; a capped run keeps its
+phase-1 partial and resumes from the cross-run cache). Both timers abort the SAME
+AbortController; do NOT restore a single fixed wall (it can't tell "slow but
+landing" from "wedged" and cuts progressing runs). **Backoff ladder (§1a/§b):**
 `BACKOFF_BASE_MS = 30_000`, `BACKOFF_CAP_MS = 480_000` (~8m), `MAX_BACKOFF_LEVEL
-= 8`, `BACKOFF_JITTER_MS = 10_000`.
+= 8`, `BACKOFF_JITTER_MS = 10_000`, `QUICK_RETRY_MS = 8_000` (§b — a cut run that
+made progress becomes eligible again this fast, see `DiscoveryController`),
+`QUICK_RETRY_BUDGET = 5` (F18 — max quick windows grantable between complete
+snapshots; once spent, every subsequent cut walks the full ladder).
 
 **Single-run pacing (Stage 2, v1.1.1).** The chain scan (`account.ts`
 `scanChain`) runs at `concurrency = 2` (down from 4) with a jittered
 `PACING_WAVE_DELAY_MS` (~200 ms + up to 100 ms jitter) delay BETWEEN waves, so a
 full run spreads over several seconds instead of firing as one burst. The two
 chains still scan concurrently, so peak in-flight is ~4 (not ~8). This is safe
-ONLY because of the cross-run cache below: a paced run the deadline cuts RESUMES
-rather than restarts. `DISCOVERY_DEADLINE_MS` stays 20_000 — pacing never
-lengthens the deadline (`waveDelayMs` is threaded through `startDiscovery` /
-`DiscoveryController.refresh`, defaulting to the production value; tests pass 0).
+ONLY because of the cross-run cache below: a paced run cut short RESUMES rather
+than restarts. Pacing never lengthens either run-deadline timer above; a
+slow-but-moving paced run keeps landing responses and completes uncut (`waveDelayMs`
+is threaded through `startDiscovery` / `DiscoveryController.refresh`, defaulting to
+the production value; tests pass 0).
 The cheap poll keeps `POLL_CONCURRENCY = 4` and is not paced. **Only waves that
 actually hit the network are paced (F17).** `scanChain` snapshots the
 `ScanCache`'s monotonic real-fetch counter around each wave and inserts the
@@ -200,7 +214,7 @@ and lock (all networks, no arg). `pollAccount` reads `getAddressStats` directly
 from 0 (F12) — only response reuse changes; `complete=true` only ever comes from
 a full gap-20 evaluation.
 
-- `startDiscovery({ network, onSnapshot, onError, onProgress?, deadlineMs? }): DiscoveryHandle`
+- `startDiscovery({ network, onSnapshot, onError, onProgress?, inactivityMs?, hardCapMs?, deadlineMs? }): DiscoveryHandle`
   — one two-phase run. **Phase 1** (first paint): fast gap-5 scan anchored at the
   cached high-water marks. **Phase 2** (correctness): extends to the full gap-20
   scan from index 0, reusing every response still fresh in the per-network
@@ -218,10 +232,20 @@ a full gap-20 evaluation.
   changes nothing about request timing/counts — pure instrumentation (§8
   do-nots hold). Like `onSnapshot`, it is SILENCED the instant the run is
   aborted/superseded (same `externallyAborted` guard), so no stale/cross-run
-  count leaks past an abort (F13-style). The run settles deterministically at the deadline:
-  a landed phase-1 result is kept; with no result at all, `onError` fires — the
-  skeleton is never open-ended. `DiscoveryHandle { done: Promise<void>; abort():
-  void }` — `abort()` cancels every in-flight request and silences the run: a
+  count leaks past an abort (F13-style). **Progress-aware deadline (v1.1.2):** the
+  run is bounded by an `inactivityMs` cutoff (default `DISCOVERY_INACTIVITY_MS`,
+  RESET on every landed response via the engine-internal `onResponse` hook wired
+  through `withScanCache` — a cache hit does NOT reset it, but a fully-cached
+  re-walk finishes inside the window anyway) and a `hardCapMs` wall (default
+  `DISCOVERY_HARD_CAP_MS`, never reset). Both abort the same AbortController;
+  tests inject small values for either (and the legacy `deadlineMs` still sets the
+  hard cap). Either way the run settles deterministically: a landed phase-1 result
+  is kept; with no result at all, `onError` fires — the skeleton is never
+  open-ended. `DiscoveryHandle { done: Promise<void>; madeProgress(): boolean;
+  abort(): void }` — `madeProgress()` is `true` iff ≥1 api response LANDED this
+  run (a network fetch resolved; cache hits don't count), read by the controller
+  to gate the backoff ladder. `abort()` cancels every in-flight request and
+  silences the run: a
   superseded run never dispatches a snapshot or an error, even if a phase had
   already resolved with its continuation still queued (F13). `abort()` does NOT
   clear the cache — a superseding manual refresh must be able to resume — but an
@@ -246,22 +270,44 @@ a full gap-20 evaluation.
   (`App.tsx` `discoveryRef`). `refresh(params)` — the MANUAL path (Try again /
   unlock / network switch / post-broadcast) — aborts any in-flight run and starts
   fresh; it is ALWAYS instant, never gated. Its OUTCOME feeds the backoff ladder:
-  a completed (phase-2) snapshot resets it, an error or a deadline-cut incomplete
-  run escalates it (a superseded run touches neither). `refresh` also accepts
-  optional `onProgress` (forwarded to the run for the scan-progress cue) and
-  `onSettled` — fired once when THIS run settles (complete, error, or cut) AND is
-  still the current run (never a superseded one). The App clears the stored
-  scan-progress in `onSettled`, so a run the deadline cut mid-scan can't leave a
-  frozen "address N of ~M" on the cue — with no run in flight the cue falls back
-  to its deliberate-wait, tappable text. `pollTick(params)` — the
-  AUTOMATIC path — is skipped (zero requests) while a run or a prior poll is in
-  flight AND while the ladder says we're not yet eligible (§1a: 30s → 1m → 2m →
-  4m → cap ~8m, +jitter), so a stalled run can't fire a second run within the
+  a completed (phase-2) snapshot resets EVERYTHING (ladder, quick window, AND the
+  F18 budget below); a cut/errored run is **progress-gated (§b, v1.1.2)** — if it
+  LANDED new responses (made progress; the cross-run cache means its resume
+  usually pays only the shrinking remainder) it earns a QUICK retry
+  (`QUICK_RETRY_MS`, ~8s) and the ladder level resets, otherwise it escalates the
+  full ladder one rung (a superseded run touches neither). The progress signal is
+  `DiscoveryHandle.madeProgress()` (≥1 network response landed — cache hits don't
+  count, so a resumed run that only re-walks the cache and then stalls is
+  correctly "no progress" and walks the ladder). **The quick privilege is
+  BUDGETED (F18):** progress alone is NOT proof of convergence — against a
+  partially-serving network, ~100s cache-TTL expiry re-fetches can consume each
+  run's landings without advancing the scan frontier, which pre-F18 refreshed the
+  privilege indefinitely (a time-unbounded ~1-run/20s trickle) — so at most
+  `QUICK_RETRY_BUDGET` (5) quick windows are granted between complete snapshots;
+  once spent, EVERY subsequent cut (progress or not) escalates the full ladder
+  until a complete snapshot resets everything. TRUE worst-case bound: ≈ budget ×
+  (12s cut + 8s window) ≈ 100s of quick cadence, then guaranteed ladder decay. A
+  quick-retried run that lands nothing walks the full ladder regardless —
+  consecutive no-progress runs always decay and a wedged network is never
+  quick-retried. `refresh` also accepts optional
+  `onProgress` (forwarded to the run for the scan-progress cue) and `onSettled` —
+  fired once when THIS run settles (complete, error, or cut) AND is still the
+  current run (never a superseded one). The App clears the stored scan-progress in
+  `onSettled`, so a run cut mid-scan can't leave a frozen "address N of ~M" on the
+  cue — with no run in flight the cue falls back to its deliberate-wait, tappable
+  text. `pollTick(params)` — the AUTOMATIC path — is skipped (zero requests) while
+  a run or a prior poll is in flight AND while the ladder says we're not yet
+  eligible (§1a: 30s → 1m → 2m → 4m → cap ~8m, +jitter; §b: the ~8s quick window
+  after a progress-cut), so a stalled run can't fire a second run within the
   window and a wedged network's offered load DECAYS. Once eligible: an incomplete
   snapshot self-heals via a full refresh (which resumes from the cache, no
   invalidation); otherwise it runs the cheap check and, on detected movement,
   invalidates the cache then fires `onChanged`. The App's 30s interval stays a
-  dumb clock — the controller decides whether a tick may act. `abort()` on
+  dumb baseline clock — the controller decides whether a tick may act; a small
+  visibility-gated, single-shot follow-up in `App.tsx` (`QUICK_SELF_HEAL_FOLLOWUP_MS`)
+  nudges the self-heal while the snapshot sits in the deliberate-wait state, so a
+  quick-eligible resume is FELT within seconds rather than at the next 30s edge
+  (bounded and no-op unless the controller is already eligible). `abort()` on
   lock/unmount/network switch — on a network switch, call it synchronously BEFORE
   dispatching `setNetwork` (F13). `busy: boolean`.
 - `loadAccount(network)` — one full single-phase discovery (no deadline/phases).
