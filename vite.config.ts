@@ -15,7 +15,8 @@ import react from '@vitejs/plugin-react';
  * v1.2.0 adds https://blockstream.info to connect-src: chain data (address stats
  * / utxos / txs / one-tx fetch / broadcast) now goes there, while mempool.space
  * is KEPT for fee estimates + USD price. Two hosts, each seeing limited request
- * types (Round 13 audit OWED — trust-model change).
+ * types (trust-model change — audited pre-ship in security review Round 13,
+ * docs/review/round1.md).
  */
 const PROD_CSP = [
   "default-src 'self'",

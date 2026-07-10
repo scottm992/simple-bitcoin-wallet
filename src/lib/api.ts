@@ -1,8 +1,9 @@
 /**
  * api.ts — thin REST client for two public Esplora-shaped APIs.
  *
- * v1.2.0 SPLITS the base URL by concern (a trust-model change; Round 13 audit
- * OWED). CHAIN DATA (address stats / utxos / txs / one-tx fetch / broadcast) now
+ * v1.2.0 SPLITS the base URL by concern (a trust-model change — audited pre-ship
+ * in security review Round 13, `docs/review/round1.md`: 0 blockers, F19/F20
+ * closed). CHAIN DATA (address stats / utxos / txs / one-tx fetch / broadcast) now
  * goes to blockstream.info via {@link chainApiBaseUrl}: the owner's IP is
  * currently HTTP-429 rate-limited by mempool.space while blockstream serves the
  * same connection flawlessly, and blockstream's address/tx endpoints return
@@ -114,7 +115,8 @@ export function apiBaseUrl(network: Network): string {
  * return byte-identical shapes to mempool.space (chain_stats / mempool_stats,
  * same field names — live-verified), so every F2 ingest validator below
  * transfers unchanged. Split out from {@link apiBaseUrl} so fees/price can stay
- * on mempool.space (see there). Trust-model change — Round 13 audit OWED.
+ * on mempool.space (see there). Trust-model change — audited pre-ship in Round
+ * 13 (`docs/review/round1.md`).
  */
 export function chainApiBaseUrl(network: Network): string {
   return network === 'mainnet'

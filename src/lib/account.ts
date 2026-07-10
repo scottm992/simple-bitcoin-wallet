@@ -113,11 +113,18 @@ export interface ScanCache {
    * frontier can only advance, so a ladder-spaced resume MUST be able to reuse a
    * landing older than the TTL, or the scan REGRESSES (entries dying faster than
    * retries arrive — stuck at "22 of 40" forever, the 2026-07-10 field bug). Once
-   * `true`, normal TTL freshness applies to subsequent rescans. Honesty holds
-   * throughout convergence: the balance is flagged incomplete by the cue, and the
-   * uncached 30s poll still watches used addresses + tips and invalidates on ANY
-   * movement, so a payment arriving mid-convergence is detected within one poll
-   * cycle. Set by {@link markComplete}; reset to `false` by {@link clear}.
+   * `true`, normal TTL freshness applies to subsequent rescans.
+   *
+   * Honesty bound (corrected per F20, Round 13): while converging, staleness is
+   * bounded by CONVERGENCE ITSELF — the on-screen snapshot is flagged incomplete
+   * (honest cue up the whole time) and a payment missed by a stale "unused" entry
+   * is an UNDERSTATE, never an overstate. The cheap uncached poll does NOT run
+   * during convergence (an incomplete snapshot routes `pollTick` down the
+   * self-heal branch instead), so a payment arriving mid-convergence is detected
+   * within one poll cycle of the next COMPLETE snapshot — not of its arrival.
+   * That is the deliberate trade: running the poll while incomplete would add
+   * offered load against the very endpoint discipline this cache protects. Set
+   * by {@link markComplete}; reset to `false` by {@link clear}.
    */
   readonly complete: boolean;
   /**
@@ -792,11 +799,14 @@ function withScanCache(api: AccountApi, cache: ScanCache, onResponse?: () => voi
     // entries never expire by TTL. The frontier only advances, so a ladder-spaced
     // resume MUST reuse a landing older than the TTL — otherwise entries die
     // faster than retries arrive and the scan REGRESSES (the 2026-07-10 field bug:
-    // stuck at "22 of 40"). Honesty holds: the balance is flagged incomplete by
-    // the cue throughout convergence, and the uncached 30s poll still watches used
-    // addresses + tips and invalidates on ANY movement, so a payment arriving
-    // mid-convergence is detected within one poll cycle. Once a full scan completes
-    // ({@link ScanCache.markComplete}), normal TTL freshness applies to rescans.
+    // stuck at "22 of 40"). Honesty bound (F20-corrected): staleness while
+    // converging is bounded by convergence itself — the snapshot is flagged
+    // incomplete (honest cue up) and a payment hidden by a stale "unused" entry
+    // is an UNDERSTATE only. The cheap uncached poll does NOT run while the
+    // snapshot is incomplete (pollTick self-heals instead), so missed movement is
+    // detected within one poll cycle of the next COMPLETE snapshot, not of its
+    // arrival. Once a full scan completes ({@link ScanCache.markComplete}),
+    // normal TTL freshness applies to rescans.
     if (!cache.complete) return entry.value;
     return cache.now() - entry.storedAt < cache.ttlMs ? entry.value : undefined;
   }

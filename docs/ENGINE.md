@@ -66,7 +66,8 @@ the mnemonic in at call time and let it go out of scope.
 ## `api.ts` — Esplora REST client (two hosts, v1.2.0)
 
 Every call takes `network: Network` first. **v1.2.0 SPLITS the base URL by
-concern (trust-model change — Round 13 audit OWED):** CHAIN DATA (address stats /
+concern (trust-model change — audited pre-ship in Round 13,
+`docs/review/round1.md`: 0 blockers, F19/F20 closed):** CHAIN DATA (address stats /
 utxos / txs / one-tx fetch / broadcast) goes to **blockstream.info** via
 `chainApiBaseUrl`, while FEES + PRICE (`getFeeEstimates` / `getBtcUsdPrice`) stay
 on **mempool.space** via `apiBaseUrl`. Blockstream's Esplora address/tx shapes are
@@ -257,10 +258,15 @@ TTL, or entries die faster than the ladder retries arrive and the scan REGRESSES
 `cache.markComplete()` where the complete phase-2 snapshot is persisted (guarded by
 the `externallyAborted` check), flipping the cache to normal-TTL mode; `clear()`
 resets it straight back to converging (so every invalidation still nukes the cache
-instantly in BOTH modes, generation-fenced F16). Honesty holds through convergence:
-the balance is flagged incomplete by the cue, and the uncached 30s poll still
-watches used addresses + tips and invalidates on ANY movement, so a payment
-arriving mid-convergence is detected within one poll cycle.
+instantly in BOTH modes, generation-fenced F16). **Honesty bound (F20-corrected,
+Round 13):** while converging, staleness is bounded by convergence itself — the
+snapshot is flagged incomplete (honest cue up throughout) and a payment hidden by
+a stale "unused" entry is an UNDERSTATE only, never an overstate. The cheap
+uncached poll does NOT run while the snapshot is incomplete (`pollTick` takes the
+self-heal branch instead — running the 2-request poll there would add offered load
+against the very endpoint discipline this cache protects), so a payment arriving
+mid-convergence is detected within one poll cycle of the next COMPLETE snapshot,
+not of its arrival.
 
 - `startDiscovery({ network, onSnapshot, onError, onProgress?, inactivityMs?, hardCapMs?, deadlineMs?, waveDelayMs?, maxRateLimitPauses? }): DiscoveryHandle`
   — one two-phase run. **Phase 1** (first paint): fast gap-5 scan anchored at the

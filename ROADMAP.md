@@ -8,12 +8,16 @@ by value-for-effort within each phase; nothing here is committed work.
 > ✅ **ROUND 13 SECURITY AUDIT: RAN PRE-SHIP, 2026-07-10 — verdict SHIP, 0
 > blockers.** The audit was briefly deferred while the owner was out of credits
 > (this banner used to say "OWED"); credits were restored and the full round ran
-> on `blockstream-primary` BEFORE any merge to `main`. Findings: **F19 (Low)** —
-> the broadcast response body is trusted as the txid (fail-closed, one-line fix
-> recommended as a fast-follow: use the locally-computed `BuiltTx.txid`) — and
-> **F20 (Info)** — the convergence-honesty comments overstate the poll's
-> mid-convergence reach (doc correction). Full report: `docs/review/round1.md`,
-> "Round 13". v1.2.0 may be treated as audited; next finding number is F21.
+> on `blockstream-primary` BEFORE any merge to `main`. Findings — **both CLOSED
+> pre-merge, same day:** **F19 (Low)** — the broadcast response body was trusted
+> as the txid (fail-closed); fixed: both broadcast paths now key the F15 record
+> and the returned id on the locally-computed `BuiltTx.txid`, with the relay's
+> echo demoted to diagnostics (294 tests, F19 suite pins a lying relay end to
+> end) — and **F20 (Info)** — the convergence-honesty comments overstated the
+> poll's mid-convergence reach; corrected in source + ENGINE.md (detection is one
+> poll cycle after the next COMPLETE snapshot, not after arrival). Full report:
+> `docs/review/round1.md`, "Round 13". v1.2.0 may be treated as audited; next
+> finding number is F21.
 
 **Owner field evidence, 2026-07-10:** mempool.space now rate-limits the owner's
 IP with bare HTTP **429s** (no `Retry-After`; a token bucket ≈25–40 refilling
