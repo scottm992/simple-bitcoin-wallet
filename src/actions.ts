@@ -122,15 +122,32 @@ const BACKOFF_JITTER_MS = 10_000;
  * Progress-gated quick retry (§b, v1.1.2). When a cut run made progress (landed
  * ≥1 new response), the automatic self-heal becomes eligible again after just
  * this long — far shorter than any full ladder rung — because the cross-run cache
- * means the resume pays only the shrinking remainder (convergence is monotonic
- * and cheap). ~8s: long enough not to hammer a recovering connection, short
- * enough that the "may be behind" wait doesn't linger. HARD guardrails in
+ * means the resume USUALLY pays only the shrinking remainder. ~8s: long enough
+ * not to hammer a recovering connection, short enough that the "may be behind"
+ * wait doesn't linger. HARD guardrails in
  * {@link DiscoveryController.settleIncomplete} keep this from re-creating the
- * v1.1.1 self-DoS: it is granted ONLY on progress, and a run it grants that then
- * lands NOTHING walks the full ladder — so consecutive no-progress runs always
- * decay, and a wedged network is never quick-retried.
+ * v1.1.1 self-DoS: quick is granted ONLY on progress; a quick-retried run that
+ * lands NOTHING walks the full ladder; and — because progress alone is NOT proof
+ * of convergence (F18: against a partially-serving network, ~100s cache-TTL
+ * expiry re-fetches can consume each run's landings WITHOUT advancing the scan
+ * frontier, indefinitely) — at most {@link QUICK_RETRY_BUDGET} quick windows are
+ * granted between complete snapshots. True worst case: ≤ budget cycles of
+ * (inactivity cut + this window) of quick cadence — ~100s — then guaranteed
+ * full-ladder decay.
  */
 const QUICK_RETRY_MS = 8_000;
+
+/**
+ * Budget of quick retries grantable between COMPLETE snapshots (F18). Progress
+ * alone cannot prove convergence — a partially-serving network can land one
+ * response per run forever while TTL churn keeps the frontier still — so the
+ * quick privilege is budgeted. 5 is generous for the real field case (a
+ * genuinely converging resume completes in 1–2 quick retries, each paying only
+ * the remainder) yet forces the F18 adversary onto the decaying full ladder
+ * within about one cache TTL (~5 × ~20s cut+window cycles ≈ 100s). Only a
+ * complete snapshot resets the budget ({@link DiscoveryController.resetBackoff}).
+ */
+const QUICK_RETRY_BUDGET = 5;
 
 /**
  * The concrete api object passed into discovery. We import the named functions
@@ -438,10 +455,13 @@ export async function pollAccount(
  *   automatic tick issues ZERO requests so offered load decays instead of
  *   growing. A cut/errored run's escalation is PROGRESS-GATED (§b, v1.1.2): a run
  *   that LANDED new responses (made progress — the cross-run cache means its
- *   resume pays only the shrinking remainder) earns a QUICK retry instead of a
- *   full rung; a run that landed nothing walks the full ladder, so consecutive
- *   no-progress runs on a wedged network still decay exactly as before. `refresh`
- *   — the MANUAL path — is never gated.
+ *   resume usually pays only the shrinking remainder) earns a QUICK retry instead
+ *   of a full rung — BUDGETED to {@link QUICK_RETRY_BUDGET} grants between
+ *   complete snapshots (F18) — while a run that landed nothing, or any cut once
+ *   the budget is spent, walks the full ladder, so offered load is GUARANTEED to
+ *   decay: a wedged network exactly as before, and a partially-serving one after
+ *   at most the budgeted quick cadence. `refresh` — the MANUAL path — is never
+ *   gated.
  *
  * Headless (no React) so the piling/skipping/backoff behavior is directly
  * testable.
@@ -452,11 +472,17 @@ export class DiscoveryController {
 
   /** Backoff ladder state (§1a/§b). Level 0 = healthy; the automatic path is
    *  suppressed until `Date.now() >= nextEligibleAt`. A progress-cut run sets a
-   *  short {@link QUICK_RETRY_MS} eligibility and resets the level; a no-progress
-   *  cut escalates the level (30s·2^level, capped). Manual refresh ignores both —
-   *  it always runs now. */
+   *  short {@link QUICK_RETRY_MS} eligibility and resets the level (while the
+   *  F18 budget below lasts); a no-progress or over-budget cut escalates the
+   *  level (30s·2^level, capped). Manual refresh ignores both — it always runs
+   *  now. */
   private backoffLevel = 0;
   private nextEligibleAt = 0;
+
+  /** Quick windows granted since the last COMPLETE snapshot (F18). Once it
+   *  reaches {@link QUICK_RETRY_BUDGET}, every subsequent cut — progress or
+   *  not — walks the full ladder; only a complete snapshot resets it. */
+  private quickRetriesGranted = 0;
 
   /** True while a full discovery run is in flight. */
   get busy(): boolean {
@@ -468,9 +494,10 @@ export class DiscoveryController {
    * the MANUAL path (Try again / unlock / network switch / post-broadcast) — it
    * is ALWAYS instant and never gated by the backoff ladder. Its OUTCOME still
    * feeds the ladder, though: a completed full snapshot resets it; a cut/errored
-   * run either earns a quick retry (it made progress) or escalates the full
-   * ladder (it landed nothing) — so the automatic path that shares this
-   * controller backs off (or recovers) based on what actually happened.
+   * run either earns a quick retry (it made progress, within the F18 budget) or
+   * escalates the full ladder (it landed nothing, or the budget is spent) — so
+   * the automatic path that shares this controller backs off (or recovers) based
+   * on what actually happened.
    */
   refresh(params: {
     network: Network;
@@ -586,26 +613,29 @@ export class DiscoveryController {
 
   /**
    * Accounts a cut/errored (non-complete) run against the backoff ladder,
-   * PROGRESS-GATED (§b, v1.1.2):
+   * PROGRESS-GATED (§b, v1.1.2) and BUDGETED (F18):
    *
-   * - **Made progress** (landed ≥1 new response): the resume will pay only the
-   *   shrinking remainder via the cross-run cache, so grant a QUICK retry
-   *   ({@link QUICK_RETRY_MS}) and RESET the ladder level — "progress resets the
-   *   privilege". Consecutive progressing runs therefore keep resuming promptly,
-   *   which is exactly right: each one advances the cache toward a complete scan.
-   * - **No progress** (landed nothing — a true stall): escalate the FULL ladder
-   *   one rung. This is the ONLY guardrail needed to prevent a quick-retry loop:
-   *   a quick-retried run that then lands nothing hits this branch and walks the
-   *   ladder (it does NOT earn a second quick retry), and a persistently wedged
-   *   network — where no run ever lands anything — decays exactly as in v1.1.1.
+   * - **Made progress** (landed ≥1 new response) AND the quick budget isn't
+   *   spent: grant a QUICK retry ({@link QUICK_RETRY_MS}), reset the ladder
+   *   level, and spend one unit of {@link QUICK_RETRY_BUDGET}. The resume
+   *   usually pays only the shrinking remainder via the cross-run cache.
+   * - **Otherwise** — no progress (a true stall), OR the budget is spent —
+   *   escalate the FULL ladder one rung. Consecutive no-progress runs always
+   *   decay, a wedged network is never quick-retried, and (F18) a
+   *   partially-serving network that lands just enough per run to keep the
+   *   privilege alive — TTL-expired re-fetches count as landings without
+   *   advancing the scan frontier — is cut off after the budget and decays too.
    *
-   * No separate "was quick-retried" flag is needed: quick is granted ONLY on
-   * progress, and progress is genuine forward convergence (a network fetch
-   * resolved that wasn't cached), so a quick chain is self-limiting — it ends the
-   * moment a run completes (→ {@link resetBackoff}) or stalls (→ full ladder).
+   * TRUE worst-case bound (corrects the pre-F18 "self-limiting" claim, which
+   * overlooked TTL churn): at most {@link QUICK_RETRY_BUDGET} quick windows
+   * between complete snapshots — ≈ budget × (inactivity cut + quick window) ≈
+   * 100s of quick cadence — after which EVERY subsequent cut, progress or not,
+   * walks the full ladder until a complete snapshot resets everything (budget
+   * AND ladder, {@link resetBackoff}).
    */
   private settleIncomplete(madeProgress: boolean): void {
-    if (madeProgress) {
+    if (madeProgress && this.quickRetriesGranted < QUICK_RETRY_BUDGET) {
+      this.quickRetriesGranted++;
       this.backoffLevel = 0;
       this.nextEligibleAt = Date.now() + QUICK_RETRY_MS;
       return;
@@ -623,11 +653,13 @@ export class DiscoveryController {
 
   /** Resets the ladder to healthy — level 0 and immediately eligible, so the
    *  automatic path may act on the next tick. This also clears any pending
-   *  quick-retry window (`nextEligibleAt = 0`). Called whenever a full (complete)
-   *  snapshot lands: a complete snapshot resets EVERYTHING. */
+   *  quick-retry window (`nextEligibleAt = 0`) AND refills the F18 quick-retry
+   *  budget. Called whenever a full (complete) snapshot lands: a complete
+   *  snapshot resets EVERYTHING. */
   private resetBackoff(): void {
     this.backoffLevel = 0;
     this.nextEligibleAt = 0;
+    this.quickRetriesGranted = 0;
   }
 }
 

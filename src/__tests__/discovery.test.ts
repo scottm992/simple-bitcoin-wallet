@@ -1025,6 +1025,142 @@ describe('progress-gated backoff (§b)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// F18 — the quick-retry BUDGET. Progress alone is not proof of convergence: a
+// partially-serving network can land exactly one response per run forever (once
+// the chain outlives the ~100s cache TTL, expired low-index re-fetches consume
+// each run's landing WITHOUT advancing the scan frontier). Pre-F18 that
+// refreshed the quick privilege indefinitely — a time-unbounded ~1-run/20s
+// trickle. Now at most QUICK_RETRY_BUDGET (5) quick windows are granted between
+// complete snapshots; after that EVERY cut walks the full ladder, so offered
+// load is guaranteed to decay. A complete snapshot refills the budget.
+// ---------------------------------------------------------------------------
+
+describe('quick-retry budget (F18)', () => {
+  it('a one-landing-per-run adversary gets exactly QUICK_RETRY_BUDGET quick retries, then walks the FULL ladder', async () => {
+    vi.useFakeTimers();
+    // Cut 1: phase 1 (10) lands, the rest stalls → progress-cut → quick #1.
+    mockNet.hangAfter = 10;
+    const controller = new DiscoveryController();
+    const heal = (): void =>
+      controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    heal();
+    await vi.advanceTimersByTimeAsync(12_500); // inactivity cut 1 (progress)
+    expect(controller.busy).toBe(false);
+
+    // Cuts 2..6 — the F18 adversary: before each resume, allow exactly ONE more
+    // request to land (hangAfter is cumulative over statsCalls). The later
+    // cycles run past the ~100s TTL, so the single landing is a TTL-expired
+    // re-fetch that does NOT advance the frontier — precisely the churn the
+    // finding describes. The ladder accounting must not care WHAT landed.
+    let quickHeals = 0;
+    for (let cut = 2; cut <= 6; cut++) {
+      // Past the ~8s quick window granted by the PREVIOUS cut (#1..#5): the
+      // self-heal probe fires. (For cut 6 this consumes quick grant #5.)
+      await vi.advanceTimersByTimeAsync(8_500);
+      mockNet.hangAfter = mockNet.statsCalls.length + 1; // exactly one landing this run
+      const onChanged = vi.fn(() => {
+        quickHeals++;
+        heal();
+      });
+      controller.pollTick({
+        network: 'testnet',
+        account: freshSnapshot(),
+        accountComplete: false,
+        onChanged,
+      });
+      expect(onChanged).toHaveBeenCalledTimes(1); // the previous cut DID grant quick
+      await vi.advanceTimersByTimeAsync(12_500); // one landing, then stall → cut
+      expect(controller.busy).toBe(false);
+    }
+    // Exactly BUDGET (5) quick-cadence heals were possible — grants #1..#5.
+    expect(quickHeals).toBe(5);
+
+    // Cut 6 made progress too, but the budget is spent: it escalated the FULL
+    // ladder (level-1 ≈ 60s + jitter), NOT quick #6. A probe past the quick
+    // window must be GATED — the time-unbounded trickle is dead.
+    await vi.advanceTimersByTimeAsync(8_500);
+    const gated = vi.fn();
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: false,
+      onChanged: gated,
+    });
+    expect(gated).not.toHaveBeenCalled();
+
+    // Offered load now decays on the ladder: eligible only past the full rung.
+    await vi.advanceTimersByTimeAsync(70_000);
+    const laddered = vi.fn();
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: false,
+      onChanged: laddered,
+    });
+    expect(laddered).toHaveBeenCalledTimes(1);
+    controller.abort();
+    vi.useRealTimers();
+  });
+
+  it('a complete snapshot REFILLS the budget — a later progress-cut earns quick again', async () => {
+    vi.useFakeTimers();
+    // Exhaust the whole budget with the same one-landing-per-run adversary.
+    mockNet.hangAfter = 10;
+    const controller = new DiscoveryController();
+    const heal = (): void =>
+      controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    heal();
+    await vi.advanceTimersByTimeAsync(12_500); // cut 1 → quick #1
+    for (let cut = 2; cut <= 6; cut++) {
+      await vi.advanceTimersByTimeAsync(8_500);
+      mockNet.hangAfter = mockNet.statsCalls.length + 1;
+      controller.pollTick({
+        network: 'testnet',
+        account: freshSnapshot(),
+        accountComplete: false,
+        onChanged: heal,
+      });
+      await vi.advanceTimersByTimeAsync(12_500);
+    }
+    expect(controller.busy).toBe(false); // budget spent; cut 6 walked the ladder
+
+    // The network recovers and a MANUAL refresh (never gated) completes —
+    // resetting ladder AND budget.
+    mockNet.hangAfter = null;
+    let complete = false;
+    controller.refresh({
+      network: 'testnet',
+      onSnapshot: (_s, c) => {
+        if (c) complete = true;
+      },
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    expect(complete).toBe(true);
+
+    // A LATER progress-cut (fresh scan: the change signal invalidated the cache,
+    // phase 1 lands, phase 2 stalls) earns the quick window again — the refilled
+    // budget's grant #1, eligible ~8s after the cut instead of a 60s rung.
+    invalidateScanCache('testnet');
+    mockNet.hangAfter = mockNet.statsCalls.length + 10;
+    controller.refresh({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(12_500); // progress-cut
+    expect(controller.busy).toBe(false);
+    await vi.advanceTimersByTimeAsync(8_500); // past the quick window, far under 60s
+    const healed = vi.fn();
+    controller.pollTick({
+      network: 'testnet',
+      account: freshSnapshot(),
+      accountComplete: false,
+      onChanged: healed,
+    });
+    expect(healed).toHaveBeenCalledTimes(1);
+    controller.abort();
+    vi.useRealTimers();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // F12 regression (round 5): a stale/ahead high-water mark can never HIDE funds —
 // phase 2 always evaluates from index 0.
 // ---------------------------------------------------------------------------

@@ -169,7 +169,9 @@ AbortController; do NOT restore a single fixed wall (it can't tell "slow but
 landing" from "wedged" and cuts progressing runs). **Backoff ladder (§1a/§b):**
 `BACKOFF_BASE_MS = 30_000`, `BACKOFF_CAP_MS = 480_000` (~8m), `MAX_BACKOFF_LEVEL
 = 8`, `BACKOFF_JITTER_MS = 10_000`, `QUICK_RETRY_MS = 8_000` (§b — a cut run that
-made progress becomes eligible again this fast, see `DiscoveryController`).
+made progress becomes eligible again this fast, see `DiscoveryController`),
+`QUICK_RETRY_BUDGET = 5` (F18 — max quick windows grantable between complete
+snapshots; once spent, every subsequent cut walks the full ladder).
 
 **Single-run pacing (Stage 2, v1.1.1).** The chain scan (`account.ts`
 `scanChain`) runs at `concurrency = 2` (down from 4) with a jittered
@@ -268,18 +270,26 @@ a full gap-20 evaluation.
   (`App.tsx` `discoveryRef`). `refresh(params)` — the MANUAL path (Try again /
   unlock / network switch / post-broadcast) — aborts any in-flight run and starts
   fresh; it is ALWAYS instant, never gated. Its OUTCOME feeds the backoff ladder:
-  a completed (phase-2) snapshot resets EVERYTHING; a cut/errored run is
-  **progress-gated (§b, v1.1.2)** — if it LANDED new responses (made progress; the
-  cross-run cache means its resume pays only the shrinking remainder) it earns a
-  QUICK retry (`QUICK_RETRY_MS`, ~8s) and the ladder level resets, otherwise it
-  escalates the full ladder one rung (a superseded run touches neither). The
-  progress signal is `DiscoveryHandle.madeProgress()` (≥1 network response
-  landed — cache hits don't count, so a resumed run that only re-walks the cache
-  and then stalls is correctly "no progress" and walks the ladder). **No separate
-  "was quick-retried" flag is needed:** quick is granted ONLY on genuine forward
-  progress, so a quick-retried run that then lands nothing hits the no-progress
-  branch and escalates — consecutive no-progress runs always decay and a wedged
-  network can never self-DoS on the quick window. `refresh` also accepts optional
+  a completed (phase-2) snapshot resets EVERYTHING (ladder, quick window, AND the
+  F18 budget below); a cut/errored run is **progress-gated (§b, v1.1.2)** — if it
+  LANDED new responses (made progress; the cross-run cache means its resume
+  usually pays only the shrinking remainder) it earns a QUICK retry
+  (`QUICK_RETRY_MS`, ~8s) and the ladder level resets, otherwise it escalates the
+  full ladder one rung (a superseded run touches neither). The progress signal is
+  `DiscoveryHandle.madeProgress()` (≥1 network response landed — cache hits don't
+  count, so a resumed run that only re-walks the cache and then stalls is
+  correctly "no progress" and walks the ladder). **The quick privilege is
+  BUDGETED (F18):** progress alone is NOT proof of convergence — against a
+  partially-serving network, ~100s cache-TTL expiry re-fetches can consume each
+  run's landings without advancing the scan frontier, which pre-F18 refreshed the
+  privilege indefinitely (a time-unbounded ~1-run/20s trickle) — so at most
+  `QUICK_RETRY_BUDGET` (5) quick windows are granted between complete snapshots;
+  once spent, EVERY subsequent cut (progress or not) escalates the full ladder
+  until a complete snapshot resets everything. TRUE worst-case bound: ≈ budget ×
+  (12s cut + 8s window) ≈ 100s of quick cadence, then guaranteed ladder decay. A
+  quick-retried run that lands nothing walks the full ladder regardless —
+  consecutive no-progress runs always decay and a wedged network is never
+  quick-retried. `refresh` also accepts optional
   `onProgress` (forwarded to the run for the scan-progress cue) and `onSettled` —
   fired once when THIS run settles (complete, error, or cut) AND is still the
   current run (never a superseded one). The App clears the stored scan-progress in
