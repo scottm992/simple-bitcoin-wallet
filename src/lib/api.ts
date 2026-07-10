@@ -35,6 +35,29 @@ export const MAX_ACCEPTED_FEE_RATE = 500;
  */
 const MAX_ARRAY_ENTRIES = 5_000;
 
+/**
+ * Hard cap on the vin/vout vector sizes we will ingest for a single
+ * transaction (F2). Our own wallet's transactions carry a handful of inputs
+ * and 1–2 outputs; 200 is far above anything this app will ever have built,
+ * while still rejecting a hostile response designed to exhaust memory. A
+ * legitimate foreign monster-tx over the cap surfaces as a typed error (it
+ * could never be fee-bumped by this wallet anyway).
+ */
+const MAX_TX_VECTOR_ENTRIES = 200;
+
+/**
+ * Hard cap on a transaction's claimed weight (F2): the Bitcoin consensus block
+ * weight limit. Anything above is a hostile/broken response, not a real tx.
+ */
+const MAX_TX_WEIGHT = 4_000_000;
+
+/**
+ * Hard cap on an ingested address string's length (F2). The longest standard
+ * address form (bech32/bech32m) is 90 characters per BIP-173; 100 leaves slack
+ * without admitting hostile megabyte "addresses" into app state.
+ */
+const MAX_ADDRESS_LENGTH = 100;
+
 /** Base URL for the mempool.space REST API for a given network. */
 export function apiBaseUrl(network: Network): string {
   return network === 'mainnet'
@@ -134,6 +157,29 @@ function asBool(v: unknown, what: string): boolean {
   return v;
 }
 
+/** Validates an unsigned 32-bit integer field (e.g. an input's nSequence). */
+function asU32(v: unknown, what: string): number {
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 0xffffffff) {
+    throw new ApiResponseError(200, `Malformed ${what}: not a u32 integer`);
+  }
+  return v;
+}
+
+/**
+ * Validates an OPTIONAL address string field (F2): standard outputs always
+ * carry `scriptpubkey_address`, but nonstandard ones (e.g. OP_RETURN) omit it —
+ * on both networks (the same esplora code serves mainnet and testnet, verified
+ * against live responses). Present-but-wrong-type or absurdly long values are
+ * rejected; absent/null values return undefined.
+ */
+function optionalAddress(v: unknown, what: string): string | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== 'string' || v.length === 0 || v.length > MAX_ADDRESS_LENGTH) {
+    throw new ApiResponseError(200, `Malformed ${what}: not a plausible address string`);
+  }
+  return v;
+}
+
 /** Confirmed + pending balance for an address, in satoshis. */
 export interface AddressStats {
   /** Confirmed (in-chain) balance in sats. */
@@ -171,6 +217,48 @@ export interface AddressTx {
   readonly blockTime?: number;
   /** Net value change for the queried address, in sats (can be negative). */
   readonly netSats: bigint;
+}
+
+/** The previous output an input spends, as reported by the API. */
+export interface ApiTxPrevout {
+  /** The value of the spent output, in sats. */
+  readonly value: bigint;
+  /** The address of the spent output; absent for nonstandard scripts. */
+  readonly address?: string;
+}
+
+/** One input of a fetched transaction. */
+export interface ApiTxVin {
+  /** The funding transaction id. */
+  readonly txid: string;
+  /** The output index within the funding transaction. */
+  readonly vout: number;
+  /** The input's nSequence (BIP125: signals RBF when < 0xfffffffe). */
+  readonly sequence: number;
+  /** The spent output's value/address; absent for coinbase inputs. */
+  readonly prevout?: ApiTxPrevout;
+}
+
+/** One output of a fetched transaction. */
+export interface ApiTxVout {
+  /** The output value, in sats. */
+  readonly value: bigint;
+  /** The output's address; absent for nonstandard scripts (e.g. OP_RETURN). */
+  readonly address?: string;
+}
+
+/** A full transaction, fetched by txid and validated on ingest (F2). */
+export interface ApiTransaction {
+  readonly txid: string;
+  readonly confirmed: boolean;
+  /** The fee the transaction pays, in sats. */
+  readonly feeSats: bigint;
+  /** The transaction weight, in weight units. */
+  readonly weight: number;
+  /** The virtual size, in vBytes: ceil(weight / 4). */
+  readonly vsize: number;
+  readonly vin: readonly ApiTxVin[];
+  readonly vout: readonly ApiTxVout[];
 }
 
 /** Per-request options for GETs: an abort signal and a timeout override. */
@@ -421,6 +509,113 @@ export async function getAddressTxs(
     };
     return out;
   });
+}
+
+/**
+ * Fetches one transaction by txid — the data source for the Speed-up (RBF
+ * fee-bump) flow. The `txidArg` is validated as 64-hex BEFORE the URL is built,
+ * so a malformed/hostile identifier can never reach the request path.
+ *
+ * Every consumed field is validated on ingest (F2), and validation is
+ * network-stable: the same esplora code serves mainnet and testnet, so the
+ * response shape is identical on both (verified against live responses). The
+ * only legitimately absent fields are `vin[].prevout` (coinbase inputs) and
+ * `scriptpubkey_address` (nonstandard scripts) — both are typed as optional
+ * rather than rejected, so validation is never flaky across networks.
+ *
+ * Cross-field integrity (F2): the response's own txid must equal the requested
+ * txid, duplicate input outpoints are rejected, and — whenever every input
+ * carries a prevout — the claimed `fee` must equal
+ * `sum(prevout values) − sum(output values)` exactly. A hostile response
+ * cannot understate or inflate the fee baseline the bump economics build on.
+ *
+ * @param network - The active network.
+ * @param txidArg - The transaction id to fetch (64 lowercase hex chars).
+ * @param signal - Optional abort signal.
+ * @throws {ApiResponseError} Status 400 for a malformed `txidArg` (rejected
+ *   client-side, no request made); status 200 for a malformed response field.
+ * @throws {ApiNetworkError} On transport failure.
+ */
+export async function getTransaction(
+  network: Network,
+  txidArg: string,
+  signal?: AbortSignal,
+): Promise<ApiTransaction> {
+  if (!/^[0-9a-f]{64}$/.test(txidArg)) {
+    throw new ApiResponseError(400, 'Invalid txid argument (expected 64 lowercase hex chars)');
+  }
+  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/tx/${txidArg}`, { signal });
+  const obj = asObject(raw, 'transaction');
+
+  const responseTxid = txid(obj['txid'], 'tx txid');
+  if (responseTxid !== txidArg) {
+    throw new ApiResponseError(200, 'Malformed transaction: txid does not match the request');
+  }
+  const status = asObject(obj['status'], 'tx status');
+  const confirmed = asBool(status['confirmed'], 'tx confirmed');
+  const feeSats = satAmount(obj['fee'], 'tx fee');
+  const weight = nonNegInt(obj['weight'], 'tx weight');
+  if (weight === 0 || weight > MAX_TX_WEIGHT) {
+    throw new ApiResponseError(200, 'Malformed tx weight: outside the plausible range');
+  }
+  const vsize = Math.ceil(weight / 4);
+
+  const vinRaw = asArray(obj['vin'], 'tx vin');
+  const voutRaw = asArray(obj['vout'], 'tx vout');
+  if (vinRaw.length === 0 || vinRaw.length > MAX_TX_VECTOR_ENTRIES) {
+    throw new ApiResponseError(200, `Malformed tx vin: implausible entry count (${vinRaw.length})`);
+  }
+  if (voutRaw.length === 0 || voutRaw.length > MAX_TX_VECTOR_ENTRIES) {
+    throw new ApiResponseError(200, `Malformed tx vout: implausible entry count (${voutRaw.length})`);
+  }
+
+  const seenOutpoints = new Set<string>();
+  const vin: ApiTxVin[] = vinRaw.map((entry) => {
+    const v = asObject(entry, 'vin');
+    const inTxid = txid(v['txid'], 'vin txid');
+    const inVout = nonNegInt(v['vout'], 'vin vout');
+    const outpoint = `${inTxid}:${inVout}`;
+    if (seenOutpoints.has(outpoint)) {
+      throw new ApiResponseError(200, 'Malformed tx vin: duplicate input outpoint');
+    }
+    seenOutpoints.add(outpoint);
+    const sequence = asU32(v['sequence'], 'vin sequence');
+    const prevoutRaw = v['prevout'];
+    if (prevoutRaw === null || prevoutRaw === undefined) {
+      // Coinbase inputs carry no prevout; typed as optional, never rejected.
+      return { txid: inTxid, vout: inVout, sequence };
+    }
+    const po = asObject(prevoutRaw, 'vin prevout');
+    const address = optionalAddress(po['scriptpubkey_address'], 'prevout address');
+    const prevout: ApiTxPrevout = {
+      value: satAmount(po['value'], 'prevout value'),
+      ...(address !== undefined ? { address } : {}),
+    };
+    return { txid: inTxid, vout: inVout, sequence, prevout };
+  });
+
+  const vout: ApiTxVout[] = voutRaw.map((entry) => {
+    const o = asObject(entry, 'vout');
+    const address = optionalAddress(o['scriptpubkey_address'], 'vout address');
+    const out: ApiTxVout = {
+      value: satAmount(o['value'], 'vout value'),
+      ...(address !== undefined ? { address } : {}),
+    };
+    return out;
+  });
+
+  // Cross-field integrity: with every prevout present, the claimed fee must be
+  // exactly inputs − outputs. (Skipped only for coinbase-style inputs, which
+  // this wallet can never bump anyway.)
+  if (vin.every((v) => v.prevout !== undefined)) {
+    const totalIn = vin.reduce((sum, v) => sum + (v.prevout?.value ?? 0n), 0n);
+    const totalOut = vout.reduce((sum, o) => sum + o.value, 0n);
+    if (totalIn < totalOut || totalIn - totalOut !== feeSats) {
+      throw new ApiResponseError(200, 'Malformed transaction: fee does not match inputs − outputs');
+    }
+  }
+
+  return { txid: responseTxid, confirmed, feeSats, weight, vsize, vin, vout };
 }
 
 /**

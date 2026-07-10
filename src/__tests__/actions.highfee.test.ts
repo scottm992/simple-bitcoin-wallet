@@ -19,7 +19,7 @@ vi.mock('../lib/api', async (importOriginal) => {
 
 import { signAndBroadcast } from '../actions';
 import { broadcastTx } from '../lib/api';
-import { FeeTooHighError, deriveReceiveAddress, type WalletUtxo } from '../lib';
+import { FeeTooHighError, deriveReceiveAddress, getSendRecord, type WalletUtxo } from '../lib';
 import { setUnlocked, lockNow } from '../session';
 
 const ABANDON =
@@ -47,6 +47,7 @@ const SMALL_SEND = {
 afterEach(() => {
   lockNow();
   vi.clearAllMocks();
+  localStorage.clear();
 });
 
 describe('signAndBroadcast — allowHighFee threading (F10)', () => {
@@ -60,8 +61,8 @@ describe('signAndBroadcast — allowHighFee threading (F10)', () => {
 
   it('with informed consent the same small send builds, signs, and reaches broadcast', async () => {
     setUnlocked(ABANDON);
-    const txid = await signAndBroadcast({ ...SMALL_SEND, allowHighFee: true });
-    expect(txid).toBe('f'.repeat(64));
+    const result = await signAndBroadcast({ ...SMALL_SEND, allowHighFee: true });
+    expect(result.txid).toBe('f'.repeat(64));
 
     const mock = vi.mocked(broadcastTx);
     expect(mock).toHaveBeenCalledTimes(1);
@@ -71,6 +72,14 @@ describe('signAndBroadcast — allowHighFee threading (F10)', () => {
     expect(typeof txHex).toBe('string');
     expect((txHex as string).length).toBeGreaterThan(100);
     expect(/^[0-9a-f]+$/i.test(txHex as string)).toBe(true);
+
+    // F15: the local send record was written, keyed by the RETURNED txid, with
+    // the user-confirmed recipient and the exact recipient-output amount.
+    expect(result.sendRecorded).toBe(true);
+    expect(getSendRecord('mainnet', result.txid)).toEqual({
+      recipient: RECIPIENT,
+      amountSats: 10_000n,
+    });
   });
 
   it('consent still cannot push a hostile 5000 sat/vB rate through to broadcast', async () => {

@@ -16,6 +16,30 @@ import type { Network } from './wallet';
 export const DUST_LIMIT_SATS = 546n;
 
 /**
+ * nSequence set on EVERY input we build, to opt into BIP125 opt-in
+ * Replace-By-Fee. A transaction signals replaceability when at least one input
+ * has `nSequence < 0xfffffffe` (equivalently `<= 0xfffffffd`); we set it
+ * uniformly on all inputs so the signal is unambiguous.
+ *
+ * Value rationale — `0xfffffffd` is `MAX_BIP125_RBF_SEQUENCE` (Bitcoin Core):
+ * the LARGEST sequence that still signals RBF. Picking the maximum keeps the two
+ * other sequence-driven behaviours OFF, so this value signals RBF and nothing
+ * else:
+ * - Its high bit (`0x80000000`, the BIP68 "disable" flag) is set, so it enables
+ *   NO relative timelock (BIP68/CSV) — the input stays immediately spendable.
+ * - It encodes no absolute-locktime constraint (our txs use lockTime 0 anyway).
+ *   (`0xffffffff` is "final" and does NOT signal RBF; `0xfffffffe` signals no
+ *   RBF but is locktime-enabling — 0xfffffffd sits just below it.)
+ *
+ * Signalling RBF makes a stuck, under-priced payment rescuable by the Speed-up
+ * (fee-bump) flow added in Phase B. nSequence is committed in the BIP143
+ * witness-v0 sighash, so this value is authenticated by every input signature
+ * and lands in the final signed tx. It does not change vsize (nSequence is
+ * always 4 bytes), so fee estimates are unaffected.
+ */
+export const RBF_SEQUENCE = 0xfffffffd;
+
+/**
  * HARD ceiling on the fee rate (sat/vByte) the signer will accept. A sane rate
  * is ~1–50 sat/vB even in congestion; anything above this is treated as a
  * bad/hostile estimate and rejected unconditionally. NOT overridable via
@@ -46,6 +70,27 @@ export const MAX_FEE_ABSOLUTE_SATS = 1_000_000n;
 const TX_OVERHEAD_VB = 11; // version + locktime + segwit marker/flag + counts (rounded up from 10.5)
 const P2WPKH_INPUT_VB = 68; // per spending input
 const OUTPUT_VB = 31; // per P2WPKH output (recipient / change)
+
+/**
+ * The network's incremental relay feerate (sat/vB), used by the BIP125 rule: a
+ * replacement must pay at least the original's absolute fee PLUS this rate
+ * times the replacement's vsize, or relays drop it. Bitcoin Core's default
+ * (`incrementalrelayfee`) is 1000 sat/kvB = 1 sat/vB.
+ */
+export const INCREMENTAL_RELAY_SAT_VB = 1;
+
+/**
+ * Plausibility window for the ORIGINAL transaction's vsize handed to the bump
+ * builder (it originates from the untrusted API's `weight`). The smallest real
+ * 1-input/1-output P2WPKH tx is ~110 vB; the largest standard-relay tx is
+ * 100,000 vB (MAX_STANDARD_TX_WEIGHT / 4). A value outside this window is a
+ * hostile/broken input, not a real transaction of ours. The direction of risk
+ * is fail-safe either way: an understated vsize just yields a replacement
+ * relays reject (no funds move), and an overstated one inflates the fee INTO
+ * the F1/F10 guards, which reject it.
+ */
+const MIN_BUMP_OLD_VSIZE = 100;
+const MAX_BUMP_OLD_VSIZE = 100_000;
 
 /** A spendable UTXO owned by this wallet. */
 export interface WalletUtxo {
@@ -157,6 +202,48 @@ export class FeeTooHighError extends Error {
     this.feeSats = feeSats;
     this.feeRateSatVb = feeRateSatVb;
     this.comparedToSats = comparedToSats;
+  }
+}
+
+/**
+ * Machine-readable reasons a pending payment cannot be sped up (fee-bumped).
+ * The UI maps each to honest plain-English copy — never a dead-end without one.
+ * - `confirmed` — the payment already confirmed; nothing to speed up.
+ * - `not-signaling` — an input does not signal BIP125 (sent before v1.1).
+ * - `foreign-inputs` — an input isn't provably ours (not our derived address).
+ * - `insufficient-change` — nothing left in the payment to raise the fee from
+ *   (change can't absorb the increase / a sweep would push the recipient
+ *   amount below dust).
+ * - `unsupported-shape` — the transaction isn't a shape this wallet builds
+ *   (multiple recipients, address-less outputs, ambiguous self-send).
+ * - `recipient-mismatch` — the API's recipient/amount for this payment do NOT
+ *   match the local send record written when this wallet broadcast it (F15).
+ *   A possible attack: hard fail, no override anywhere.
+ * - `unverified` — no local send record exists for this payment on this
+ *   device (F15): the wallet was restored from its 12 words on a new device,
+ *   so the record didn't travel. Honest dead-end — never a silent bypass.
+ */
+export type CannotBumpReason =
+  | 'confirmed'
+  | 'not-signaling'
+  | 'foreign-inputs'
+  | 'insufficient-change'
+  | 'unsupported-shape'
+  | 'recipient-mismatch'
+  | 'unverified';
+
+/**
+ * Thrown when a transaction cannot be replaced (sped up). Carries a
+ * machine-readable {@link CannotBumpReason} so the UI can show the specific
+ * honest explanation rather than a generic failure.
+ */
+export class CannotBumpError extends Error {
+  /** Why the transaction cannot be bumped. */
+  readonly reason: CannotBumpReason;
+  constructor(reason: CannotBumpReason, message: string) {
+    super(message);
+    this.name = 'CannotBumpError';
+    this.reason = reason;
   }
 }
 
@@ -481,6 +568,8 @@ export function buildAndSignTx(params: BuildTxParams): BuiltTx {
       txid: utxo.txid,
       index: utxo.vout,
       witnessUtxo: { script: payment.script, amount: utxo.value },
+      // BIP125 opt-in RBF: signal replaceability on every input (see RBF_SEQUENCE).
+      sequence: RBF_SEQUENCE,
     });
   }
 
@@ -510,6 +599,424 @@ export function buildAndSignTx(params: BuildTxParams): BuiltTx {
     vsize: tx.vsize,
     totalInputSats: totalInput,
     changeSats,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// RBF fee bump (Speed-up flow)
+// ---------------------------------------------------------------------------
+
+/** Parameters for {@link estimateBumpFee} — pure numbers, no keys/addresses. */
+export interface BumpEstimateParams {
+  /**
+   * EXACTLY the original transaction's inputs, as wallet UTXOs (the actions
+   * layer maps prevout addresses to derivation paths; the engine stays pure
+   * and never fetches). The replacement spends the identical outpoint set —
+   * v1 deliberately adds NO inputs, so the replacement's conflict set equals
+   * the original's and the BIP125 complexity around introducing new
+   * unconfirmed inputs (rule 2) never arises.
+   */
+  readonly utxos: readonly WalletUtxo[];
+  /** The amount the ORIGINAL transaction pays its recipient, in sats. */
+  readonly recipientAmountSats: bigint;
+  /** Whether the original transaction carries a change output. */
+  readonly hasChangeOutput: boolean;
+  /** The fee the original transaction pays, in sats (from the chain API). */
+  readonly oldFeeSats: bigint;
+  /** The original transaction's actual vsize in vBytes (ceil(weight/4)). */
+  readonly oldVsize: number;
+  /** The requested new fee rate, in sat/vByte. */
+  readonly feeRateSatVb: number;
+}
+
+/**
+ * The full fee picture for a prospective RBF bump — the EXACT numbers
+ * {@link buildRbfBumpTx} will use, because the build consumes this same
+ * function (F11: one code path, no parallel computation that can drift).
+ */
+export interface BumpFeeEstimate {
+  /** The absolute fee the replacement will pay, in sats (dust-fold included). */
+  readonly newFeeSats: bigint;
+  /** The original fee, echoed for display. */
+  readonly oldFeeSats: bigint;
+  /** What the bump costs on top of the original fee: new − old. */
+  readonly extraFeeSats: bigint;
+  /** The vsize (vB) the fee was computed for (replacement structure). */
+  readonly newVsize: number;
+  /** The replacement's effective rate: newFeeSats / newVsize (display only). */
+  readonly effectiveRateSatVb: number;
+  /** The rate the caller asked for, echoed for display. */
+  readonly requestedRateSatVb: number;
+  /**
+   * True when the BIP125 floors (old fee + incremental relay, and
+   * strictly-greater effective rate) raised the fee ABOVE what the requested
+   * rate alone would pay. The estimate reports the raised values — the engine
+   * never silently builds a replacement relays would reject.
+   */
+  readonly rateWasRaised: boolean;
+  /** Whether the replacement carries a change output. */
+  readonly hasChange: boolean;
+  /** The replacement's change value, in sats (0 when no change output). */
+  readonly newChangeSats: bigint;
+  /** The amount the replacement pays the recipient, in sats. */
+  readonly newRecipientAmountSats: bigint;
+  /**
+   * How much LESS the recipient receives than in the original, in sats.
+   * Non-zero only for a no-change (sweep-style) original, where the fee
+   * increase has nowhere to come from but the recipient amount — the UI must
+   * collect explicit consent before building. 0 when change absorbs the fee.
+   */
+  readonly reducesRecipientBy: bigint;
+  /** Sum of the input values, in sats. */
+  readonly totalInputSats: bigint;
+  /**
+   * True when the new fee trips the {@link MAX_FEE_FRACTION} informed-consent
+   * rule (same semantics as sends: compared against amount + fee, or total
+   * input for a no-change sweep). {@link buildRbfBumpTx} throws
+   * {@link FeeTooHighError} unless `allowHighFee` is set.
+   */
+  readonly needsHighFeeConsent: boolean;
+  /**
+   * True when the floors pushed the fee above what the HARD
+   * {@link MAX_FEE_RATE_SAT_VB} ceiling permits for this size — i.e. the
+   * original already pays at/near the emergency ceiling and a compliant
+   * replacement cannot stay under it. {@link buildRbfBumpTx} rejects this
+   * unconditionally (never bypassable via `allowHighFee`).
+   */
+  readonly exceedsRateCeiling: boolean;
+}
+
+/** The three BIP125-economics floors, combined: the minimum compliant fee. */
+function bumpFeeFloor(
+  newVsize: number,
+  oldFeeSats: bigint,
+  oldVsize: number,
+  feeRateSatVb: number,
+): bigint {
+  // What the requested rate alone would pay for the replacement.
+  const target = feeForVsize(newVsize, feeRateSatVb);
+  // BIP125 rule 4: replacement fee ≥ original fee + incremental relay fee ×
+  // replacement vsize, or relays drop it.
+  const relayFloor = oldFeeSats + BigInt(newVsize * INCREMENTAL_RELAY_SAT_VB);
+  // BIP125 rule 6 (in spirit): the replacement's effective rate must EXCEED
+  // the original's. Smallest integer fee with newFee/newVsize > oldFee/oldVsize.
+  const rateFloor = (oldFeeSats * BigInt(newVsize)) / BigInt(oldVsize) + 1n;
+  let fee = target;
+  if (relayFloor > fee) fee = relayFloor;
+  if (rateFloor > fee) fee = rateFloor;
+  return fee;
+}
+
+/**
+ * Dry-runs the RBF bump fee computation for a pending payment — the single
+ * source of truth for "what would speeding this payment up cost".
+ * {@link buildRbfBumpTx} consumes this same function, so a sheet built on it is
+ * exact by construction (F11).
+ *
+ * Replacement structure: the SAME inputs and the SAME recipient/amount as the
+ * original. The fee increase comes out of the change output; when the original
+ * has no change (a sweep), it comes out of the recipient amount instead and
+ * `reducesRecipientBy` reports by how much. Change left sub-dust by the
+ * increase is folded into the fee (same dust rule as {@link estimateSendFee}).
+ *
+ * If the requested rate does not clear the BIP125 floors (old fee +
+ * {@link INCREMENTAL_RELAY_SAT_VB} × new vsize; strictly greater effective
+ * rate), the fee is RAISED to the floor and reported (`rateWasRaised`) — this
+ * function never describes a replacement relays would reject.
+ *
+ * @throws {InvalidTxParamsError} On non-positive rate/amount, an implausible
+ *   `oldVsize`, or params that don't reconcile (inputs ≠ amount + change + fee).
+ * @throws {CannotBumpError} reason `insufficient-change` when nothing in the
+ *   payment can absorb any fee increase.
+ */
+export function estimateBumpFee(params: BumpEstimateParams): BumpFeeEstimate {
+  const { utxos, recipientAmountSats, hasChangeOutput, oldFeeSats, oldVsize, feeRateSatVb } = params;
+
+  if (!(feeRateSatVb > 0) || !Number.isFinite(feeRateSatVb)) {
+    throw new InvalidTxParamsError('feeRateSatVb must be a positive number');
+  }
+  if (utxos.length === 0) {
+    throw new InvalidTxParamsError('bump requires the original inputs');
+  }
+  if (recipientAmountSats <= 0n) {
+    throw new InvalidTxParamsError('recipientAmountSats must be positive');
+  }
+  if (oldFeeSats < 0n) {
+    throw new InvalidTxParamsError('oldFeeSats must be non-negative');
+  }
+  if (
+    !Number.isInteger(oldVsize) ||
+    oldVsize < MIN_BUMP_OLD_VSIZE ||
+    oldVsize > MAX_BUMP_OLD_VSIZE
+  ) {
+    throw new InvalidTxParamsError('oldVsize outside the plausible transaction range');
+  }
+
+  const totalInput = utxos.reduce((sum, u) => sum + u.value, 0n);
+
+  // Reconciliation: the caller's numbers must describe a real transaction —
+  // inputs = recipient + change + fee exactly. Catches any mapping bug in the
+  // layer above before it can reach fee math or signing.
+  const oldChange = totalInput - recipientAmountSats - oldFeeSats;
+  if (oldChange < 0n || (!hasChangeOutput && oldChange !== 0n)) {
+    throw new InvalidTxParamsError('bump params do not reconcile (inputs ≠ amount + change + fee)');
+  }
+
+  const requestedRateSatVb = feeRateSatVb;
+
+  if (hasChangeOutput) {
+    // Fee increase comes out of the change output. Same structure as the
+    // original (same inputs, recipient + change), so the replacement's vsize
+    // is the original's actual vsize — exact even for non-P2WPKH recipients.
+    const keepVsize = oldVsize;
+    const fee = bumpFeeFloor(keepVsize, oldFeeSats, oldVsize, feeRateSatVb);
+    const rateWasRaised = fee > feeForVsize(keepVsize, feeRateSatVb);
+    // Hard-ceiling accounting happens on the PRE-fold fee, mirroring sends
+    // (the F1 rate guard applies to the requested/floored fee; the dust-fold
+    // slop below is bounded by DUST_LIMIT_SATS, exactly as in selectCoins).
+    const exceedsRateCeiling = fee > feeForVsize(keepVsize, MAX_FEE_RATE_SAT_VB);
+
+    const newChange = totalInput - recipientAmountSats - fee;
+    if (newChange < 0n) {
+      throw new CannotBumpError(
+        'insufficient-change',
+        'The change output cannot absorb the required fee increase',
+      );
+    }
+
+    if (newChange >= DUST_LIMIT_SATS) {
+      return {
+        newFeeSats: fee,
+        oldFeeSats,
+        extraFeeSats: fee - oldFeeSats,
+        newVsize: keepVsize,
+        effectiveRateSatVb: Number(fee) / keepVsize,
+        requestedRateSatVb,
+        rateWasRaised,
+        hasChange: true,
+        newChangeSats: newChange,
+        newRecipientAmountSats: recipientAmountSats,
+        reducesRecipientBy: 0n,
+        totalInputSats: totalInput,
+        needsHighFeeConsent: fee > feeFractionCeiling(recipientAmountSats + fee),
+        exceedsRateCeiling,
+      };
+    }
+
+    // Sub-dust change: drop the change output and fold the residue into the
+    // fee (dust rule as in selectCoins). The folded fee still clears every
+    // floor for the SMALLER structure: foldedFee ≥ fee ≥ each floor at
+    // keepVsize > the same floor at foldVsize (all three floors shrink with
+    // vsize), so relays accept the replacement.
+    const foldVsize = oldVsize - OUTPUT_VB;
+    const foldedFee = totalInput - recipientAmountSats;
+    return {
+      newFeeSats: foldedFee,
+      oldFeeSats,
+      extraFeeSats: foldedFee - oldFeeSats,
+      newVsize: foldVsize,
+      effectiveRateSatVb: Number(foldedFee) / foldVsize,
+      requestedRateSatVb,
+      rateWasRaised,
+      hasChange: false,
+      newChangeSats: 0n,
+      newRecipientAmountSats: recipientAmountSats,
+      reducesRecipientBy: 0n,
+      totalInputSats: totalInput,
+      needsHighFeeConsent: foldedFee > feeFractionCeiling(recipientAmountSats + foldedFee),
+      exceedsRateCeiling,
+    };
+  }
+
+  // No change output (sweep-style original): the fee increase has nowhere to
+  // come from but the recipient amount. Structure unchanged (same inputs, one
+  // output), so the replacement's vsize is the original's actual vsize.
+  const newVsize = oldVsize;
+  const fee = bumpFeeFloor(newVsize, oldFeeSats, oldVsize, feeRateSatVb);
+  const rateWasRaised = fee > feeForVsize(newVsize, feeRateSatVb);
+  const exceedsRateCeiling = fee > feeForVsize(newVsize, MAX_FEE_RATE_SAT_VB);
+
+  const newRecipientAmount = totalInput - fee;
+  if (newRecipientAmount < DUST_LIMIT_SATS) {
+    throw new CannotBumpError(
+      'insufficient-change',
+      'Raising the fee would push the swept amount below the dust limit',
+    );
+  }
+
+  return {
+    newFeeSats: fee,
+    oldFeeSats,
+    extraFeeSats: fee - oldFeeSats,
+    newVsize,
+    effectiveRateSatVb: Number(fee) / newVsize,
+    requestedRateSatVb,
+    rateWasRaised,
+    hasChange: false,
+    newChangeSats: 0n,
+    newRecipientAmountSats: newRecipientAmount,
+    reducesRecipientBy: recipientAmountSats - newRecipientAmount,
+    totalInputSats: totalInput,
+    // Sweep semantics, as in estimateSendFee: compare against the total input.
+    needsHighFeeConsent: fee > feeFractionCeiling(totalInput),
+    exceedsRateCeiling,
+  };
+}
+
+/** Parameters for {@link buildRbfBumpTx}. */
+export interface BuildBumpParams {
+  /** The wallet mnemonic (secret; used only to derive signing keys, then dropped). */
+  readonly mnemonic: string;
+  /** The active network. */
+  readonly network: Network;
+  /** EXACTLY the original transaction's inputs (see {@link BumpEstimateParams.utxos}). */
+  readonly utxos: readonly WalletUtxo[];
+  /** The ORIGINAL transaction's recipient address (reused verbatim). */
+  readonly recipient: string;
+  /** The amount the original pays that recipient, in sats. */
+  readonly recipientAmountSats: bigint;
+  /**
+   * The ORIGINAL transaction's change address (ours), or null when the
+   * original carries no change output. Reused verbatim so the replacement's
+   * outputs match the original's — only the amounts shift toward the fee.
+   */
+  readonly changeAddress: string | null;
+  /** The fee the original pays, in sats. */
+  readonly oldFeeSats: bigint;
+  /** The original's actual vsize, in vBytes. */
+  readonly oldVsize: number;
+  /** The requested new fee rate, in sat/vByte. */
+  readonly feeRateSatVb: number;
+  /** Informed consent for the {@link MAX_FEE_FRACTION} rule ONLY (F10). */
+  readonly allowHighFee?: boolean;
+}
+
+/**
+ * Builds and signs a BIP125 replacement for a pending payment: the SAME inputs
+ * (each re-signalling with {@link RBF_SEQUENCE}, so a bump can itself be
+ * re-bumped) and the SAME recipient, with the fee raised per
+ * {@link estimateBumpFee} — which this function CONSUMES, never re-derives, so
+ * the sheet's numbers and the signed transaction cannot disagree (F11).
+ *
+ * All send-path fee guards apply unchanged:
+ * - a requested rate above {@link MAX_FEE_RATE_SAT_VB} — HARD reject (F1/F10);
+ * - a floored fee that cannot stay under that ceiling for this size
+ *   (`exceedsRateCeiling`) — HARD reject;
+ * - a fee above {@link MAX_FEE_ABSOLUTE_SATS} — HARD reject;
+ * - the {@link MAX_FEE_FRACTION} consent rule — bypassable ONLY via
+ *   `allowHighFee`, same semantics as sends.
+ *
+ * @throws {InvalidTxParamsError} On invalid/unreconcilable params.
+ * @throws {CannotBumpError} When the payment has nothing to raise the fee from.
+ * @throws {FeeTooHighError} Per the guards above.
+ * @throws {InvalidRecipientError} On a bad or wrong-network recipient/change.
+ */
+export function buildRbfBumpTx(params: BuildBumpParams): BuiltTx {
+  const { mnemonic, network, utxos, recipient, changeAddress } = params;
+  const allowHighFee = params.allowHighFee ?? false;
+
+  if (!(params.feeRateSatVb > 0) || !Number.isFinite(params.feeRateSatVb)) {
+    throw new InvalidTxParamsError('feeRateSatVb must be a positive number');
+  }
+  // F1 hard rate ceiling — allowHighFee does NOT bypass (F10).
+  if (params.feeRateSatVb > MAX_FEE_RATE_SAT_VB) {
+    throw new FeeTooHighError(
+      `Fee rate ${params.feeRateSatVb} sat/vB exceeds the ${MAX_FEE_RATE_SAT_VB} sat/vB safety limit`,
+      0n,
+      params.feeRateSatVb,
+      0n,
+    );
+  }
+
+  // Validate destination scripts up front (throws on wrong network/malformed).
+  const recipientScript = scriptForAddress(recipient, network);
+  const changeScript = changeAddress !== null ? scriptForAddress(changeAddress, network) : null;
+
+  // The ONE bump code path (F11): the sheet's estimate and this build share it.
+  const est = estimateBumpFee({
+    utxos,
+    recipientAmountSats: params.recipientAmountSats,
+    hasChangeOutput: changeAddress !== null,
+    oldFeeSats: params.oldFeeSats,
+    oldVsize: params.oldVsize,
+    feeRateSatVb: params.feeRateSatVb,
+  });
+
+  const comparedTo = est.hasChange ? est.newRecipientAmountSats + est.newFeeSats : est.totalInputSats;
+
+  // HARD: the BIP125 floors cannot push the effective rate past the F1 ceiling.
+  if (est.exceedsRateCeiling) {
+    throw new FeeTooHighError(
+      `A compliant replacement fee would exceed the ${MAX_FEE_RATE_SAT_VB} sat/vB safety limit`,
+      est.newFeeSats,
+      params.feeRateSatVb,
+      comparedTo,
+    );
+  }
+  // HARD absolute ceiling — allowHighFee does NOT bypass (F10).
+  if (est.newFeeSats > MAX_FEE_ABSOLUTE_SATS) {
+    throw new FeeTooHighError(
+      `Fee ${est.newFeeSats} sats exceeds the absolute ${MAX_FEE_ABSOLUTE_SATS}-sat safety limit`,
+      est.newFeeSats,
+      params.feeRateSatVb,
+      comparedTo,
+    );
+  }
+  // Percentage rule — the ONLY guard allowHighFee bypasses (F10). Computed
+  // inside estimateBumpFee so the sheet and this build can never disagree (F11).
+  if (!allowHighFee && est.needsHighFeeConsent) {
+    throw new FeeTooHighError(
+      `Fee ${est.newFeeSats} sats exceeds ${Math.round(MAX_FEE_FRACTION * 100)}% of the amount being sent`,
+      est.newFeeSats,
+      params.feeRateSatVb,
+      comparedTo,
+    );
+  }
+  if (est.hasChange && changeScript === null) {
+    // Unreachable by construction (hasChange requires hasChangeOutput); kept
+    // as a fail-closed invariant so a future refactor can't route change away.
+    throw new InvalidTxParamsError('change output required but no change address provided');
+  }
+
+  const net = btcNetwork(network);
+  const tx = new Transaction();
+
+  for (const utxo of utxos) {
+    const priv = derivePrivateKeyForPath(mnemonic, utxo.path);
+    const pub = pubFromPriv(priv);
+    const payment = p2wpkh(pub, net);
+    if (!payment.script) {
+      throw new InvalidTxParamsError('Failed to build input script');
+    }
+    tx.addInput({
+      txid: utxo.txid,
+      index: utxo.vout,
+      witnessUtxo: { script: payment.script, amount: utxo.value },
+      // Re-signal BIP125 so the replacement can itself be sped up again.
+      sequence: RBF_SEQUENCE,
+    });
+  }
+
+  tx.addOutput({ script: recipientScript, amount: est.newRecipientAmountSats });
+  if (est.hasChange && changeScript !== null) {
+    tx.addOutput({ script: changeScript, amount: est.newChangeSats });
+  }
+
+  for (let i = 0; i < utxos.length; i++) {
+    const utxo = utxos[i];
+    if (!utxo) continue;
+    const priv = derivePrivateKeyForPath(mnemonic, utxo.path);
+    tx.signIdx(priv, i);
+  }
+  tx.finalize();
+
+  return {
+    txHex: tx.hex,
+    txid: tx.id,
+    feeSats: est.newFeeSats,
+    vsize: tx.vsize,
+    totalInputSats: est.totalInputSats,
+    changeSats: est.newChangeSats,
   };
 }
 

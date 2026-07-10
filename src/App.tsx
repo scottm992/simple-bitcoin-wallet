@@ -30,7 +30,15 @@ import {
   getMnemonic,
   isUnlocked,
 } from './session';
-import { DiscoveryController, loadFees, loadPrice, signAndBroadcast } from './actions';
+import {
+  DiscoveryController,
+  bumpAndBroadcast,
+  loadFees,
+  loadPrice,
+  prepareBump,
+  signAndBroadcast,
+  type PreparedBump,
+} from './actions';
 import type { AccountSnapshot } from './lib/account';
 import type { DisplayUnit } from './display';
 
@@ -433,7 +441,9 @@ export default function App(): JSX.Element {
   async function confirmSend(): Promise<void> {
     const pending = state.pendingSend;
     if (!pending || !state.account) throw new Error('nothing to send');
-    const txid = await signAndBroadcast({
+    // sendRecorded=false (a best-effort storage failure) never blocks a send —
+    // it only means this payment won't be speed-up-able later (F15).
+    const { txid } = await signAndBroadcast({
       network: state.network,
       utxos: state.account.utxos,
       recipient: pending.recipient,
@@ -445,6 +455,32 @@ export default function App(): JSX.Element {
     });
     dispatch({ type: 'sendBroadcast', txid });
     // Refresh so the pending tx shows up in activity.
+    void refreshAll();
+  }
+
+  // ---- Speed up (RBF fee bump) --------------------------------------------
+  // The Activity detail sheet owns the sub-flow's UI state; App owns the two
+  // impure calls that read the mnemonic + touch the network, mirroring how
+  // confirmSend wraps signAndBroadcast.
+
+  /** Gathers everything the Speed-up offer needs (one network fetch). */
+  async function speedUpPrepare(txid: string, signal?: AbortSignal): Promise<PreparedBump> {
+    if (!state.account) throw new Error('no account loaded');
+    return prepareBump(state.network, txid, state.account, signal);
+  }
+
+  /**
+   * Builds + broadcasts the boosted replacement, then triggers the same full
+   * refresh the send path uses so the replaced payment (new id) settles into
+   * Activity. The sheet keeps its success state on screen until dismissed, so
+   * this refresh never flashes a scary "the old payment vanished" intermediate.
+   */
+  async function speedUpConfirm(
+    prepared: PreparedBump,
+    feeRateSatVb: number,
+    allowHighFee: boolean,
+  ): Promise<void> {
+    await bumpAndBroadcast({ network: state.network, prepared, feeRateSatVb, allowHighFee });
     void refreshAll();
   }
 
@@ -673,6 +709,10 @@ export default function App(): JSX.Element {
             items={state.account?.activity ?? []}
             status={state.accountStatus}
             btcUsd={state.btcUsd}
+            account={state.account}
+            fees={state.feeEstimates}
+            onPrepareBump={speedUpPrepare}
+            onBumpConfirm={speedUpConfirm}
             onBack={goHome}
             onRefresh={() => void refreshAll()}
           />
