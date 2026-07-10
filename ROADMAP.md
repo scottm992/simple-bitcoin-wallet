@@ -3,15 +3,17 @@
 Where Simple Bitcoin Wallet could go from v1.0 (July 2026). Items are ordered
 by value-for-effort within each phase; nothing here is committed work.
 
-## v1.2.0 — 🚧 built 2026-07-10 for owner UX testing: blockstream.info is the chain-data source
+## v1.2.0 — 🚧 built 2026-07-10, Round-13 audited pre-ship: blockstream.info is the chain-data source
 
-> ⚠️ **ROUND 13 SECURITY AUDIT OWED — before any further money-path work.** This
-> release was built with the formal Fable security round **explicitly deferred by
-> the owner** so he could test on his phone quickly. It touches API ingestion and
-> the trust model (a second endpoint), which the repo's own rules require a review
-> round for. **Do not build further on the money path, and do not treat v1.2.0 as
-> audited, until Round 13 runs and appends to `docs/review/round1.md` (continuing
-> the F-numbering from F18).**
+> ✅ **ROUND 13 SECURITY AUDIT: RAN PRE-SHIP, 2026-07-10 — verdict SHIP, 0
+> blockers.** The audit was briefly deferred while the owner was out of credits
+> (this banner used to say "OWED"); credits were restored and the full round ran
+> on `blockstream-primary` BEFORE any merge to `main`. Findings: **F19 (Low)** —
+> the broadcast response body is trusted as the txid (fail-closed, one-line fix
+> recommended as a fast-follow: use the locally-computed `BuiltTx.txid`) — and
+> **F20 (Info)** — the convergence-honesty comments overstate the poll's
+> mid-convergence reach (doc correction). Full report: `docs/review/round1.md`,
+> "Round 13". v1.2.0 may be treated as audited; next finding number is F21.
 
 **Owner field evidence, 2026-07-10:** mempool.space now rate-limits the owner's
 IP with bare HTTP **429s** (no `Retry-After`; a token bucket ≈25–40 refilling
@@ -38,12 +40,15 @@ The app treated a 429 as a fatal run error, so scans died and the frontier
   still nukes the cache instantly in both modes (generation-fenced, F16).
 
 Built with `tsc` clean and the full suite green (279 → 290 tests). **Round 13
-should attack:** the second-endpoint trust surface (a lying blockstream mis-stating
-balances — display-only, still caught by F15 on the one non-derivable field, the
-bump recipient); the 429-pause inactivity-suspension interplay with the hard cap
-and the F16 generation guard; and the convergence-TTL honesty argument (a payment
-arriving mid-convergence must still be caught by the uncached poll within one
-cycle).
+attacked** the second-endpoint trust surface (validators confirmed byte-identical;
+a lying blockstream is display-only + broadcast-relay, F15 unbroken — the one
+crack is the broadcast-returned txid, F19 Low, fail-closed); the 429-pause
+interplay with the inactivity suspension, hard cap, abort discipline, and the F16
+generation guard (all held at deterministic interleavings; the §1c ruling:
+compliant — a bounded server-priced pause REDUCES offered load); and the
+convergence-TTL honesty argument (understate-only, honest cue throughout;
+detection is one poll cycle after COMPLETION, not after arrival — F20 Info, doc
+correction).
 
 ## v1.1.1 — ✅ shipped 2026-07-10: discovery retry loop self-throttles the API
 
@@ -149,7 +154,8 @@ network behaves byte-identically to v1.1.1.
   2026-07-10. **Still future:** true FAILOVER architecture (automatic switch when
   the primary is unreachable/throttling) and the optional cross-check of displayed
   balances between the two — today it is a straight primary swap, not a resilient
-  multi-source layer. Revisiting either still needs the owned Round 13 audit first.
+  multi-source layer (Round 13 audited the swap; either extension gets its own
+  review round).
 - **Smarter password strength** — a proper local estimator (zxcvbn-class,
   vendored/audited) instead of the current heuristic; still no server, still
   plain-English guidance.
