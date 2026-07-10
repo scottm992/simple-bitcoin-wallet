@@ -1862,3 +1862,80 @@ mempool.space. Gates re-confirmed after deletion: `tsc --noEmit` clean,
 `npm test` = 290 passing, `npm run build` clean, dist CSP `script-src 'self';
 connect-src 'self' https://mempool.space https://blockstream.info`. Next finding
 number: **F21**._
+
+---
+
+## Round 13 closure — F19 / F20 re-check
+
+**Both findings CLOSED. New findings: 0. Ship recommendation: SHIP `blockstream-primary`.**
+
+Re-audit of the two fix commits: `02585f6` (F19 — the locally computed txid is
+authoritative; the relay echo never keys anything) and `7fb8eff` (F20 — honest
+convergence-detection bound + the stale ROUND-13-OWED wording corrected at the
+four flagged source sites). `tsc --noEmit` clean, `npm test` = **294 passing**
+(290 + the 4-case shipped F19 suite), `npm run build` clean, dist CSP unchanged
+(`connect-src 'self' https://mempool.space https://blockstream.info`;
+`script-src 'self'`), no `console.*` in `src/`, no live API contact this pass
+(mocked only). Verified with throwaway `round13close.review.test.ts` (5 probes,
+independent harness) + `round13close.api.review.test.ts` (3 probes, real
+`broadcastTx`), executed, deleted.
+
+- **F19 — hostile relay re-run — CLOSED.** Independent re-run of the Round-13
+  adversary against the committed code: a relay answering a successful POST /tx
+  with a wrong-but-well-formed txid, or outright HTML garbage, changes NOTHING —
+  `BroadcastResult.txid` strictly equals the independently recomputed
+  `built.txid` (deterministic rebuild, exact equality), the F15 record is keyed
+  by it carrying the user-confirmed recipient/amount, and `getSendRecord` under
+  the lie is `null` — for sends AND for a bump whose own relay lies harder
+  (`not-even-hex`). The Speed-up chain verifies end to end on the REAL txid
+  (`prepareBump` → record match), and — the side the shipped suite doesn't
+  re-check — the F15 HARD FAIL is intact: a hostile `getTransaction`
+  substituting the recipient under the real txid still dead-ends
+  `recipient-mismatch` (typed `CannotBumpError`). The chain of trust now
+  terminates entirely in local values: `built.txid` → sendLog → prepareBump.
+- **F19 — no new failure mode — CONFIRMED.** Real `broadcastTx` + stubbed fetch:
+  a 2xx with a divergent/garbage body RESOLVES (trimmed echo returned,
+  diagnostics only — a lying success echo is deliberately not an error); a
+  non-2xx surfaces byte-identically (typed `ApiResponseError`, relay status AND
+  body verbatim — pinned independently and by the shipped api test); still
+  exactly ONE POST to `blockstream.info/api/tx`, never a retry. Consumer sweep:
+  `broadcastTx` has exactly two call sites in non-test `src/` (the two broadcast
+  paths in `actions.ts`), both now `await` it without binding the return —
+  nothing anywhere consumes the echo.
+- **F20 — corrected wording matches reality — CLOSED.** Grep of every claim
+  site: the two `account.ts` comments and `ENGINE.md` now state the true bound
+  ("detected within one poll cycle of the next COMPLETE snapshot — not of its
+  arrival") plus WHY the poll deliberately does not run while incomplete; no
+  overclaim survives anywhere in `src/`/`docs/` (the only remaining old-claim
+  text is this audit trail quoting it). Behavior re-pinned against the wording:
+  `pollTick` with an incomplete snapshot issues ZERO api requests and self-heals
+  via `onChanged`; with a complete snapshot it runs the uncached 2-request
+  tips poll. The stale "Round 13 audit OWED" wording is gone from `api.ts`
+  (header + `chainApiBaseUrl` doc), `vite.config.ts`, and `ENGINE.md` — all now
+  read "audited pre-ship in Round 13"; the ROADMAP banner records both findings
+  closed pre-merge.
+- **Scope + regression — GREEN.** `02585f6` touches only the two broadcast-path
+  identity bindings in `actions.ts` (plus docs/tests); its `api.ts` hunks are
+  comment-only (the return statement's behavior is unchanged). `7fb8eff` is
+  comments/docs only (`account.ts`, `api.ts`, `vite.config.ts`, `ENGINE.md`,
+  `ROADMAP.md`) — zero behavioral hunks. `tx.ts`, `sendLog.ts`, `vault.ts`,
+  `state.ts`, fee/price paths, and `public/` are untouched by both. Full suite
+  294/294 — every Round-13 pin (429-pause probes' shipped equivalents,
+  convergence tests, URL split, F1–F18 regressions) green. The updated
+  bump/highfee suites now run their relay mock as deliberate garbage — a
+  standing structural pin that no broadcast-path assertion can ever silently
+  re-grow a dependency on the echo.
+
+**SHIP.** F19's fix is exactly the recommended one and strictly strengthens the
+trust model (the relay lost its last write into the F15 chain — it is now purely
+display-source + relay, with identity fully local); F20's correction makes the
+documented honesty bound match the probe-verified behavior. Both fixes are
+minimal, correct, and regression-free.
+
+_Round-13-closure throwaway tests used the `.review.test.ts` suffix, were
+executed, and were deleted; the only file modified is this
+`docs/review/round1.md`, committed on `blockstream-primary` (not pushed). Zero
+live API calls this pass. Gates re-confirmed after deletion: `tsc --noEmit`
+clean, `npm test` = 294 passing, `npm run build` clean, dist CSP
+`connect-src 'self' https://mempool.space https://blockstream.info`. Next
+finding number: **F21**._
