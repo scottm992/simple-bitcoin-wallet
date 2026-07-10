@@ -2140,3 +2140,38 @@ and were deleted; the only file modified is this `docs/review/round1.md`,
 committed on `custom-fee` (not pushed). Zero live API calls this round. Gates
 re-confirmed after deletion: `tsc --noEmit` clean, `npm test` = 319 passing,
 `npm run build` clean, dist CSP unchanged. Next finding number: **F22**._
+
+## Round 14 closure — F21 re-check
+
+**F21 — CLOSED.** Fix commit `5377d91` (PM-authored per the one-liners policy;
+this closure is the independent check the policy exists for). The sendMax
+conversion line now renders only when `sendMax && feeSats !== null`, with the
+WHY comment citing F21, and the else-branch became `!sendMax && conversion`.
+
+- **Reproduction re-run (my probe, not the fix's own test):** Max + Custom with
+  no rate → NO `.amount-conv` node, no `$0.00`, no `0.00000000 BTC` anywhere on
+  the screen; also dark for a MALFORMED (`abc`) and an OUT-OF-RANGE (`0.01`)
+  entry, not just empty (the shipped regression test covers only the empty
+  case — the fix's `feeSats !== null` gate covers all three, probed). A valid
+  rate restores the honest balance-minus-fee line; switching back to a tier
+  keeps it honest. Review stays hard-disabled and `review()` a no-op throughout.
+- **The else-branch adjustment is CORRECT and necessary, not just cosmetic:**
+  under Max the `conversion` memo is NON-empty (amountSats = spendableSats), so
+  a plain `feeSats !== null ? sweep : conversion ? …` would have leaked the
+  full-balance conversion into the dark state — the `!sendMax` guard prevents
+  exactly that (probed: no conversion string paints in the F21 state). Non-Max
+  rendering is byte-identical: a typed USD amount paints the same
+  `convBtc(…)` string before/after and UNDER custom-with-no-rate, invalid, and
+  valid rates alike (the line is amount-derived, deliberately rate-free), the
+  BTC entry unit path is unchanged, and an empty amount still paints nothing.
+- **No other `previewAmountSats` fallback renders:** its three render sites are
+  the now-gated sweep line, the `feeSats !== null`-gated total line, and the
+  high-fee percentage (rendered only with a live feeSelection). Diff scope is
+  exactly Send.tsx (the one ternary + comment) and the one added regression
+  test; engine/actions/api untouched.
+
+Gates on `5377d91`: `npm test` = **320 passing** (319 + the F21 regression
+test), `tsc --noEmit` clean, `npm run build` clean. Throwaway
+`round14closure.review.test.tsx` (4 probes) executed and deleted.
+
+**SHIP** stands. Next finding number: **F22**.
