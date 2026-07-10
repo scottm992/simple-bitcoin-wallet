@@ -19,6 +19,7 @@
  */
 import type { Chain, DerivedAddress, Network } from './wallet';
 import type { AddressStats, AddressTx, ApiUtxo } from './api';
+import { isRateLimitError, RATE_LIMIT_PAUSE_MS } from './api';
 import type { WalletUtxo } from './tx';
 
 /**
@@ -242,6 +243,29 @@ export interface DiscoveryOptions {
    * only when a {@link ScanCache} is present. Absent ⇒ no-op (byte-identical).
    */
   readonly onResponse?: () => void;
+  /**
+   * Engine-internal hook fired when a DISCOVERY chain-data GET (stats / utxos /
+   * txs) is rejected with an explicit HTTP 429 — the server pricing a wait
+   * (v1.2.0). The orchestrator ({@link startDiscovery} in `actions.ts`) decides
+   * whether a polite in-run PAUSE is granted and returns:
+   *  - a RELEASE callback ⇒ the pause is granted: {@link withRateLimitPause}
+   *    waits {@link RATE_LIMIT_PAUSE_MS}, calls release, then RETRIES the same
+   *    request. The orchestrator suspends its INACTIVITY cutoff for the wait (a
+   *    deliberate pause must never be read as a stall), resuming it on release;
+   *    the HARD CAP is untouched and still binds.
+   *  - `null` ⇒ denied (the per-run pause budget `MAX_RATE_LIMIT_PAUSES` is
+   *    spent, or the run has settled): the 429 propagates and the run is cut
+   *    exactly as a stall is (phase-1 kept; resume later from the cross-run
+   *    cache).
+   *
+   * This is NOT the §1c-forbidden transport retry: a 429 is an explicit
+   * server-priced wait, and honoring it REDUCES offered load (unlike a blind
+   * retry against a silent staller, which doubled it). Absent ⇒ a 429 throws
+   * immediately with no pause — byte-identical to pre-v1.2.0. Only stats / utxos
+   * / txs route through here; broadcast / getTransaction / fees / price are never
+   * wrapped, so a 429 on those throws exactly as today.
+   */
+  readonly onRateLimitPause?: () => (() => void) | null;
 }
 
 /**
@@ -530,7 +554,15 @@ export async function discoverAccount(
   options: Partial<DiscoveryOptions> = {},
 ): Promise<AccountSnapshot> {
   const opts: DiscoveryOptions = { ...DEFAULT_DISCOVERY_OPTIONS, ...options };
-  const cachedApi = opts.cache ? withScanCache(api, opts.cache, opts.onResponse) : api;
+  // Layer the discovery api (v1.2.0): 429-pause wraps the RAW api INNERMOST, then
+  // the cache wraps THAT. So a cache HIT never reaches the pause logic (no 429 to
+  // handle), and `onResponse` (the landed-response / inactivity signal) fires in
+  // `withScanCache` only after a genuine successful response — a 429 that is
+  // paused-and-retried resolves as ONE landed response; a 429 that exhausts the
+  // budget throws and lands nothing. Both wrappers are opt-in: absent hooks ⇒
+  // byte-identical passthrough.
+  const baseApi = opts.onRateLimitPause ? withRateLimitPause(api, opts.onRateLimitPause) : api;
+  const cachedApi = opts.cache ? withScanCache(baseApi, opts.cache, opts.onResponse) : baseApi;
 
   // ---- Scan-progress aggregation (optional; onProgress absent ⇒ no-op) ------
   // discoverAccount owns the aggregation across the two CONCURRENTLY-scanning
@@ -619,6 +651,82 @@ export async function discoverAccount(
     usedAddresses: usedScanned.map((s) => s.derived.address),
     receiveHighWater: receive.highestUsedIndex,
     changeHighWater: change.highestUsedIndex,
+  };
+}
+
+/**
+ * A plain delay that resolves early if `signal` aborts. Used for the 429 pause
+ * (a fixed wait, no jitter — unlike {@link pacedDelay}), so a run cutoff (hard
+ * cap / supersede) still ends the wait promptly instead of hanging the full pause.
+ */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(t);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    if (signal?.aborted) {
+      done();
+      return;
+    }
+    signal?.addEventListener('abort', done);
+  });
+}
+
+/**
+ * Wraps the discovery chain-data GETs (stats / utxos / txs) so an explicit HTTP
+ * 429 becomes a polite in-run PAUSE instead of a fatal run error (v1.2.0). On a
+ * 429 it asks the orchestrator (`onRateLimitPause`) whether a pause is granted:
+ *  - granted (a release callback) ⇒ wait {@link RATE_LIMIT_PAUSE_MS} honoring the
+ *    run's abort signal, release, then RETRY the same request against the
+ *    (partly-refilled) token bucket;
+ *  - denied (`null` — budget spent / run settled) ⇒ rethrow, and the run is cut
+ *    exactly as a stall is (phase-1 kept; resume later from the cross-run cache).
+ *
+ * ONLY an explicit 429 is handled here (see {@link isRateLimitError}); every other
+ * rejection — transport failure, any other non-2xx, a malformed body — propagates
+ * unchanged (§1c: discovery GETs never transport-retry). `release()` is called in
+ * a `finally`, so the orchestrator's pause bookkeeping (and its suspended
+ * inactivity clock) is always balanced even when the wait is cut by an abort. A
+ * signal already aborted at the top short-circuits (no pause), matching the
+ * mapWithConcurrency abort discipline.
+ */
+function withRateLimitPause(api: AccountApi, onRateLimitPause: () => (() => void) | null): AccountApi {
+  async function withPause<T>(
+    call: (signal?: AbortSignal) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    // A function (not a bare `signal?.aborted` read) so TS does not narrow the
+    // property and then wrongly assume it is unchanged across the `await` below —
+    // the signal can abort DURING the pause, which is the whole point.
+    const aborted = (): boolean => signal?.aborted === true;
+    for (;;) {
+      try {
+        return await call(signal);
+      } catch (err) {
+        // Only a server-priced 429 pauses; anything else (and any already-aborted
+        // run) is fatal to this request exactly as before.
+        if (!isRateLimitError(err) || aborted()) throw err;
+        const release = onRateLimitPause();
+        if (release === null) throw err; // budget spent / settled → cut like a stall
+        try {
+          await abortableSleep(RATE_LIMIT_PAUSE_MS, signal);
+        } finally {
+          release();
+        }
+        if (aborted()) throw err; // cut during the wait → don't retry
+        // else loop: retry the SAME request.
+      }
+    }
+  }
+  return {
+    getAddressStats: (network, address, signal) =>
+      withPause((s) => api.getAddressStats(network, address, s), signal),
+    getUtxos: (network, address, signal) => withPause((s) => api.getUtxos(network, address, s), signal),
+    getAddressTxs: (network, address, signal) =>
+      withPause((s) => api.getAddressTxs(network, address, s), signal),
   };
 }
 

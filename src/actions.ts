@@ -88,6 +88,21 @@ const DISCOVERY_INACTIVITY_MS = 12_000;
  */
 const DISCOVERY_HARD_CAP_MS = 120_000;
 
+/**
+ * Cap on how many times ONE discovery run may PAUSE for a server-priced HTTP 429
+ * (v1.2.0). Each grant waits `RATE_LIMIT_PAUSE_MS` (~12s, api.ts) and retries the
+ * paused request; past this cap the run is cut exactly as a stall is (phase-1
+ * kept, cue shown, resume later from the cross-run cache). 3 bounds the total
+ * deliberate wait one run can incur at ~36s — comfortably inside the 120s hard
+ * cap — so a persistent rate-limit wall decays offered load onto the backoff
+ * ladder instead of parking a run in a pause loop. This is NOT the §1c-forbidden
+ * transport retry: a 429 is the server explicitly pricing a wait, and honoring a
+ * bounded number of them REDUCES offered load. While a pause is active the run's
+ * INACTIVITY cutoff is suspended (a deliberate wait is not a stall); the HARD CAP
+ * is never extended and still binds a pathological pause loop.
+ */
+const MAX_RATE_LIMIT_PAUSES = 3;
+
 /** Concurrency for the cheap poll's stats re-checks. */
 const POLL_CONCURRENCY = 4;
 
@@ -295,11 +310,16 @@ export function startDiscovery(params: {
   /** Inter-wave pacing delay (Stage 2); omitted → the production default. Tests
    *  pass 0 to keep request-count assertions fast and deterministic. */
   waveDelayMs?: number;
+  /** Per-run cap on server-priced 429 pauses (v1.2.0); omitted →
+   *  {@link MAX_RATE_LIMIT_PAUSES}. Tests inject a small/large value to exercise
+   *  the budget-cut and the hard-cap-cuts-a-pause-loop paths deterministically. */
+  maxRateLimitPauses?: number;
 }): DiscoveryHandle {
   const { network, onSnapshot, onError } = params;
   const controller = new AbortController();
   const inactivityMs = params.inactivityMs ?? DISCOVERY_INACTIVITY_MS;
   const hardCapMs = params.hardCapMs ?? params.deadlineMs ?? DISCOVERY_HARD_CAP_MS;
+  const maxRateLimitPauses = params.maxRateLimitPauses ?? MAX_RATE_LIMIT_PAUSES;
   let gotSnapshot = false;
   // An externally aborted (superseded) run must stay silent: the aborter owns
   // the UI state now. Only a cutoff / genuine failure with no result may settle
@@ -313,9 +333,16 @@ export function startDiscovery(params: {
   // network fetches that resolved — cache hits don't count). ≥1 ⇒ the run made
   // forward progress; the controller reads this via {@link DiscoveryHandle.madeProgress}.
   let landedResponses = 0;
+  // v1.2.0 429-pause state: how many server-priced pauses this run has granted
+  // (budgeted by `maxRateLimitPauses`), and how many are CURRENTLY active (a
+  // depth counter, since ~4 requests scan concurrently and several can 429 at
+  // once). While `pauseDepth > 0` the inactivity clock is suspended outright.
+  let rateLimitPauses = 0;
+  let pauseDepth = 0;
 
   // The HARD CAP: an unconditional wall so the run always settles (F12). Never
-  // reset — a run never outlives it regardless of activity.
+  // reset — a run never outlives it regardless of activity, INCLUDING a 429 pause
+  // loop (the inactivity suspension below never touches this timer).
   const hardCap = setTimeout(() => controller.abort(), hardCapMs);
   // The INACTIVITY cutoff: (re-)armed on every landed response. A total stall
   // (nothing lands) fires it after one full window — faster than the old fixed
@@ -324,8 +351,39 @@ export function startDiscovery(params: {
   const onResponse = (): void => {
     if (settled) return;
     landedResponses++;
+    // While a deliberate 429 pause is active the pause OWNS the inactivity clock
+    // (it is cleared). A concurrent landing during the wait must NOT re-arm a
+    // short window that would then fire mid-pause — it still counts as progress,
+    // but the clock stays suspended until the last pause releases.
+    if (pauseDepth > 0) return;
     clearTimeout(inactivity);
     inactivity = setTimeout(() => controller.abort(), inactivityMs);
+  };
+  // v1.2.0: a chain-data GET returned HTTP 429 (a server-priced wait). Grant a
+  // bounded in-run pause up to `maxRateLimitPauses` times; past the budget (or
+  // once settled) deny by returning null, and the run is cut exactly like a stall
+  // (phase-1 kept, resume from the cross-run cache). On grant, SUSPEND the
+  // inactivity cutoff for the wait — a deliberate pause must never be read as a
+  // stall — and return a release that resumes a fresh inactivity window once the
+  // LAST concurrent pause ends. The HARD CAP is deliberately left alone, so a
+  // pathological pause loop is still cut by it. This is the §1c distinction made
+  // concrete: honoring an explicit 429 REDUCES offered load, unlike a blind retry.
+  const onRateLimitPause = (): (() => void) | null => {
+    if (settled) return null;
+    if (rateLimitPauses >= maxRateLimitPauses) return null;
+    rateLimitPauses++;
+    pauseDepth++;
+    clearTimeout(inactivity);
+    return () => {
+      if (pauseDepth > 0) pauseDepth--;
+      // Resume a fresh inactivity window only when every concurrent pause has
+      // ended and the run is still live (not settled, not aborted) — arming a
+      // timer for a doomed run would just be cleared in `finally` anyway.
+      if (pauseDepth === 0 && !settled && !controller.signal.aborted) {
+        clearTimeout(inactivity);
+        inactivity = setTimeout(() => controller.abort(), inactivityMs);
+      }
+    };
   };
 
   const done = (async () => {
@@ -346,6 +404,10 @@ export function startDiscovery(params: {
         // {@link DiscoveryOptions.onResponse}). Covers stats AND the utxo/txs
         // fetches uniformly, since all three go through `withScanCache`.
         onResponse,
+        // v1.2.0 429-pause hook (shared across BOTH phases, so the pause budget
+        // is per-RUN): grants/denies a bounded in-run pause on a server 429 and
+        // suspends the inactivity clock for its duration (see onRateLimitPause).
+        onRateLimitPause,
         // Scan-progress (display-only): forward each aggregated tick to the
         // caller, but ONLY while this run still owns the UI. A superseded/aborted
         // run must fall silent (same rule as the onSnapshot dispatches below,

@@ -16,6 +16,8 @@ import {
   getAddressTxs,
   getBtcUsdPrice,
   broadcastTx,
+  getTransaction,
+  isRateLimitError,
   ApiNetworkError,
   ApiResponseError,
   MAX_ACCEPTED_FEE_RATE,
@@ -213,6 +215,31 @@ describe('chain-data / fee-price URL split (v1.2.0)', () => {
     m = captureFetch(JSON.stringify({ USD: 60_000 }));
     await getBtcUsdPrice();
     expect(String(m.mock.calls[0]?.[0])).toBe('https://mempool.space/api/v1/prices');
+  });
+});
+
+// --- v1.2.0: HTTP 429 — the pause lives ABOVE the api layer -----------------
+
+describe('HTTP 429 (v1.2.0)', () => {
+  it('isRateLimitError is true ONLY for a 429 ApiResponseError', () => {
+    expect(isRateLimitError(new ApiResponseError(429, 'Too Many Requests'))).toBe(true);
+    expect(isRateLimitError(new ApiResponseError(503, 'busy'))).toBe(false);
+    expect(isRateLimitError(new ApiNetworkError('stalled'))).toBe(false);
+    expect(isRateLimitError(new Error('nope'))).toBe(false);
+    expect(isRateLimitError(undefined)).toBe(false);
+  });
+
+  it('a 429 on broadcast / getTransaction / fees still THROWS a typed ApiResponseError (no pause here)', async () => {
+    // The polite in-run pause is orchestrated in the discovery layer, NOT the api
+    // layer: these non-discovery-wrapped calls surface a 429 exactly as any other
+    // non-2xx, with no retry and no delay.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('Too Many Requests', { status: 429 })),
+    );
+    await expect(broadcastTx('mainnet', 'deadbeef')).rejects.toMatchObject({ status: 429 });
+    await expect(getFeeEstimates('mainnet')).rejects.toBeInstanceOf(ApiResponseError);
+    await expect(getTransaction('mainnet', 'ab'.repeat(32))).rejects.toMatchObject({ status: 429 });
   });
 });
 

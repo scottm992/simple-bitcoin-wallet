@@ -41,6 +41,20 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 const DISCOVERY_TIMEOUT_MS = 8_000;
 
 /**
+ * How long a discovery scan PAUSES in-run when a chain-data GET is rejected with
+ * an explicit HTTP 429 (see {@link isRateLimitError}). Sized to the field-measured
+ * token bucket (owner's IP vs mempool.space, 2026-07-10): the limiter refills at
+ * ~1 request/second, so a ~12s wait restores ~12 tokens — roughly a full scan
+ * wave — before the scan retries the paused request. Honoring the server's stated
+ * wait REDUCES offered load; it is emphatically NOT the §1c-forbidden per-request
+ * transport retry (which DOUBLED load against a silent staller that returned no
+ * error). The COUNT of pauses per run is capped by the orchestrator
+ * (`MAX_RATE_LIMIT_PAUSES`, actions.ts), so a persistent 429 wall still cuts the
+ * run onto the backoff ladder rather than parking it in a pause loop.
+ */
+export const RATE_LIMIT_PAUSE_MS = 12_000;
+
+/**
  * Fee-rate sanity window (sat/vByte) applied to untrusted estimates from
  * mempool.space (F1). A legitimate rate is ~1–50 even in heavy congestion; we
  * accept a generous ceiling but clamp anything outside `[MIN, MAX]` so a
@@ -131,6 +145,20 @@ export class ApiResponseError extends Error {
     this.status = status;
     this.body = body;
   }
+}
+
+/**
+ * Whether `err` is an explicit HTTP 429 (Too Many Requests). This is the ONE api
+ * rejection the discovery layer treats specially: a 429 is the server explicitly
+ * PRICING a wait (a token bucket refilling at ~1/s in tonight's field probes),
+ * not a silent stall. The orchestrator honors it as a bounded in-run PAUSE (see
+ * {@link RATE_LIMIT_PAUSE_MS}) that REDUCES offered load — the opposite of the
+ * §1c-forbidden transport retry, which doubled load against a stall-throttler
+ * that returns no error at all. Everything else (transport failure, any other
+ * non-2xx, a malformed body) is unaffected and propagates exactly as before.
+ */
+export function isRateLimitError(err: unknown): boolean {
+  return err instanceof ApiResponseError && err.status === 429;
 }
 
 // ---------------------------------------------------------------------------

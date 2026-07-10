@@ -26,6 +26,18 @@ const mockNet = vi.hoisted(() => ({
    * the v1.1.2 inactivity cutoff (landings keep resetting it) and hard cap.
    */
   responseDelayMs: null as number | null,
+  /**
+   * v1.2.0 429-pause: number of upcoming stats requests to reject with an
+   * explicit HTTP 429 (decremented per rejection). Exercises the polite in-run
+   * pause + retry.
+   */
+  rate429Count: 0,
+  /**
+   * v1.2.0 429-pause: reject with a 429 EVERY request once the call ordinal
+   * (statsCalls.length) passes this — e.g. `10` lets phase 1 land, then 429s all
+   * of phase 2. `0` 429s everything (a pathological pause loop).
+   */
+  rate429After: null as number | null,
   used: new Set<string>(),
   statsCalls: [] as string[],
   abortedRequests: 0,
@@ -39,6 +51,17 @@ vi.mock('../lib/api', async (importOriginal) => {
     ...actual,
     getAddressStats: vi.fn(async (_network: unknown, address: string, signal?: AbortSignal) => {
       mockNet.statsCalls.push(address);
+      // v1.2.0: reject with an explicit HTTP 429 to drive the polite in-run pause.
+      // Checked BEFORE the stall/delay/manual paths (a 429 is a rejection, not a
+      // stall). A retried request re-enters here, so rate429After keeps 429-ing
+      // until the budget is spent; rate429Count 429s a fixed number then relents.
+      const should429 =
+        mockNet.rate429Count > 0 ||
+        (mockNet.rate429After !== null && mockNet.statsCalls.length > mockNet.rate429After);
+      if (should429) {
+        if (mockNet.rate429Count > 0) mockNet.rate429Count--;
+        throw new actual.ApiResponseError(429, 'Too Many Requests');
+      }
       const statsFor = (addr: string) => {
         const used = mockNet.used.has(addr);
         return {
@@ -150,6 +173,8 @@ beforeEach(() => {
   mockNet.mode = 'instant';
   mockNet.hangAfter = null;
   mockNet.responseDelayMs = null;
+  mockNet.rate429Count = 0;
+  mockNet.rate429After = null;
   mockNet.used.clear();
   mockNet.statsCalls = [];
   mockNet.abortedRequests = 0;
@@ -334,6 +359,107 @@ describe('startDiscovery — progress-aware deadline (Bug A4 / v1.1.2)', () => {
     expect(flags).toEqual([false]); // never reached a complete phase-2
     expect(onError).not.toHaveBeenCalled();
     expect(mockNet.abortedRequests).toBeGreaterThan(0);
+    vi.useRealTimers();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.2.0 — HTTP 429 is a polite in-run PAUSE, never a dead run. A chain-data GET
+// that returns 429 pauses the scan for RATE_LIMIT_PAUSE_MS (~12s), then retries
+// and continues. The inactivity cutoff is SUSPENDED during the wait (a deliberate
+// pause is not a stall); the 120s hard cap and the per-run pause budget still
+// bind. NOT the §1c transport retry — a 429 is a server-priced wait and honoring
+// it REDUCES offered load.
+// ---------------------------------------------------------------------------
+
+describe('429 polite in-run pause (v1.2.0)', () => {
+  it('a mid-wave 429 pauses, retries, and completes in ONE run — the inactivity cutoff does NOT fire during the pause', async () => {
+    vi.useFakeTimers();
+    // Exactly one request 429s. The injected inactivity window (5s) is BELOW the
+    // 12s pause, so without the pause-suspension the run would be cut mid-wait —
+    // this is the discriminator that proves the suspension works.
+    mockNet.rate429Count = 1;
+    const flags: boolean[] = [];
+    const onError = vi.fn();
+    const handle = startDiscovery({
+      network: 'testnet',
+      inactivityMs: 5_000, // deliberately < RATE_LIMIT_PAUSE_MS (12s)
+      onSnapshot: (_s, c) => flags.push(c),
+      onError,
+    });
+
+    // At 6s we are PAST the un-suspended 5s inactivity but still inside the 12s
+    // pause: if the suspension had failed, the run would already be cut with no
+    // snapshot → onError. It is holding, so nothing has settled.
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(onError).not.toHaveBeenCalled();
+    expect(flags).toEqual([]); // phase 1 is blocked on the paused request
+
+    // Past the 12s pause the request retries and the whole scan completes in ONE
+    // run — phase 1 then a COMPLETE phase 2.
+    await vi.advanceTimersByTimeAsync(7_000); // t≈13s
+    await handle.done;
+    expect(flags).toEqual([false, true]);
+    expect(onError).not.toHaveBeenCalled();
+    expect(mockNet.abortedRequests).toBe(0); // nothing was cut
+    expect(mockNet.rate429Count).toBe(0); // the 429 was consumed, then retried OK
+    vi.useRealTimers();
+  });
+
+  it('the 120s hard cap still cuts a pathological pause loop (inactivity suspended, budget unbounded)', async () => {
+    vi.useFakeTimers();
+    // EVERY request 429s, and the pause budget is effectively unlimited, so the
+    // run would pause→retry→pause forever. A large inactivity window proves it is
+    // the HARD CAP — not inactivity — that finally settles it.
+    mockNet.rate429After = 0;
+    const onError = vi.fn();
+    const handle = startDiscovery({
+      network: 'testnet',
+      inactivityMs: 60_000, // large: cannot be the cutter here
+      hardCapMs: 30_000, // the binding wall
+      maxRateLimitPauses: 1_000, // budget never trips → only the hard cap can end it
+      onSnapshot: vi.fn(),
+      onError,
+    });
+
+    // Before the cap the run is still looping (paused), nothing settled.
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(onError).not.toHaveBeenCalled();
+
+    // The hard cap settles the never-completing pause loop; nothing ever landed,
+    // so it settles to error.
+    await vi.advanceTimersByTimeAsync(2_000); // t≈31s, past the 30s cap
+    await handle.done;
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(handle.madeProgress()).toBe(false); // nothing ever landed
+    vi.useRealTimers();
+  });
+
+  it('pauses past MAX_RATE_LIMIT_PAUSES cut the run, keeping the phase-1 partial (incomplete cue)', async () => {
+    vi.useFakeTimers();
+    // Phase 1 (10 requests) lands; every request after that 429s. With the default
+    // budget of 3, the run grants 3 pauses then denies — cutting phase 2 exactly
+    // as a stall would, keeping the phase-1 partial.
+    mockNet.rate429After = 10;
+    const flags: boolean[] = [];
+    const onError = vi.fn();
+    const handle = startDiscovery({
+      network: 'testnet',
+      onSnapshot: (_s, c) => flags.push(c),
+      onError,
+    });
+
+    // Phase 1 paints immediately (its 10 requests are all under the 429 threshold).
+    await vi.advanceTimersByTimeAsync(0);
+    expect(flags).toEqual([false]);
+
+    // Advance through the budgeted pauses (≤ 3 × 12s = 36s) plus slack — well under
+    // the 120s hard cap, so it is the BUDGET, not the cap, that cuts phase 2.
+    await vi.advanceTimersByTimeAsync(60_000);
+    await handle.done;
+    expect(flags).toEqual([false]); // phase 2 cut → still incomplete, never complete
+    expect(onError).not.toHaveBeenCalled(); // a landed phase-1 result is never an error
+    expect(handle.madeProgress()).toBe(true); // phase 1 landed
     vi.useRealTimers();
   });
 });
