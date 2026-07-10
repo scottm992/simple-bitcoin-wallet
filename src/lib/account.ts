@@ -205,6 +205,23 @@ export interface DiscoveryOptions {
    * `DISCOVERY_DEADLINE_MS` (20s) — the pacing never lengthens the deadline.
    */
   readonly waveDelayMs?: number;
+  /**
+   * Optional progress callback for the Home "Checking address N of ~M…" cue
+   * (scan-progress feature; DISPLAY-ONLY). Invoked as each address is EVALUATED
+   * during the gap-limit scan:
+   *  - `checked` = addresses evaluated so far across BOTH chains. Cache hits
+   *    COUNT — the user cares about scan position, not network traffic — because
+   *    we count evaluations, not fetches. Never decreases within a run.
+   *  - `estimatedTotal` = the current COMBINED window estimate across both
+   *    chains, which GROWS when a used address extends a chain's gap window (so
+   *    the honest cue form is "N of ~M", never a percent that could move
+   *    backwards). Only ever grows within a run.
+   * {@link discoverAccount} owns the cross-chain aggregation. ABSENT ⇒ ZERO
+   * behavior change: no aggregation runs and the request pattern is byte-for-byte
+   * identical. This is pure instrumentation — it touches nothing about WHEN or
+   * HOW requests are made (the handoff §8 do-nots hold).
+   */
+  readonly onProgress?: (checked: number, estimatedTotal: number) => void;
 }
 
 /**
@@ -360,6 +377,11 @@ async function scanChain(
   api: AccountApi,
   opts: DiscoveryOptions,
   highWater: number,
+  // Optional progress reporter (scan-progress feature). Called once per
+  // EVALUATED address with this chain's current window basis — the furthest
+  // index it now knows it must reach. `undefined` ⇒ no reporting AND
+  // byte-identical scan behavior. See {@link discoverAccount} for aggregation.
+  reportProgress?: (windowBasis: number) => void,
 ): Promise<{
   used: ScannedAddress[];
   nextUnusedIndex: number;
@@ -441,8 +463,19 @@ async function scanChain(
           firstUnusedRecorded = true;
         }
         consecutiveUnused++;
-        if (consecutiveUnused >= opts.gapLimit && index + k > highWater) break;
       }
+      // Report AFTER classification (scan-progress): every EVALUATED address
+      // counts as "checked" (cache hits included — we count evaluations, not
+      // fetches), and a used address that just extended this chain's window is
+      // reflected in the estimate on the SAME tick, so M grows exactly when the
+      // used address is seen. The basis is the furthest index this chain now
+      // must reach: max(cached high-water, highest used seen). When absent this
+      // is a no-op and the loop is byte-identical to before — the gap-limit
+      // `break` still fires on exactly the same address (a used address resets
+      // `consecutiveUnused` to 0, so the break can only trigger right after an
+      // unused increment, precisely as when it lived inside the `else`).
+      if (reportProgress !== undefined) reportProgress(Math.max(highWater, highestUsedIndex));
+      if (consecutiveUnused >= opts.gapLimit && index + k > highWater) break;
     }
     index += batch.length;
   }
@@ -479,13 +512,42 @@ export async function discoverAccount(
   const opts: DiscoveryOptions = { ...DEFAULT_DISCOVERY_OPTIONS, ...options };
   const cachedApi = opts.cache ? withScanCache(api, opts.cache) : api;
 
+  // ---- Scan-progress aggregation (optional; onProgress absent ⇒ no-op) ------
+  // discoverAccount owns the aggregation across the two CONCURRENTLY-scanning
+  // chains: `checked` is every address EVALUATED on either chain (cache hits
+  // included — we count evaluations, not fetches), and `estimatedTotal` is the
+  // SUM of each chain's current window estimate — which GROWS when a used
+  // address extends a chain's gap window. That growing M is why the cue is
+  // "N of ~M": a raw percent was rejected because it would move BACKWARDS as M
+  // grows. Both chains share these counters; JS is single-threaded, so the
+  // interleaved increments are race-free.
+  const onProgress = opts.onProgress;
+  const receiveHw = opts.highWater?.receive ?? -1;
+  const changeHw = opts.highWater?.change ?? -1;
+  // A chain's window estimate = the furthest index it must reach, plus the full
+  // gap window, clamped to maxIndex (we never scan past it). Seeded from the
+  // high-water mark so the FIRST report's combined M is already the full initial
+  // window (e.g. 20 + 20 = 40 for a fresh gap-20 run), not a half-populated sum.
+  const chainEstimate = (windowBasis: number): number =>
+    Math.min(windowBasis + 1 + opts.gapLimit, opts.maxIndex + 1);
+  const estimates: [number, number] = [chainEstimate(receiveHw), chainEstimate(changeHw)];
+  let checked = 0;
+  const makeReporter = (chain: Chain): ((windowBasis: number) => void) | undefined => {
+    if (onProgress === undefined) return undefined;
+    return (windowBasis: number): void => {
+      checked += 1;
+      estimates[chain] = chainEstimate(windowBasis);
+      onProgress(checked, estimates[0] + estimates[1]);
+    };
+  };
+
   let receive: Awaited<ReturnType<typeof scanChain>>;
   let change: Awaited<ReturnType<typeof scanChain>>;
   try {
     // Chains are independent; scan them concurrently.
     [receive, change] = await Promise.all([
-      scanChain(network, 0, derive, cachedApi, opts, opts.highWater?.receive ?? -1),
-      scanChain(network, 1, derive, cachedApi, opts, opts.highWater?.change ?? -1),
+      scanChain(network, 0, derive, cachedApi, opts, receiveHw, makeReporter(0)),
+      scanChain(network, 1, derive, cachedApi, opts, changeHw, makeReporter(1)),
     ]);
   } catch (err) {
     throw new AccountDiscoveryError(err);

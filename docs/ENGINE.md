@@ -200,7 +200,7 @@ and lock (all networks, no arg). `pollAccount` reads `getAddressStats` directly
 from 0 (F12) — only response reuse changes; `complete=true` only ever comes from
 a full gap-20 evaluation.
 
-- `startDiscovery({ network, onSnapshot, onError, deadlineMs? }): DiscoveryHandle`
+- `startDiscovery({ network, onSnapshot, onError, onProgress?, deadlineMs? }): DiscoveryHandle`
   — one two-phase run. **Phase 1** (first paint): fast gap-5 scan anchored at the
   cached high-water marks. **Phase 2** (correctness): extends to the full gap-20
   scan from index 0, reusing every response still fresh in the per-network
@@ -208,7 +208,17 @@ a full gap-20 evaluation.
   across a resumed run). `onSnapshot(snapshot, complete)` fires per phase —
   `complete` is `false` for phase 1, `true` for phase 2 (F12; the UI keeps a
   "Checking for updates…" cue while only an incomplete snapshot is on screen,
-  INCLUDING while backed off). The run settles deterministically at the deadline:
+  INCLUDING while backed off). `onProgress?(checked, estimatedTotal)`
+  (`DiscoveryOptions.onProgress`, threaded here) fires as each address is
+  EVALUATED during either phase's gap scan for the Home "Checking address N of
+  ~M…" cue — `checked` counts addresses evaluated across BOTH chains (cache hits
+  included; never decreases), `estimatedTotal` is the combined window estimate
+  that GROWS as a used address extends a chain (`discoverAccount` owns the
+  aggregation). DISPLAY-ONLY: absent ⇒ zero behavior change, and present it
+  changes nothing about request timing/counts — pure instrumentation (§8
+  do-nots hold). Like `onSnapshot`, it is SILENCED the instant the run is
+  aborted/superseded (same `externallyAborted` guard), so no stale/cross-run
+  count leaks past an abort (F13-style). The run settles deterministically at the deadline:
   a landed phase-1 result is kept; with no result at all, `onError` fires — the
   skeleton is never open-ended. `DiscoveryHandle { done: Promise<void>; abort():
   void }` — `abort()` cancels every in-flight request and silences the run: a
@@ -237,7 +247,13 @@ a full gap-20 evaluation.
   unlock / network switch / post-broadcast) — aborts any in-flight run and starts
   fresh; it is ALWAYS instant, never gated. Its OUTCOME feeds the backoff ladder:
   a completed (phase-2) snapshot resets it, an error or a deadline-cut incomplete
-  run escalates it (a superseded run touches neither). `pollTick(params)` — the
+  run escalates it (a superseded run touches neither). `refresh` also accepts
+  optional `onProgress` (forwarded to the run for the scan-progress cue) and
+  `onSettled` — fired once when THIS run settles (complete, error, or cut) AND is
+  still the current run (never a superseded one). The App clears the stored
+  scan-progress in `onSettled`, so a run the deadline cut mid-scan can't leave a
+  frozen "address N of ~M" on the cue — with no run in flight the cue falls back
+  to its deliberate-wait, tappable text. `pollTick(params)` — the
   AUTOMATIC path — is skipped (zero requests) while a run or a prior poll is in
   flight AND while the ladder says we're not yet eligible (§1a: 30s → 1m → 2m →
   4m → cap ~8m, +jitter), so a stalled run can't fire a second run within the

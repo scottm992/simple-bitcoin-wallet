@@ -189,6 +189,15 @@ export function startDiscovery(params: {
    */
   onSnapshot: (snapshot: AccountSnapshot, complete: boolean) => void;
   onError: () => void;
+  /**
+   * Optional progress callback for the Home scan-progress cue (display-only).
+   * Fires as each address is evaluated during EITHER phase's gap scan, forwarding
+   * `discoverAccount`'s aggregated (checked, estimatedTotal). Like `onSnapshot`,
+   * it is SILENCED the instant the run is superseded/aborted (the
+   * `externallyAborted` guard below) — the aborter owns the UI now, so no stale
+   * or cross-run count can leak past an abort (F13-style).
+   */
+  onProgress?: (checked: number, estimatedTotal: number) => void;
   deadlineMs?: number;
   /** Inter-wave pacing delay (Stage 2); omitted → the production default. Tests
    *  pass 0 to keep request-count assertions fast and deterministic. */
@@ -216,6 +225,19 @@ export function startDiscovery(params: {
         ...(params.waveDelayMs !== undefined ? { waveDelayMs: params.waveDelayMs } : {}),
         signal: controller.signal,
         cache,
+        // Scan-progress (display-only): forward each aggregated tick to the
+        // caller, but ONLY while this run still owns the UI. A superseded/aborted
+        // run must fall silent (same rule as the onSnapshot dispatches below,
+        // F13) — checked at dispatch time so a landing that resolves just after
+        // an abort can't push a stale count onto the cue.
+        ...(params.onProgress
+          ? {
+              onProgress: (checked: number, estimatedTotal: number): void => {
+                if (externallyAborted) return;
+                params.onProgress?.(checked, estimatedTotal);
+              },
+            }
+          : {}),
       };
 
       const fast = await discoverAccount(network, derive, accountApi, {
@@ -338,6 +360,17 @@ export class DiscoveryController {
     network: Network;
     onSnapshot: (snapshot: AccountSnapshot, complete: boolean) => void;
     onError: () => void;
+    /** Display-only scan-progress ticks, forwarded to the run (see
+     *  {@link startDiscovery}). */
+    onProgress?: (checked: number, estimatedTotal: number) => void;
+    /**
+     * Fires exactly once when THIS run settles (complete, error, or
+     * deadline-cut) AND is still the current run — never for a superseded run.
+     * The App clears the stored scan-progress here, so a run the deadline cut
+     * mid-scan can't leave a frozen "address N of ~M" on the cue: with no run in
+     * flight the cue must fall back to its deliberate-wait (State B) text.
+     */
+    onSettled?: () => void;
     deadlineMs?: number;
     waveDelayMs?: number;
   }): void {
@@ -355,11 +388,15 @@ export class DiscoveryController {
     this.current = handle;
     void handle.done.finally(() => {
       // A superseded run (replaced by a newer refresh, or cleared by abort())
-      // must not touch the ladder — its replacement owns the state now.
+      // must not touch the ladder — nor clear progress — its replacement owns
+      // the state now.
       if (this.current !== handle) return;
       this.current = null;
       if (sawComplete) this.resetBackoff();
       else this.escalateBackoff();
+      // Settle signal: only the current run reaches here, so the App can safely
+      // drop a stale scan-progress count without racing a newer run's ticks.
+      params.onSettled?.();
     });
   }
 
