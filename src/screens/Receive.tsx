@@ -1,5 +1,5 @@
 import type { JSX } from 'react';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { strings } from '../strings';
 import { Chrome } from '../components/Chrome';
 import { Qr } from '../components/Qr';
@@ -17,6 +17,41 @@ export function Receive(props: {
 }): JSX.Element {
   const [toast, setToast] = useState<string | null>(null);
   const practice = props.network === 'testnet';
+
+  // Fresh-address nudge (roadmap, owner request): the ROTATION itself already
+  // happens with zero new machinery — this screen renders the snapshot's
+  // next-unused address, so when the 30s poll notices a payment and the
+  // refreshed snapshot advances the index, the address/QR here updates on the
+  // spot (derivation stays local; zero extra requests). What was missing is
+  // the EXPLANATION: without it the address silently swaps under the user
+  // mid-copy. So: remember the last (network, address) shown, and when the
+  // address changes IN PLACE — same network, a real address before and after —
+  // show a one-time reassurance notice. Guards, and why each exists:
+  //  - same network only: a network switch shows a different chain's address,
+  //    not a used one (unreachable while mounted today — Settings is another
+  //    screen — but belt-and-braces against future navigation changes);
+  //  - both addresses non-empty: the fallback→snapshot fill-in on a flaky
+  //    first load is loading progress, not a rotation (F12-era lesson: never
+  //    dress loading up as a state change);
+  //  - the ref starts as the CURRENT props, so an ordinary mount can never
+  //    fire it — only a change observed live counts.
+  // The notice is honest for the rare cross-device case too: if a snapshot
+  // advances because another device's copy of this wallet got paid, the shown
+  // address really was used — the copy stays true.
+  const [rotated, setRotated] = useState(false);
+  const lastShown = useRef({ network: props.network, address: props.address });
+  useEffect(() => {
+    const prev = lastShown.current;
+    lastShown.current = { network: props.network, address: props.address };
+    if (
+      prev.network === props.network &&
+      prev.address !== props.address &&
+      prev.address.trim() !== '' &&
+      props.address.trim() !== ''
+    ) {
+      setRotated(true);
+    }
+  }, [props.network, props.address]);
 
   async function copy(): Promise<void> {
     const ok = await copyToClipboard(props.address);
@@ -63,6 +98,14 @@ export function Receive(props: {
           {strings.receive.heading}
         </h1>
         <p className="sub">{strings.receive.body}</p>
+
+        {rotated ? (
+          // role="status": screen readers announce the rotation politely
+          // without stealing focus from whatever the user was doing.
+          <div className="callout" role="status">
+            <div className="callout__body">{strings.receive.rotatedNotice}</div>
+          </div>
+        ) : null}
 
         <Qr data={bitcoinUri(props.address)} />
 
