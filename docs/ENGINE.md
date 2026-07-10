@@ -202,12 +202,17 @@ a full gap-20 evaluation.
   superseded run never dispatches a snapshot or an error, even if a phase had
   already resolved with its continuation still queued (F13). `abort()` does NOT
   clear the cache — a superseding manual refresh must be able to resume — but an
-  aborted run's POST-abort landings are never written to it: `withScanCache`
-  gates every write on the request's own signal after the await (§7), so a
-  response whose continuation executes after a synchronous invalidate + abort
-  (the poll's changed → invalidate → refresh path) cannot repopulate the freshly
-  invalidated cache with fresh-stamped pre-change data. Resume semantics rely
-  only on writes that landed before the abort.
+  in-flight run's landings that resolve AFTER an invalidation are never written
+  to it. `withScanCache` fences every write with TWO complementary guards
+  evaluated after the await: (1) a **generation counter** (F16) — `clear()`
+  bumps `ScanCache.generation`, and a write proceeds only if the generation is
+  unchanged since the request was issued, so ANY invalidation drops a queued
+  landing even when it is NOT paired with a synchronous abort of the run (the
+  broadcast paths invalidate a microtask before their aborting refresh fires);
+  and (2) the request's own **signal** (§7) — which drops a superseded run's
+  post-abort landings when the cache was aborted but NOT invalidated (resume
+  semantics). Either way a doomed landing is returned to its scan but never
+  cached; resume relies only on writes that landed before the invalidation/abort.
 - `invalidateScanCache(network?)` — clears the per-network cache (or all networks
   with no arg). The load-bearing invalidation API (see the cross-run-cache note).
 - `pollAccount(network, account, signal?): Promise<boolean>` — the cheap 30-second

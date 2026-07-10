@@ -942,3 +942,78 @@ describe('post-abort cache writes (§7 regression)', () => {
     expect(mockNet.statsCalls.length - afterAborted).toBe(40);
   });
 });
+
+// ---------------------------------------------------------------------------
+// F16 — broadcast-path invalidation NOT paired with a synchronous abort. A
+// broadcast (signAndBroadcast / bumpAndBroadcast) invalidates the cache in its
+// own async frame; the aborting refreshAll only runs a microtask LATER, after
+// the caller's await resumes. In that gap an in-flight run's already-resolved
+// continuation runs while the run's OWN signal is not yet aborted — so the
+// signal-only guard would let it write a PRE-broadcast response back into the
+// just-cleared cache (the reviewer reproduced: the next run paid 36/40 and its
+// complete snapshot reported $0 for a just-funded address). The generation
+// counter closes the gap: any invalidation, abort-paired or not, drops the
+// landing.
+// ---------------------------------------------------------------------------
+
+describe('broadcast-path invalidation drops in-flight landings (F16)', () => {
+  it('an invalidation NOT paired with a synchronous abort still drops a run\'s queued landings', async () => {
+    mockNet.mode = 'manual';
+    const handle = startDiscovery({
+      network: 'testnet',
+      onSnapshot: vi.fn(),
+      onError: vi.fn(),
+    });
+
+    // Wave 1 in flight: concurrency 2 on each chain = 4 requests.
+    await tick();
+    expect(mockNet.pending.length).toBe(4);
+
+    // The responses RESOLVE — pre-broadcast server data, continuations queued.
+    for (const resolve of mockNet.pending.splice(0)) resolve();
+
+    // A BROADCAST-style invalidation: signAndBroadcast bumps the cache
+    // generation in its own async frame, with NO synchronous abort of the run
+    // (the aborting refreshAll runs a microtask later, after confirmSend's await
+    // resumes). This is the exact F16 gap — and the crucial difference from the
+    // §7 test above, which aborts in the SAME synchronous frame.
+    invalidateScanCache('testnet');
+
+    // Flush: the wave-1 continuations run NOW — after the invalidation, but while
+    // the run's OWN signal is still NOT aborted. The signal-only guard alone would
+    // let them write pre-broadcast data into the freshly-cleared cache (the
+    // reviewer's 36/40 poisoning). The generation guard must drop them.
+    await tick();
+
+    // Only NOW does the delayed abort land, as refreshAll finally supersedes the
+    // run. (Aborting after the flush is what isolates the generation guard: by
+    // this point, under the old code, the poison would already be written.)
+    handle.abort();
+
+    // Drain any still-pending requests so the aborted run can settle (manual mode
+    // doesn't reject on abort; each runner stops at its next signal check).
+    while (mockNet.pending.length > 0) {
+      for (const resolve of mockNet.pending.splice(0)) resolve();
+      await tick();
+    }
+    await handle.done;
+
+    // The post-broadcast refresh (R2) must re-fetch EVERYTHING — the full
+    // 40-request scan. Had any of the run's wave-1 landings been cached, this
+    // would cost 36 and its complete snapshot could report stale pre-broadcast
+    // numbers for up to the TTL.
+    mockNet.mode = 'instant';
+    const before = mockNet.statsCalls.length;
+    let complete = false;
+    const h2 = startDiscovery({
+      network: 'testnet',
+      onSnapshot: (_s, c) => {
+        if (c) complete = true;
+      },
+      onError: vi.fn(),
+    });
+    await h2.done;
+    expect(complete).toBe(true);
+    expect(mockNet.statsCalls.length - before).toBe(40);
+  });
+});

@@ -71,7 +71,24 @@ export interface ScanCache {
   readonly ttlMs: number;
   /** Clock source, injectable for tests; defaults to `Date.now`. */
   readonly now: () => number;
-  /** Drops every cached entry — call on ANY change signal (see `actions.ts`). */
+  /**
+   * Monotonic generation counter, bumped by {@link clear} (F16). A wrapped-api
+   * write captures this value BEFORE its `await` and stores the response only if
+   * the generation is unchanged when the response lands. This makes invalidation
+   * authoritative ON ITS OWN — it never depends on being paired with a
+   * synchronous abort of the in-flight run by every future call site. The two
+   * BROADCAST paths (`signAndBroadcast` / `bumpAndBroadcast`) invalidate a
+   * microtask BEFORE their abort fires, a gap the signal-only guard cannot cover:
+   * a run's already-resolved continuation would otherwise write pre-broadcast
+   * data back into the just-cleared cache. Bumping the generation on every
+   * `clear()` closes that gap for any invalidation, abort-paired or not.
+   */
+  readonly generation: number;
+  /**
+   * Drops every cached entry AND bumps {@link generation} — call on ANY change
+   * signal (see `actions.ts`). The generation bump is what makes an
+   * invalidation drop even the in-flight landings whose writes are still queued.
+   */
   clear(): void;
 }
 
@@ -88,16 +105,23 @@ export function createScanCache(
   const stats = new Map<string, CacheEntry<AddressStats>>();
   const utxos = new Map<string, CacheEntry<ApiUtxo[]>>();
   const txs = new Map<string, CacheEntry<AddressTx[]>>();
+  // F16: bumped by clear(); read (as a getter) by withScanCache to fence any
+  // in-flight write against an invalidation that landed during its await.
+  let generation = 0;
   return {
     stats,
     utxos,
     txs,
     ttlMs,
     now,
+    get generation(): number {
+      return generation;
+    },
     clear(): void {
       stats.clear();
       utxos.clear();
       txs.clear();
+      generation++;
     },
   };
 }
@@ -481,37 +505,63 @@ function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
     if (entry === undefined) return undefined;
     return cache.now() - entry.storedAt < cache.ttlMs ? entry.value : undefined;
   }
-  // POST-ABORT WRITE GUARD (§7): every write is gated on the request's own
-  // signal AFTER the await. A response that resolves just before an abort has
-  // its continuation sitting in the microtask queue; a change signal can
-  // invalidate the cache and abort the run synchronously BEFORE that
-  // continuation executes (exactly the poll's changed → invalidate → refresh →
-  // abort sequence). Writing then would repopulate the freshly invalidated
+  // WRITE GUARD (§7 + F16): every write is fenced by TWO complementary checks,
+  // evaluated AFTER the await, against state captured BEFORE it. A response that
+  // resolves just before an invalidation has its continuation sitting in the
+  // microtask queue; writing it then would repopulate the freshly invalidated
   // cache with a fresh-stamped but PRE-change response — hiding, for up to the
-  // TTL, the very change the poll just detected: the "un-detect" the
-  // invalidation rule exists to prevent. So an aborted run's post-abort
-  // landings are returned to their (doomed) scan but never cached: resume
-  // semantics only rely on writes that landed before the abort.
+  // TTL, the very change that invalidation exists to surface (the "un-detect"
+  // the invalidation rule forbids, §7). The two guards cover the two ways that
+  // race arrives:
+  //
+  //  1. GENERATION (F16). `clear()` bumps `cache.generation`; a write proceeds
+  //     only if the generation is unchanged since the request was issued. This
+  //     makes invalidation authoritative ON ITS OWN — it does NOT depend on
+  //     being paired with a synchronous abort of the in-flight run. The two
+  //     broadcast paths invalidate a microtask BEFORE their aborting refresh
+  //     fires (the abort straddles an `await` in App.tsx), so at the moment the
+  //     continuation runs the run's own signal is NOT yet aborted; only the
+  //     generation bump catches it. Invalidation must never rely on every future
+  //     call site remembering to abort in the same frame — the generation guard
+  //     removes that fragility.
+  //  2. SIGNAL (unchanged). A superseding refresh aborts the prior run WITHOUT
+  //     invalidating the cache (resume semantics — the new run must reuse the
+  //     old landings), so the generation is unchanged there; the abort guard is
+  //     what drops that superseded run's post-abort landings, keeping the
+  //     round-5 regression semantics intact.
+  //
+  // Either way, an aborted/superseded run's post-abort landings are returned to
+  // their (doomed) scan but never cached: resume relies only on writes that
+  // landed before the invalidation/abort.
   return {
     getAddressStats: async (network, address, signal) => {
       const hit = fresh(cache.stats.get(address));
       if (hit !== undefined) return hit;
+      const gen = cache.generation;
       const value = await api.getAddressStats(network, address, signal);
-      if (signal?.aborted !== true) cache.stats.set(address, { value, storedAt: cache.now() });
+      if (cache.generation === gen && signal?.aborted !== true) {
+        cache.stats.set(address, { value, storedAt: cache.now() });
+      }
       return value;
     },
     getUtxos: async (network, address, signal) => {
       const hit = fresh(cache.utxos.get(address));
       if (hit !== undefined) return hit;
+      const gen = cache.generation;
       const value = await api.getUtxos(network, address, signal);
-      if (signal?.aborted !== true) cache.utxos.set(address, { value, storedAt: cache.now() });
+      if (cache.generation === gen && signal?.aborted !== true) {
+        cache.utxos.set(address, { value, storedAt: cache.now() });
+      }
       return value;
     },
     getAddressTxs: async (network, address, signal) => {
       const hit = fresh(cache.txs.get(address));
       if (hit !== undefined) return hit;
+      const gen = cache.generation;
       const value = await api.getAddressTxs(network, address, signal);
-      if (signal?.aborted !== true) cache.txs.set(address, { value, storedAt: cache.now() });
+      if (cache.generation === gen && signal?.aborted !== true) {
+        cache.txs.set(address, { value, storedAt: cache.now() });
+      }
       return value;
     },
   };
