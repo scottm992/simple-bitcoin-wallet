@@ -117,8 +117,9 @@ network behaves byte-identically to v1.1.1.
   terminate in the same F1-clamped `feeRateForTier` evaluation (round 12
   traced chip-to-broadcast equality, including clamped extremes).
 
-- **Custom fee rate** *(owner request, 2026-07-10)* — 🚧 **built 2026-07-10
-  (branch `custom-fee`), awaiting security review Round 14.** A fourth
+- **Custom fee rate** *(owner request, 2026-07-10)* — ✅ **shipped 2026-07-10
+  (v1.2.1; security review round 14 + closure: F21 found and CLOSED pre-merge,
+  0 open findings, 320 tests).** A fourth
   "Custom" chip on Send reveals a sat/vB input. Owner design decisions as
   built: the input **REJECTS, never clamps** — anything outside
   [`MIN_CUSTOM_FEE_RATE` = 0.1, `MAX_ACCEPTED_FEE_RATE` = 500] (decimals
