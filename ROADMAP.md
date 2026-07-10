@@ -61,18 +61,17 @@ review rounds 9 + closure in `docs/review/round1.md`.
   with the sub-1 sat/vB item below: a custom rate under 1 sat/vB raises the
   same relay-floor questions, so decide the floor once, for both.
 
-- **Scan progress on the "Checking for updates…" cue** *(owner request,
-  2026-07-10 — PRIORITIZED as the next work item, ahead of the blockstream
-  failover; owner specifically wants the cue to say which address the scan is
-  on)* — show progress so an in-flight scan doesn't read as stuck.
-  Design note: a strict percent is dishonest — the gap-limit scan's total
-  grows when it finds a used address — so use "checked N of ~M addresses"
-  (or a never-decreasing clamped percent) from a progress callback threaded
-  through `scanChain` → `DiscoveryController` → the Home cue. Pair it with
-  backoff-aware wording ("retrying in Xs — tap to check now") so a
-  deliberately-waiting ladder doesn't look frozen either. Display-only, but
-  it touches the discovery layer: the HANDOFF-discovery-throttle §7/§8
-  invariants bind (no extra requests, no cache/pacing changes).
+- **Scan progress on the "Checking for updates…" cue** — ✅ **shipped
+  2026-07-10** (owner request; security review round 10, 0 findings). While
+  a scan runs, the cue reads "Checking address N of ~M…" (M is an estimate
+  that grows as used addresses extend the window — deliberately not a
+  percent, which could move backwards); while the v1.1.1 backoff ladder is
+  deliberately waiting, it becomes a tappable "Balance may be behind — will
+  check again soon. Tap to check now." wired to the always-instant manual
+  refresh. Display-only: the engine is byte-identical when the progress
+  callback is absent. Known cosmetic: the counter resets at the phase-1→
+  phase-2 seam (sub-second, only on self-heal re-runs) — smooth with a
+  phase-1 offset if it ever bothers anyone.
 
 - **Sub-1 sat/vB "super economy" fee** — Bitcoin Core 30 (Oct 2025) lowered the
   default minimum relay feerate to 0.1 sat/vB, so in a quiet mempool a payment
