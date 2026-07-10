@@ -1,6 +1,12 @@
 # Handoff — discovery retry loop self-throttles mempool.space (v1.1.1 hotfix)
 
-**Status: OPEN BUG, not yet fixed. Nothing in this document has been implemented.**
+**Status: FIXED — shipped 2026-07-10 as v1.1.1.** Stages 1 and 2 below were
+implemented (plus review findings F16/F17, found and closed in security review
+round 9 — see `docs/review/round1.md`). Stage 3 (blockstream.info failover)
+remains NOT started, pending the owner's explicit sign-off. This document is
+kept as the design record: its §7 landmines and §8 do-nots still bind any
+future change to the discovery layer.
+
 Written 2026-07-09 after a live field report + two independent diagnoses (the
 second by a fresh Fable reviewer who verified every number below with
 instrumented throwaway tests against the real scan code).
