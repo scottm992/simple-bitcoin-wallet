@@ -149,11 +149,13 @@ export function Send(props: {
   // review(), and — via App's reviewNumbers/confirmSend — the SAME
   // buildAndSignTx/signAndBroadcast. No parallel fee computation anywhere.
   //
-  // `null` means "no usable rate yet" (custom chosen, input empty/invalid):
-  // every preview number derived from a rate goes dark rather than showing a
-  // fee at a rate the user didn't type, and Review stays disabled. The tier
-  // path keeps its pre-existing rate-1 display placeholder while estimates are
-  // still loading (sending remains gated on real estimates via canReview).
+  // `null` means "no usable rate yet", and now covers BOTH paths symmetrically:
+  // custom chosen with an empty/invalid input, OR a tier chosen while fee
+  // estimates are unavailable. Either way every rate-derived preview goes dark
+  // (F21 law: never a number at a rate nobody chose — the old rate-1 tier
+  // placeholder is gone) and Review stays disabled via `feeRate !== null`.
+  // A tier therefore implies live estimates, and custom implies a validated
+  // typed rate — the one null-check downstream encodes the whole gate.
   const feeRate: number | null =
     feeChoice === 'custom'
       ? customFee.kind === 'valid'
@@ -161,7 +163,7 @@ export function Send(props: {
         : null
       : props.fees
         ? feeRateForTier(props.fees, feeChoice)
-        : 1;
+        : null;
 
   // Parse the entered amount into sats (from whichever unit is active).
   const amountSats = useMemo<bigint | null>(() => {
@@ -248,15 +250,29 @@ export function Send(props: {
   // estimate used to miss. When true, the normal Review button is held back and
   // an inline notice with the real numbers plus a "Send anyway" option
   // (allowHighFee) is shown instead.
+  // No `props.fees` term here: feeSelection existing already implies a REAL
+  // rate (a tier's live estimate or a validated custom entry — feeRate is null
+  // otherwise), so the consent rule guards custom sends even while the
+  // estimate endpoint is down. Dropping the old fees-null short-circuit is
+  // load-bearing for the relaxed gate below: without it, a high-fee custom
+  // send composed during an estimates outage would skip straight past consent.
   const highFee: boolean =
-    props.fees !== null && amountReady && feeSelection !== null && feeSelection.needsHighFeeConsent;
+    amountReady && feeSelection !== null && feeSelection.needsHighFeeConsent;
 
-  // Review needs a valid destination, a valid amount, live fee estimates (kept
-  // as a gate even for a custom rate — estimates arriving doubles as an
-  // endpoint-health signal, and relaxing it would be a separate decision), a
-  // usable rate, and no un-consented high-fee condition.
-  const canReview =
-    addressReady && amountReady && props.fees !== null && feeRate !== null && !highFee;
+  // Review needs a valid destination, a valid amount, a usable rate, and no
+  // un-consented high-fee condition. `feeRate !== null` IS the fee gate for
+  // both paths: a tier requires live estimates (feeRate is null without them),
+  // while a VALID CUSTOM rate sends even when estimates are unavailable.
+  //
+  // That second half DELIBERATELY REMOVES a fail-closed rail (owner decision,
+  // 2026-07-10): the old gate also required `props.fees !== null` for custom
+  // sends, treating estimate availability as an endpoint-health signal.
+  // Availability won: the user typed an explicit rate, the whole downstream
+  // path (Review dry-run, broadcast build) consumes only that rate, and the
+  // estimate endpoint being down shouldn't block self-directed sending. The
+  // engine's hard fee guards (F1/F10) don't depend on estimates and stand
+  // unchanged beneath this gate.
+  const canReview = addressReady && amountReady && feeRate !== null && !highFee;
 
   async function paste(): Promise<void> {
     try {
@@ -280,8 +296,10 @@ export function Send(props: {
    */
   function review(allowHighFee: boolean): void {
     // feeRate !== null repeats canReview's gate for the "Send anyway" entry
-    // path too: no PendingSend can ever be built without a usable rate.
-    if (!(addressReady && amountReady && props.fees !== null && feeRate !== null)) return;
+    // path too: no PendingSend can ever be built without a usable rate. It
+    // mirrors canReview exactly — including the relaxed custom-while-
+    // estimates-down path (see canReview for the availability reasoning).
+    if (!(addressReady && amountReady && feeRate !== null)) return;
     if (highFee && !allowHighFee) return;
     const pending: PendingSend = {
       recipient: address.trim(),
@@ -443,19 +461,25 @@ export function Send(props: {
               // The clamped rate this tier would actually use — the SAME value
               // feeRateForTier feeds the engine (its second F1 guard), so the
               // sat/vB shown on the chip can never disagree with the rate that
-              // gets signed. Null until real estimates load: the chip then omits
-              // the rate line and falls back to a typical-size USD placeholder
-              // (unchanged prior behavior — display degrades, never crashes).
+              // gets signed. Null while estimates are unavailable: the chip
+              // then shows NO cost and NO rate (F21 law — the old rate-1
+              // "typical" placeholder fabricated a cost nobody chose, which
+              // matters more now that fees-null is a reachable SENDING state
+              // via the custom path) and is disabled: a speed that cannot be
+              // priced cannot be picked. The Custom chip below stays live —
+              // it is the working path during an estimates outage.
               const tierRate = props.fees ? feeRateForTier(props.fees, c.tier) : null;
-              const rate = tierRate ?? 1;
-              const chipFeeSats = BigInt(Math.ceil(TYPICAL_VSIZE * rate));
-              const chipFeeUsd = props.btcUsd === null ? '' : fmtUsd(chipFeeSats, props.btcUsd);
+              const chipFeeUsd =
+                tierRate === null || props.btcUsd === null
+                  ? ''
+                  : fmtUsd(BigInt(Math.ceil(TYPICAL_VSIZE * tierRate)), props.btcUsd);
               return (
                 <button
                   key={c.tier}
                   className={`fee ${feeChoice === c.tier ? 'fee--sel' : ''}`}
                   onClick={() => setFeeChoice(c.tier)}
                   aria-pressed={feeChoice === c.tier}
+                  disabled={props.fees === null}
                 >
                   <div className="fee__title">{c.title}</div>
                   <div className="fee__sub">
@@ -491,6 +515,13 @@ export function Send(props: {
               ) : null}
             </button>
           </div>
+          {props.fees === null ? (
+            // Estimates outage: name it and point at the one live path, so the
+            // disabled tier chips read as "unavailable", never as broken.
+            <p className="small" style={{ marginTop: 'var(--sp-2)' }}>
+              {strings.send.feesUnavailable}
+            </p>
+          ) : null}
           {feeChoice === 'custom' ? (
             <div style={{ marginTop: 'var(--sp-3)' }}>
               <label className="label" htmlFor="send-custom-fee">
