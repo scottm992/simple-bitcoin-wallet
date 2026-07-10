@@ -141,11 +141,14 @@ export const strings = {
     practiceNote: 'This is a practice address. Only worthless practice coins work here.',
     newAddress: 'Show a new address',
     // One-time notice when the shown address rotates LIVE on this screen (a
-    // payment just landed on it and discovery advanced to the next unused
-    // address). Reassures on both counts a beginner worries about: the swap
-    // wasn't an error, and the old address didn't stop being theirs.
+    // payment landed on it and discovery advanced to the next unused address).
+    // Reassures on both counts a beginner worries about: the swap wasn't an
+    // error, and the old address didn't stop being theirs. "Has been used",
+    // not "was just used": at the stale-cache seam the payment may have landed
+    // long ago and discovery only just noticed — the copy must not overclaim
+    // recency (F22, round 15).
     rotatedNotice:
-      "Nice — the address you were showing was just used, so here's a fresh one. Using a new address each time keeps your payment history more private. The old address still works if someone pays it again.",
+      "Nice — the address you were showing has been used, so here's a fresh one. Using a new address each time keeps your payment history more private. The old address still works if someone pays it again.",
     qrError: "Couldn't draw the code — copy the address instead.",
     qrAlt: 'QR code for your bitcoin address',
     // Shown if no address is available at all (should not normally happen —
