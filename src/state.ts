@@ -52,6 +52,21 @@ export interface PendingSend {
 /** Loading status for network-backed data. */
 export type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
 
+/**
+ * Live scan position for the Home "Checking address N of ~M…" cue
+ * (scan-progress feature; DISPLAY-ONLY). `checked` = addresses evaluated so far
+ * across both chains (cache hits count — scan position, not network traffic);
+ * `estimatedTotal` = the current combined window estimate, which GROWS as used
+ * addresses extend a chain's gap window (so the honest form is "N of ~M", never
+ * a percent that could move backwards). `null` whenever no discovery run is
+ * actively scanning — the cue then shows its deliberate-wait text (the v1.1.1
+ * backoff ladder is between checks), so a cut run can't freeze a stale count.
+ */
+export interface ScanProgress {
+  readonly checked: number;
+  readonly estimatedTotal: number;
+}
+
 /** The full application state. Contains NO secrets. */
 export interface AppState {
   readonly screen: Screen;
@@ -72,6 +87,12 @@ export interface AppState {
    * scan. True whenever there is no snapshot at all (nothing to qualify).
    */
   readonly accountComplete: boolean;
+  /**
+   * Live scan-progress for the Home checking cue, or `null` when no run is
+   * actively scanning (see {@link ScanProgress}). Display-only; carries no
+   * secrets and never gates funds display.
+   */
+  readonly scanProgress: ScanProgress | null;
 
   /** BTC/USD price, or null when unavailable (offline). */
   readonly btcUsd: number | null;
@@ -104,6 +125,7 @@ export type Action =
   | { type: 'accountLoading' }
   | { type: 'accountLoaded'; account: AccountSnapshot; complete: boolean }
   | { type: 'accountError' }
+  | { type: 'scanProgress'; progress: ScanProgress | null }
   | { type: 'priceLoaded'; btcUsd: number | null }
   | { type: 'feesLoaded'; feeEstimates: FeeEstimates }
   | { type: 'composeSend'; pending: PendingSend }
@@ -121,6 +143,7 @@ export const initialState: AppState = {
   account: null,
   accountStatus: 'idle',
   accountComplete: true,
+  scanProgress: null,
   btcUsd: null,
   feeEstimates: null,
   pendingSend: null,
@@ -161,6 +184,7 @@ export function reducer(state: AppState, action: Action): AppState {
         account: null,
         accountStatus: 'loading',
         accountComplete: true,
+        scanProgress: null,
         pendingSend: null,
         sentTxid: null,
       };
@@ -173,6 +197,7 @@ export function reducer(state: AppState, action: Action): AppState {
         account: null,
         accountStatus: 'idle',
         accountComplete: true,
+        scanProgress: null,
         pendingSend: null,
         sentTxid: null,
       };
@@ -202,13 +227,17 @@ export function reducer(state: AppState, action: Action): AppState {
         account: null,
         accountStatus: 'loading',
         accountComplete: true,
+        scanProgress: null,
         feeEstimates: null,
         pendingSend: null,
         sentTxid: null,
       };
 
     case 'accountLoading':
-      return { ...state, accountStatus: 'loading' };
+      // A run is starting: drop any prior scan-progress so a stale count from a
+      // previous (possibly deadline-cut) run can't flash before the new run's
+      // first progress tick arrives.
+      return { ...state, accountStatus: 'loading', scanProgress: null };
 
     case 'accountLoaded':
       return {
@@ -220,6 +249,11 @@ export function reducer(state: AppState, action: Action): AppState {
 
     case 'accountError':
       return { ...state, accountStatus: 'error' };
+
+    case 'scanProgress':
+      // Display-only cue data. `null` = no run actively scanning (dispatched
+      // when a run settles, so a cut run's count can't linger on the cue).
+      return { ...state, scanProgress: action.progress };
 
     case 'priceLoaded':
       return { ...state, btcUsd: action.btcUsd };

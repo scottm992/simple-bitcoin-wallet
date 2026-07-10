@@ -1189,3 +1189,108 @@ deleted (a stray `round9closure.review.test.ts` from a parallel run was also rem
 file modified is this `docs/review/round1.md`. Not committed, not pushed. Gates re-confirmed after
 deletion: `tsc --noEmit` clean, `npm test` = 261 passing, `npm run build` clean, `dist` CSP
 `script-src 'self'`._
+
+---
+
+# Round 10 — Scan-progress cue (display-only)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 0**
+
+Light round, scoped to the two `scan-progress` commits (`53adece` engine, `f957d2e` UI) and
+their interaction with the F12 honesty contract and the v1.1.1 invariants — v1.1.1 itself was
+not re-audited (round 9 + closure just did). `npm test` = **268 passing**, `tsc --noEmit`
+clean, `npm run build` clean, prod CSP unchanged (`dist/index.html`: `default-src 'self';
+connect-src 'self' https://mempool.space; …; script-src 'self'; object-src 'none'; base-uri
+'self'; form-action 'none'`), no `console.*` in source, and the PWA surface is untouched
+(`public/`, `index.html`, `vite.config.ts` absent from the diff — no `CACHE_NAME` bump owed).
+Verified every attack area with throwaway `round10.review.test.ts` (15 cases, executed,
+deleted).
+
+## Per-area verdicts
+
+- **1. F12 honesty — SOUND.** The cue's VISIBILITY gate is byte-identical: the
+  `props.account !== null && !props.accountComplete ?` line is unchanged context in the diff —
+  only the inner content forked into the two states. Hunted every frozen-count and
+  State-A/State-B misclassification path against the REAL reducer + controller:
+  - *Deadline-cut run:* `onSettled` fires exactly once, strictly AFTER the run's last progress
+    tick (fake timers, phase 2 stalled at 20 requests) — the reducer then derives State B,
+    never a stale "N of ~M". The ordering is structural, not lucky: every tick fires inside
+    `discoverAccount` before `done` settles, and `onSettled` runs in `done.finally`, so a
+    settle-null can never be overtaken by a tick from its own run.
+  - *Superseded run:* the old run fires NO `onSettled` (the `this.current !== handle` guard),
+    so it can never null a newer run's live count; its own post-abort ticks are silenced by
+    `externallyAborted` (verified with the manual-resolver F13 technique — wave resolved, then
+    superseded before the continuations ran: zero further ticks). The new run's
+    `accountLoading` dispatch precedes its first tick, so no cross-run count can flash.
+  - *Lock / network-switch mid-run:* `controller.abort()` fires no `onSettled` and silences
+    all further ticks (verified); the paired reducer resets are the cleaner. Enumerated ALL
+    five run-ending reducer paths (`scanProgress:null`, `accountLoading`, `locked`,
+    `setNetwork`, `unlocked`) against a mid-run state: every one leaves `scanProgress` null.
+  - *Misclassification:* a run in flight always presents as scanning — every run start goes
+    through `refreshAccount` (the only `discovery().refresh` caller), whose `accountLoading`
+    sets `'loading'` before any tick can land, and phase-2 ticks keep `scanProgress` non-null
+    through the post-phase-1 `'ready'` window. State B is reachable only with no run in
+    flight — exactly its claim. Replayed the error-after-incomplete sequence: it lands on
+    State B beside the error callout — two affordances, both honest, both the same manual
+    refresh. An incomplete balance is never presentable as settled on any path found.
+- **2. Behavioral no-op — SOUND (byte-identical, A/B-verified).** Ran `discoverAccount` with
+  vs without `onProgress` over identical mocks in four shapes — empty wallet (40 requests),
+  used@7 (break lands mid-batch, 48), used@19 (the exact gap-window edge, 60), and a
+  maxIndex-clamped all-used chain: the stats sequences are deep-equal in ORDER and COUNT,
+  snapshots identical, utxo/tx call counts identical. The moved gap-limit `break` is
+  equivalent by construction (checked against main's version): a used address resets
+  `consecutiveUnused` to 0, so the relocated condition can only fire right after an unused
+  increment — precisely as when it lived inside the `else`. All shipped pins (40/10/2, resume
+  remainder, F16 40/40, F17 deep-wallet + pacing) are green in the 268. The controller's
+  `done.finally` only APPENDS `onSettled?.()` after the ladder ops — no request, cache,
+  pacing, backoff, or deadline change anywhere in the diff.
+- **3. The tap — SOUND.** State B's `onClick` is the SAME `refreshAll` callback Home's error
+  callout already uses — no new network path. Locked: `refreshAll` re-checks `isUnlocked()`
+  (no-op), and the `locked` reducer unmounts Home anyway — double-guarded. Rapid taps:
+  structurally suppressed at the UI (the first tap's `accountLoading` flips the cue to
+  State A, unmounting the button) and bounded at the controller — 5 synchronous refreshes
+  issued at most one 4-request wave each before their supersede aborted them, and exactly ONE
+  run completed and settled (verified). No burst amplification beyond the pre-existing
+  single-flight abort+restart semantics.
+- **4. Secrets / injection — SOUND.** `ScanProgress` carries two plain numbers derived from
+  loop counters; `checkingAddress(n, m)` interpolates them into template text rendered as a
+  React text node (auto-escaped). No `dangerouslySetInnerHTML` in the diff (the only one in
+  src remains Qr.tsx, Round-1 verified-good); nothing new persisted; `scanProgress` never
+  gates funds display. The estimate math also can't mislead upward: per-chain evaluations
+  never exceed the per-chain estimate (batch size is capped by the remaining gap window and
+  the estimate clamps at `maxIndex + 1`), so N ≤ M on every tick (asserted across all
+  scenarios).
+- **5. Hidden-tab timer clamping (PM observation) — ACCEPT AND DOCUMENT, not a finding.**
+  Agreed with the PM's read. In a hidden tab the ~1s `setTimeout` clamp stretches the paced
+  waves so a cold scan can approach the 20s deadline (the deadline timer itself is 20s ≫ the
+  clamp minimum, so the cut stays deterministic) → phase-1 kept, State B on return. That is
+  the throttle machinery doing its job on a different cause: scans start only from
+  user-visible actions; the 30s tick no-ops while `visibilityState !== 'visible'` (so nothing
+  loops in a hidden tab); a tab hidden >60s locks on return (account cleared, fresh scan on
+  unlock); a cut scan's landings persist in the cross-run cache (TTL ~100s) so the resume
+  pays only the remainder — and State B's tap is the immediate, never-throttled recovery.
+  Direction is safe throughout (understate + honest cue). No change requested.
+
+**Noted, not a finding (cosmetic):** the counter resets at the phase boundary. Empirically
+(throwaway, fresh empty wallet): phase 1 emits "1..10 of ~10" (gap-5 window), then phase 2's
+own aggregation RESETS to "1..40 of ~40" — N visibly drops 10 → 1 mid-run, after briefly
+holding the last phase-1 count while phase 2's first wave is in flight. Within each phase both
+counters are strictly monotonic (shipped tests + mine), M only grows across the run
+(10 → 40), and the cue never claims more progress than has actually been made — safe
+direction, honestly "checking" throughout. If the PM wants a seamless count, thread phase 1's
+final `checked`/estimate into phase 2's aggregation as an offset; purely cosmetic, zero
+security value.
+
+## Ship recommendation
+
+**SHIP.** The feature is what it claims to be: pure display instrumentation. The engine is
+byte-identical with `onProgress` absent (A/B-verified, all pins green), the F12 honesty
+contract survives every cut/supersede/lock/switch/spam attack I could construct, the tap
+reuses the existing never-throttled manual path with no amplification, and the v1.1.1
+ladder/cache/pacing invariants are untouched. Zero findings; the one cosmetic (phase-boundary
+counter reset) is noted above for the PM to take or leave.
+
+_Round-10 throwaway tests used the `.review.test.ts` suffix, were executed, and were deleted;
+the only file modified is this `docs/review/round1.md`. Not committed, not pushed. Gates
+re-confirmed after deletion: `tsc --noEmit` clean, `npm test` = 268 passing, `npm run build`
+clean, `dist` CSP `script-src 'self'`. Next finding number: **F18**._

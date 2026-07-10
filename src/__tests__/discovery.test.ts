@@ -71,11 +71,13 @@ vi.mock('../lib/api', async (importOriginal) => {
 });
 
 import { startDiscovery, pollAccount, DiscoveryController, invalidateScanCache } from '../actions';
-import { getAddressStats } from '../lib/api';
+import { getAddressStats, getUtxos, getAddressTxs } from '../lib/api';
 import { setUnlocked, lockNow } from '../session';
 import {
+  createScanCache,
   createVault,
   DEFAULT_DISCOVERY_OPTIONS,
+  deriveAddress,
   deriveReceiveAddress,
   discoverAccount,
   getCachedHighWater,
@@ -83,6 +85,14 @@ import {
   setCachedHighWater,
   type AccountSnapshot,
 } from '../lib';
+
+/** An AccountApi backed by the mocked `../lib/api` above (used-set + counters),
+ *  for direct {@link discoverAccount} calls that assert scan-progress. */
+const scanApi = { getAddressStats, getUtxos, getAddressTxs };
+
+/** Deriver over BOTH chains for the ABANDON wallet on testnet. */
+const testnetDeriver = (chain: 0 | 1, index: number) =>
+  deriveAddress(ABANDON, 'testnet', chain, index);
 
 const ABANDON =
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -1173,5 +1183,110 @@ describe('broadcast-path invalidation drops in-flight landings (F16)', () => {
     await h2.done;
     expect(complete).toBe(true);
     expect(mockNet.statsCalls.length - before).toBe(40);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scan-progress (display-only) — discoverAccount aggregates a (checked,
+// estimatedTotal) count across both concurrently-scanning chains for the Home
+// "Checking address N of ~M…" cue. Pure instrumentation: absent onProgress ⇒
+// zero behavior change (the request-count pins above are untouched). N counts
+// EVALUATIONS (cache hits included), never decreases; M is the combined window
+// estimate and only GROWS as used addresses extend a chain.
+// ---------------------------------------------------------------------------
+
+describe('scan-progress aggregation (onProgress)', () => {
+  it('empty wallet: checked climbs 1..40 and estimatedTotal stays 40 (both chains)', async () => {
+    const progress: Array<[number, number]> = [];
+    const snap = await discoverAccount('testnet', testnetDeriver, scanApi, {
+      waveDelayMs: 0,
+      onProgress: (checked, estimatedTotal) => progress.push([checked, estimatedTotal]),
+    });
+    expect(snap.confirmedSats).toBe(0n);
+    // 20 addresses per chain × 2 chains = 40 evaluations; with no used address
+    // each chain's estimate stays at the gap window (20), so combined M = 40.
+    expect(progress[progress.length - 1]).toEqual([40, 40]);
+    // checked is exactly the evaluation ordinal 1..40 (shared, single-threaded
+    // counter), so it never repeats or decreases.
+    expect(progress.map(([c]) => c)).toEqual(Array.from({ length: 40 }, (_, i) => i + 1));
+    expect(progress.every(([, t]) => t === 40)).toBe(true);
+  });
+
+  it('a used address GROWS estimatedTotal (window extends) while checked never decreases', async () => {
+    // Funds at receive index 7 → the receive chain extends to 0..27 (7 + gap 20).
+    mockNet.used.add(deriveReceiveAddress(ABANDON, 'testnet', 7).address);
+    const progress: Array<[number, number]> = [];
+    const snap = await discoverAccount('testnet', testnetDeriver, scanApi, {
+      waveDelayMs: 0,
+      onProgress: (checked, estimatedTotal) => progress.push([checked, estimatedTotal]),
+    });
+    expect(snap.confirmedSats).toBe(10_000n);
+
+    const totals = progress.map(([, t]) => t);
+    // Starts at 40 (20 + 20), grows to 48 once index 7 is seen (receive window
+    // 7 + 1 + 20 = 28; change stays 20).
+    expect(totals[0]).toBe(40);
+    expect(Math.max(...totals)).toBe(48);
+    // Monotonic both ways: estimatedTotal only grows, checked strictly increases.
+    for (let i = 1; i < progress.length; i++) {
+      const prev = progress[i - 1]!;
+      const cur = progress[i]!;
+      expect(cur[1]).toBeGreaterThanOrEqual(prev[1]);
+      expect(cur[0]).toBeGreaterThan(prev[0]);
+    }
+    // Final: 28 (receive) + 20 (change) = 48 evaluations, estimate settled at 48.
+    expect(progress[progress.length - 1]).toEqual([48, 48]);
+  });
+
+  it('cache-hit evaluations still count toward checked (a fully warm re-walk reaches 40)', async () => {
+    const cache = createScanCache();
+    // Warm the cache with a full cold run (no progress needed).
+    await discoverAccount('testnet', testnetDeriver, scanApi, { waveDelayMs: 0, cache });
+    const warmed = mockNet.statsCalls.length;
+    expect(warmed).toBe(40);
+
+    // Re-run over the warm cache WITH progress: every address is a cache hit, so
+    // zero new fetches — but each is still an EVALUATION, so checked reaches 40.
+    const progress: Array<[number, number]> = [];
+    await discoverAccount('testnet', testnetDeriver, scanApi, {
+      waveDelayMs: 0,
+      cache,
+      onProgress: (checked, estimatedTotal) => progress.push([checked, estimatedTotal]),
+    });
+    expect(mockNet.statsCalls.length - warmed).toBe(0); // fully cached: no fetches
+    expect(progress[progress.length - 1]).toEqual([40, 40]); // yet checked hit 40
+  });
+
+  it('does not dispatch progress after the run is aborted (manual-resolver, like F13)', async () => {
+    mockNet.mode = 'manual';
+    const progress: Array<[number, number]> = [];
+    const handle = startDiscovery({
+      network: 'testnet',
+      onSnapshot: vi.fn(),
+      onError: vi.fn(),
+      onProgress: (checked, estimatedTotal) => progress.push([checked, estimatedTotal]),
+    });
+
+    // Wave 1: 4 requests (concurrency 2 × 2 chains). Resolve them and let the
+    // continuations run so progress DOES flow for the evaluated addresses.
+    await tick();
+    expect(mockNet.pending.length).toBe(4);
+    for (const resolve of mockNet.pending.splice(0)) resolve();
+    await tick();
+    const beforeAbort = progress.length;
+    expect(beforeAbort).toBeGreaterThan(0); // progress flowed before the abort
+
+    // Wave 2 is now pending. Resolve it and — before any continuation runs —
+    // abort, exactly as a superseding refresh / network switch does.
+    expect(mockNet.pending.length).toBe(4);
+    for (const resolve of mockNet.pending.splice(0)) resolve();
+    handle.abort();
+
+    // Flush: the wave-2 continuations execute AFTER the abort; externallyAborted
+    // must suppress every one of their progress dispatches.
+    await tick();
+    await tick();
+    await handle.done;
+    expect(progress.length).toBe(beforeAbort);
   });
 });

@@ -165,6 +165,16 @@ export default function App(): JSX.Element {
       network,
       onSnapshot: (account, complete) => dispatch({ type: 'accountLoaded', account, complete }),
       onError: () => dispatch({ type: 'accountError' }),
+      // Scan-progress cue (display-only): each tick updates "Checking address N
+      // of ~M". onSettled clears it when the run ends so a deadline-cut run can't
+      // leave a frozen count on the cue — with no run in flight the cue falls
+      // back to its deliberate-wait (State B) text. A superseded run never fires
+      // onSettled (the controller guards this.current === handle), and
+      // startDiscovery drops any progress after abort (externallyAborted), so no
+      // stale or cross-run count can linger.
+      onProgress: (checked, estimatedTotal) =>
+        dispatch({ type: 'scanProgress', progress: { checked, estimatedTotal } }),
+      onSettled: () => dispatch({ type: 'scanProgress', progress: null }),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.network]);
@@ -617,6 +627,7 @@ export default function App(): JSX.Element {
             account={state.account}
             accountStatus={state.accountStatus}
             accountComplete={state.accountComplete}
+            scanProgress={state.scanProgress}
             btcUsd={state.btcUsd}
             unit={unit}
             onCycleUnit={setUnit}
