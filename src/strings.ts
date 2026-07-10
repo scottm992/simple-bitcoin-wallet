@@ -169,6 +169,15 @@ export const strings = {
     feeFasterTime: '~10 min',
     feeEconomy: 'Economy',
     feeEconomyTime: 'few hrs',
+    // The underlying network fee rate for a tier, in sat/vB (satoshis per
+    // virtual byte — bitcoin's own fee unit). Surfaced on each fee chip so a
+    // curious or advanced sender can see the actual rate behind the speed/cost
+    // lines; those plain-English lines stay the primary read for everyone else.
+    // `rate` is passed straight from feeRateForTier — the SAME clamped value the
+    // engine signs — so the number shown can never disagree with the number
+    // used. Shown only once real estimates have loaded (no estimates → the chip
+    // degrades to no rate, exactly as before).
+    feeRate: (rate: number): string => `${rate} sat/vB`,
     review: 'Review',
     totalLine: (amount: string, fee: string, total: string): string =>
       `You'll send ${amount} + ${fee} fee = ${total} total`,
