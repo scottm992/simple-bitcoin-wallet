@@ -38,8 +38,16 @@ const mockNet = vi.hoisted(() => ({
    * of phase 2. `0` 429s everything (a pathological pause loop).
    */
   rate429After: null as number | null,
+  /**
+   * v1.2.0 convergence-scoped TTL: stall a stats request once this many UNIQUE
+   * addresses have landed (cumulative across runs; cache hits don't count). Cuts
+   * a run at a deterministic frontier regardless of stalled-issued request noise.
+   */
+  landCap: null as number | null,
   used: new Set<string>(),
   statsCalls: [] as string[],
+  /** Addresses that SUCCESSFULLY landed (pushed once per returned response). */
+  landed: [] as string[],
   abortedRequests: 0,
   /** 'manual' mode: resolvers for every pending stats request, in order. */
   pending: [] as (() => void)[],
@@ -63,6 +71,12 @@ vi.mock('../lib/api', async (importOriginal) => {
         throw new actual.ApiResponseError(429, 'Too Many Requests');
       }
       const statsFor = (addr: string) => {
+        // Record every SUCCESSFUL landing (statsFor is called exactly once per
+        // returned response — never on a 429 or a stall). `landed` powers the
+        // convergence-scoped-TTL tests: a cached address is a HIT (no mock call,
+        // no land), so an address appears here at most ONCE unless a broken TTL
+        // re-fetched an already-landed entry.
+        mockNet.landed.push(addr);
         const used = mockNet.used.has(addr);
         return {
           confirmedSats: used ? 10_000n : 0n,
@@ -80,7 +94,11 @@ vi.mock('../lib/api', async (importOriginal) => {
       }
       const stall =
         mockNet.mode === 'hang' ||
-        (mockNet.hangAfter !== null && mockNet.statsCalls.length > mockNet.hangAfter);
+        (mockNet.hangAfter !== null && mockNet.statsCalls.length > mockNet.hangAfter) ||
+        // landCap: stall once `landCap` UNIQUE addresses have already landed (a
+        // deterministic cut that IGNORES cache hits — used to model ladder-spaced
+        // resumes that each converge a fixed slice further).
+        (mockNet.landCap !== null && new Set(mockNet.landed).size >= mockNet.landCap);
       if (stall) {
         // Simulates mempool.space stalling a throttled connection: the request
         // only ever settles when aborted.
@@ -175,8 +193,10 @@ beforeEach(() => {
   mockNet.responseDelayMs = null;
   mockNet.rate429Count = 0;
   mockNet.rate429After = null;
+  mockNet.landCap = null;
   mockNet.used.clear();
   mockNet.statsCalls = [];
+  mockNet.landed = [];
   mockNet.abortedRequests = 0;
   mockNet.pending = [];
   setUnlocked(ABANDON);
@@ -805,6 +825,125 @@ describe('cross-run scan cache (§1b)', () => {
     const m2 = startDiscovery({ network: 'mainnet', onSnapshot: vi.fn(), onError: vi.fn() });
     await m2.done;
     expect(mockNet.statsCalls.length - n).toBe(40);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.2.0 — convergence-scoped cache lifetime. While an account is CONVERGING (no
+// full scan has completed since the cache was created/invalidated), entries do
+// NOT expire by TTL, so a ladder-spaced resume keeps advancing the frontier
+// instead of REGRESSING (entries dying faster than retries arrive — the field
+// bug stuck at "22 of 40"). A completed full scan restores the normal 100s TTL;
+// any change signal flips it straight back to converging.
+// ---------------------------------------------------------------------------
+
+describe('convergence-scoped cache lifetime (v1.2.0)', () => {
+  it('three cut runs spaced 150s apart (> TTL) converge to 40/40 with NO re-fetch of a landed address', async () => {
+    vi.useFakeTimers();
+    const flags: boolean[] = [];
+    const onError = vi.fn();
+    const run = (): ReturnType<typeof startDiscovery> =>
+      startDiscovery({ network: 'testnet', onSnapshot: (_s, c) => flags.push(c), onError });
+
+    // Run 1: converge the first 15 unique addresses, then stall → cut. NEVER
+    // completes, so the cache stays in converging mode (no TTL).
+    mockNet.landCap = 15;
+    const h1 = run();
+    await vi.advanceTimersByTimeAsync(12_500); // inactivity cut
+    await h1.done;
+    expect(new Set(mockNet.landed).size).toBe(15);
+
+    // 150s later (WELL past the 100s TTL) the aged entries are STILL served —
+    // converging. Run 2 advances the frontier to 30 unique, then stalls → cut.
+    await vi.advanceTimersByTimeAsync(150_000);
+    mockNet.landCap = 30;
+    const h2 = run();
+    await vi.advanceTimersByTimeAsync(12_500);
+    await h2.done;
+    expect(new Set(mockNet.landed).size).toBe(30);
+
+    // Another 150s later: the network fully recovers (no cap) and run 3 finishes.
+    await vi.advanceTimersByTimeAsync(150_000);
+    mockNet.landCap = null;
+    const h3 = run();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await h3.done;
+
+    // Converged to the full 40 across three TTL-spanning resumes, and — the
+    // regression pin — NO address was ever fetched twice (a landed entry is a
+    // cache hit forever while converging). If the TTL had wrongly applied, the
+    // aged entries would have expired and re-landed → landed.length > 40.
+    expect(new Set(mockNet.landed).size).toBe(40);
+    expect(mockNet.landed.length).toBe(40);
+    expect(flags).toContain(true); // run 3 reached a COMPLETE snapshot
+    vi.useRealTimers();
+  });
+
+  it('converging entries survive past the TTL, but a completed scan restores normal TTL freshness', async () => {
+    vi.useFakeTimers();
+    // Run 1: cut mid-scan (20 landed) → never completes → converging.
+    mockNet.landCap = 20;
+    const h1 = startDiscovery({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(12_500);
+    await h1.done;
+    expect(new Set(mockNet.landed).size).toBe(20);
+
+    // 150s later (> TTL): converging, so the 20 aged entries are reused — the
+    // resume pays ONLY the remaining 20 and COMPLETES (markComplete fires).
+    await vi.advanceTimersByTimeAsync(150_000);
+    mockNet.landCap = null;
+    const beforeResume = mockNet.statsCalls.length;
+    let complete = false;
+    const h2 = startDiscovery({
+      network: 'testnet',
+      onSnapshot: (_s, c) => {
+        if (c) complete = true;
+      },
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(50);
+    await h2.done;
+    expect(complete).toBe(true);
+    expect(mockNet.statsCalls.length - beforeResume).toBe(20); // aged entries reused, not re-fetched
+
+    // Now COMPLETE: normal 100s TTL is back. 101s later a rescan re-fetches all 40.
+    await vi.advanceTimersByTimeAsync(101_000);
+    const beforeStale = mockNet.statsCalls.length;
+    const h3 = startDiscovery({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(50);
+    await h3.done;
+    expect(mockNet.statsCalls.length - beforeStale).toBe(40);
+    vi.useRealTimers();
+  });
+
+  it('an invalidation while CONVERGING still clears the cache instantly (no aged entries survive it)', async () => {
+    vi.useFakeTimers();
+    // Converge partway (20 cached), still converging.
+    mockNet.landCap = 20;
+    const h1 = startDiscovery({ network: 'testnet', onSnapshot: vi.fn(), onError: vi.fn() });
+    await vi.advanceTimersByTimeAsync(12_500);
+    await h1.done;
+    expect(new Set(mockNet.landed).size).toBe(20);
+
+    // A change signal (broadcast / poll movement / network switch / lock) must
+    // nuke the cache REGARDLESS of mode — converging is not an excuse to retain
+    // stale entries (§7). After it, the next run pays the FULL 40 fresh.
+    invalidateScanCache('testnet');
+    mockNet.landCap = null;
+    const before = mockNet.statsCalls.length;
+    let complete = false;
+    const h2 = startDiscovery({
+      network: 'testnet',
+      onSnapshot: (_s, c) => {
+        if (c) complete = true;
+      },
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(50);
+    await h2.done;
+    expect(complete).toBe(true);
+    expect(mockNet.statsCalls.length - before).toBe(40); // cleared: nothing reused
+    vi.useRealTimers();
   });
 });
 

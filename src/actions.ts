@@ -441,6 +441,13 @@ export function startDiscovery(params: {
       });
       if (externallyAborted) return;
       persistScanMarks(network, full);
+      // v1.2.0 convergence-scoped TTL: a FULL gap-20 scan just completed, so the
+      // per-network cache leaves "converging" mode — subsequent rescans honor the
+      // normal SCAN_CACHE_TTL_MS again. `complete=true` only ever comes from this
+      // full-scan completion; any change signal (invalidateScanCache → clear())
+      // flips it straight back to converging. Skipped for a superseded run (the
+      // `externallyAborted` guard above), so a doomed run never marks complete.
+      cache.markComplete();
       onSnapshot(full, true);
     } catch {
       // Inactivity/cap cutoff or network failure. With a phase-1 result already

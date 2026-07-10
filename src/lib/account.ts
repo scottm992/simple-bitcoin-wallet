@@ -41,6 +41,12 @@ export interface AccountApi {
  * change signal invalidates the cache outright regardless (see the
  * cross-run cache owner + invalidation API in `actions.ts`). ~100s sits inside
  * the 90–120s band the hotfix brief specifies.
+ *
+ * v1.2.0 — this TTL applies ONLY once the account has completed a full scan
+ * (see {@link ScanCache.complete}). While still CONVERGING it is suspended: a
+ * ladder-spaced resume must be able to reuse a landing older than this, or the
+ * scan REGRESSES (entries dying faster than retries arrive — the 2026-07-10
+ * field bug, stuck at "22 of 40"). See {@link ScanCache.complete}.
  */
 export const SCAN_CACHE_TTL_MS = 100_000;
 
@@ -60,9 +66,9 @@ interface CacheEntry<T> {
  * a run the deadline cut at 25/40 resumes and pays only the remaining ~15
  * instead of restarting the 40-request burst forever. Two invariants keep that
  * safe: every entry carries a {@link SCAN_CACHE_TTL_MS} TTL (a stale response is
- * ignored and re-fetched), and any on-chain change signal must call the owner's
- * invalidation API — a cached "unused" response must never un-detect a payment
- * the cheap poll just found.
+ * ignored and re-fetched — but only once {@link complete}; see below), and any
+ * on-chain change signal must call the owner's invalidation API — a cached
+ * "unused" response must never un-detect a payment the cheap poll just found.
  */
 export interface ScanCache {
   readonly stats: Map<string, CacheEntry<AddressStats>>;
@@ -101,9 +107,32 @@ export interface ScanCache {
   /** Records one real network fetch (called by `withScanCache` on a miss). */
   recordFetch(): void;
   /**
-   * Drops every cached entry AND bumps {@link generation} — call on ANY change
-   * signal (see `actions.ts`). The generation bump is what makes an
-   * invalidation drop even the in-flight landings whose writes are still queued.
+   * Whether a FULL (gap-20) scan has completed since this cache was created or
+   * last invalidated (v1.2.0 convergence-scoped TTL). While `false`
+   * ("converging"), cached entries do NOT expire by {@link ttlMs} — the scan
+   * frontier can only advance, so a ladder-spaced resume MUST be able to reuse a
+   * landing older than the TTL, or the scan REGRESSES (entries dying faster than
+   * retries arrive — stuck at "22 of 40" forever, the 2026-07-10 field bug). Once
+   * `true`, normal TTL freshness applies to subsequent rescans. Honesty holds
+   * throughout convergence: the balance is flagged incomplete by the cue, and the
+   * uncached 30s poll still watches used addresses + tips and invalidates on ANY
+   * movement, so a payment arriving mid-convergence is detected within one poll
+   * cycle. Set by {@link markComplete}; reset to `false` by {@link clear}.
+   */
+  readonly complete: boolean;
+  /**
+   * Marks a FULL gap-20 scan as completed — call where the complete phase-2
+   * snapshot is persisted (see `actions.ts`). Flips {@link complete} to `true`,
+   * so subsequent rescans honor the normal {@link ttlMs} again. Idempotent.
+   */
+  markComplete(): void;
+  /**
+   * Drops every cached entry, bumps {@link generation} (F16), AND resets
+   * {@link complete} to `false` (back to converging) — call on ANY change signal
+   * (see `actions.ts`). The generation bump makes an invalidation drop even the
+   * in-flight landings whose writes are still queued; the convergence reset means
+   * the freshly-emptied cache re-converges under the no-TTL rule until the next
+   * full scan completes.
    */
   clear(): void;
 }
@@ -127,6 +156,10 @@ export function createScanCache(
   // F17: incremented on every real network fetch; read (as a getter) by
   // scanChain to pace only waves that actually hit the network.
   let fetches = 0;
+  // v1.2.0: false = "converging" (no full scan has completed since creation/last
+  // invalidation) → entries never expire by TTL; true = a full scan completed →
+  // normal TTL applies. Flipped true by markComplete(), reset false by clear().
+  let complete = false;
   return {
     stats,
     utxos,
@@ -139,14 +172,21 @@ export function createScanCache(
     get fetches(): number {
       return fetches;
     },
+    get complete(): boolean {
+      return complete;
+    },
     recordFetch(): void {
       fetches++;
+    },
+    markComplete(): void {
+      complete = true;
     },
     clear(): void {
       stats.clear();
       utxos.clear();
       txs.clear();
       generation++;
+      complete = false;
     },
   };
 }
@@ -747,6 +787,17 @@ function withScanCache(api: AccountApi, cache: ScanCache, onResponse?: () => voi
   /** Returns a still-fresh cached value, or undefined (miss or expired). */
   function fresh<T>(entry: CacheEntry<T> | undefined): T | undefined {
     if (entry === undefined) return undefined;
+    // Convergence-scoped lifetime (v1.2.0): while the account is still CONVERGING
+    // (no full scan has completed since the cache was created/invalidated),
+    // entries never expire by TTL. The frontier only advances, so a ladder-spaced
+    // resume MUST reuse a landing older than the TTL — otherwise entries die
+    // faster than retries arrive and the scan REGRESSES (the 2026-07-10 field bug:
+    // stuck at "22 of 40"). Honesty holds: the balance is flagged incomplete by
+    // the cue throughout convergence, and the uncached 30s poll still watches used
+    // addresses + tips and invalidates on ANY movement, so a payment arriving
+    // mid-convergence is detected within one poll cycle. Once a full scan completes
+    // ({@link ScanCache.markComplete}), normal TTL freshness applies to rescans.
+    if (!cache.complete) return entry.value;
     return cache.now() - entry.storedAt < cache.ttlMs ? entry.value : undefined;
   }
   // WRITE GUARD (§7 + F16): every write is fenced by TWO complementary checks,

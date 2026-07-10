@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
+  createScanCache,
   discoverAccount,
   AccountDiscoveryError,
   type AccountApi,
@@ -177,6 +178,25 @@ describe('discoverAccount — gap limit', () => {
     ]);
     // Next unused receive is just past the cap.
     expect(snap.receiveAddress).toBe(fakeAddress(0, 3));
+  });
+});
+
+// --- ScanCache convergence-scoped lifetime (v1.2.0) ------------------------
+
+describe('ScanCache — convergence state machine (v1.2.0)', () => {
+  it('starts converging; markComplete flips complete; clear resets to converging (and bumps generation)', () => {
+    const cache = createScanCache();
+    expect(cache.complete).toBe(false); // a fresh cache is CONVERGING (no TTL yet)
+    const gen0 = cache.generation;
+
+    cache.markComplete();
+    expect(cache.complete).toBe(true); // a completed full scan restores normal TTL
+    cache.markComplete(); // idempotent
+    expect(cache.complete).toBe(true);
+
+    cache.clear();
+    expect(cache.complete).toBe(false); // any invalidation → back to converging
+    expect(cache.generation).toBe(gen0 + 1); // and still bumps the F16 generation
   });
 });
 
