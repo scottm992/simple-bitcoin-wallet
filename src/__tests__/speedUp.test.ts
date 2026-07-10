@@ -70,6 +70,11 @@ describe('deadEndFromReason', () => {
     expect(deadEndFromReason('foreign-inputs')).toBe('cannot');
     expect(deadEndFromReason('unsupported-shape')).toBe('cannot');
   });
+
+  it('maps the F15 verification reasons to their own dead-ends (never collapsed)', () => {
+    expect(deadEndFromReason('recipient-mismatch')).toBe('mismatch');
+    expect(deadEndFromReason('unverified')).toBe('unverified');
+  });
 });
 
 describe('isHardFeeCap', () => {
@@ -105,5 +110,7 @@ describe('deadEndCopy', () => {
     expect(deadEndCopy('insufficient-change')).toBe(strings.speedUp.deadInsufficientChange);
     expect(deadEndCopy('cannot')).toBe(strings.speedUp.deadCannot);
     expect(deadEndCopy('fee-cap')).toBe(strings.speedUp.deadFeeCap);
+    expect(deadEndCopy('mismatch')).toBe(strings.speedUp.deadMismatch);
+    expect(deadEndCopy('unverified')).toBe(strings.speedUp.deadUnverified);
   });
 });

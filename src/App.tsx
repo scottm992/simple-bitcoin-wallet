@@ -441,7 +441,9 @@ export default function App(): JSX.Element {
   async function confirmSend(): Promise<void> {
     const pending = state.pendingSend;
     if (!pending || !state.account) throw new Error('nothing to send');
-    const txid = await signAndBroadcast({
+    // sendRecorded=false (a best-effort storage failure) never blocks a send —
+    // it only means this payment won't be speed-up-able later (F15).
+    const { txid } = await signAndBroadcast({
       network: state.network,
       utxos: state.account.utxos,
       recipient: pending.recipient,

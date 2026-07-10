@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { strings } from '../strings';
 import { Chrome } from '../components/Chrome';
 import { ActivityRow, relativeTime } from '../components/ActivityRow';
-import { CheckRow, Sheet, StatusPill } from '../components/ui';
+import { AddressChunk, CheckRow, Sheet, StatusPill } from '../components/ui';
 import { fmtBtc, fmtSats, fmtUsd } from '../display';
 import {
   apiBaseUrl,
@@ -299,7 +299,23 @@ function DetailSheet(props: {
         <h2 className="sheet__title">{strings.speedUp.title}</h2>
         <p className="sheet__body">{strings.speedUp.offerBody}</p>
 
+        {/* F15: re-confirm the DESTINATION, not just the fees. The address is
+            the one the wallet verified against its own send record; showing it
+            chunked (the Review-screen pattern) keeps the user in the loop even
+            though the check is mechanical. */}
+        <label className="label" style={{ marginTop: 'var(--sp-3)' }}>
+          {strings.speedUp.destinationLabel}
+        </label>
+        <div style={{ marginTop: 'var(--sp-2)' }}>
+          <AddressChunk address={offer.prepared.recipient} />
+        </div>
+
         <div className="rev-block" style={{ marginTop: 'var(--sp-3)' }}>
+          <FeeRow
+            label={strings.speedUp.destinationAmountLabel}
+            sats={est.newRecipientAmountSats}
+            btcUsd={props.btcUsd}
+          />
           <FeeRow label={strings.speedUp.feePaidLabel} sats={est.oldFeeSats} btcUsd={props.btcUsd} />
           <FeeRow label={strings.speedUp.newFeeLabel} sats={est.newFeeSats} btcUsd={props.btcUsd} />
           <FeeRow

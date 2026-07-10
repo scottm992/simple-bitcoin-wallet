@@ -10,16 +10,31 @@ by value-for-effort within each phase; nothing here is committed work.
   hand-rolled zero-dependency service worker (network-first HTML, cache-first
   hashed assets, cross-origin untouched), iOS standalone safe-areas, and
   browser pull-to-refresh suppression (an accidental reload locked the wallet).
-- **Speed up a stuck payment (RBF)** — pending outgoing transactions get a
-  "Speed up" button that rebuilds with a higher fee (BIP125). Closes the
-  biggest known functional gap: today a low-fee send can sit unconfirmed
-  with no recourse. Money-path change → needs a security review round.
+- **Speed up a stuck payment (RBF)** — ✅ **shipped 2026-07-09** (security
+  review round 8; F15 found and closed). All sends signal BIP125
+  (`RBF_SEQUENCE`); pending outgoing payments get a "Speed up" sheet that
+  rebuilds with a higher fee on the same inputs. The bump's recipient is
+  verified against a local send record written at broadcast time
+  (`src/lib/sendLog.ts`) — a hostile chain endpoint cannot redirect a
+  sped-up payment. Payments made before v1.1, or on another device, honestly
+  dead-end as un-bumpable.
 - **Scan QR to send** — camera-based address scanning on the Send screen
   (today it's paste-only). Needs a QR-decode dependency, so the supply-chain
   bar applies: tiny, audited, zero-dep library or nothing.
 - **Fresh address nudge** — after a receive address gets used, rotate the
   Receive screen to the next one automatically (with the old one still valid).
   Improves privacy for free.
+
+- **Sub-1 sat/vB "super economy" fee** — Bitcoin Core 30 (Oct 2025) lowered the
+  default minimum relay feerate to 0.1 sat/vB, so in a quiet mempool a payment
+  can confirm for less than the app's current 1 sat/vB floor. The engine's fee
+  math is already fraction-safe (`ceil(vsize × rate)`); the floor lives in
+  `MIN_ACCEPTED_FEE_RATE` (api.ts) and `feeRateForTier`, both part of the F1
+  fee-sanity fix — so lowering it is a money-path change needing a review round.
+  Savings are small (≈100 sats on a typical send) and a sub-1 payment is more
+  likely to stall, so this only became sane once **Speed up** shipped. Requires
+  checking what mempool.space actually serves for fractional rates (the
+  `/v1/fees/recommended` endpoint returns integers) and accepts on broadcast.
 
 ## v1.2 — Trust hardening
 

@@ -17,11 +17,14 @@ import {
   getBtcUsdPrice,
   getCachedHighWater,
   getFeeEstimates,
+  getSendRecord,
   getTransaction,
   getUtxos,
   mapWithConcurrency,
   MAX_ACCEPTED_FEE_RATE,
   MIN_ACCEPTED_FEE_RATE,
+  normalizeRecipientAddress,
+  recordSend,
   setCachedHighWater,
   setCachedReceiveIndex,
   type AccountSnapshot,
@@ -315,12 +318,37 @@ export function feeRateForTier(fees: FeeEstimates, tier: FeeTier): number {
 }
 
 /**
+ * What a broadcast returns: the txid, plus whether the local send record —
+ * the Speed-up flow's verification baseline (F15) — was persisted.
+ */
+export interface BroadcastResult {
+  /** The broadcast transaction id. */
+  readonly txid: string;
+  /**
+   * Whether the local send record (txid → recipient + amount, sendLog.ts) was
+   * persisted (F15). Best-effort BY DESIGN: a storage failure never fails the
+   * broadcast — the payment is already out and unaffected — but a `false`
+   * here means this payment cannot later be sped up (prepareBump will
+   * dead-end `'unverified'`), so callers can see their verification coverage
+   * instead of losing it silently.
+   */
+  readonly sendRecorded: boolean;
+}
+
+/**
  * Signs and broadcasts a payment. Reads the mnemonic at call time, builds the
  * tx, broadcasts it, and returns the txid. The mnemonic is not returned.
  *
  * Idempotency: buildAndSignTx over the same UTXO set + params yields the same
  * signed tx, and mempool.space treats a re-broadcast of an already-accepted tx
- * as success (returns the same txid), so a retry cannot double-spend.
+ * as success (returns the same txid), so a retry cannot double-spend (and its
+ * record write just rewrites identical data).
+ *
+ * F15: immediately after a successful broadcast, the send is recorded locally
+ * (returned txid → the USER-confirmed recipient + the exact amount the signed
+ * tx pays them, from the engine's own accounting). This record is what lets
+ * the Speed-up flow later prove the chain API isn't lying about where the
+ * payment goes.
  */
 export async function signAndBroadcast(params: {
   network: Network;
@@ -333,7 +361,7 @@ export async function signAndBroadcast(params: {
   /** User's informed consent to a large fee-vs-amount ratio (F10). Only bypasses
    * the engine's percentage rule — never the hard rate/absolute limits. */
   allowHighFee: boolean;
-}): Promise<string> {
+}): Promise<BroadcastResult> {
   const mnemonic = getMnemonic();
   const built = buildAndSignTx({
     mnemonic,
@@ -346,7 +374,14 @@ export async function signAndBroadcast(params: {
     sendMax: params.sendMax,
     allowHighFee: params.allowHighFee,
   });
-  return broadcastTx(params.network, built.txHex);
+  const txid = await broadcastTx(params.network, built.txHex);
+  // The recipient-output value, exactly: inputs − fee − change covers normal
+  // sends, sendMax sweeps, and the dust-fold alike.
+  const sendRecorded = recordSend(params.network, txid, {
+    recipient: params.recipient,
+    amountSats: built.totalInputSats - built.feeSats - built.changeSats,
+  });
+  return { txid, sendRecorded };
 }
 
 // ---------------------------------------------------------------------------
@@ -489,7 +524,19 @@ function classifyBumpOutputs(
  * 3. every input spends an address WE derive (both chains, index 0 through the
  *    high-water mark + gap — local derivation only) (`foreign-inputs`);
  * 4. the outputs match this wallet's own send shape (`unsupported-shape` —
- *    see {@link classifyBumpOutputs}, including the self-send rules).
+ *    see {@link classifyBumpOutputs}, including the self-send rules);
+ * 5. **F15 — the recipient is verified against the LOCAL send record** written
+ *    at broadcast time (sendLog.ts). Inputs and change are provable ours by
+ *    derivation, but the recipient is the one field of the fetched tx we
+ *    cannot derive — without this check a hostile chain API could substitute
+ *    an attacker's address and the bump would sign the full amount to it.
+ *    Recorded recipient AND amount must match the classified recipient output
+ *    exactly; a mismatch is `recipient-mismatch` (hard fail, no override
+ *    anywhere). No record at all is `unverified` — an honest dead-end, and a
+ *    legitimate one: only v1.1+ sends signal RBF, and v1.1 ships WITH this
+ *    record-keeping, so every bumpable payment made by this app has a record.
+ *    "No record" therefore means the wallet was restored from its 12 words on
+ *    a new device (records don't travel) — never a silent bypass.
  *
  * @throws {CannotBumpError} Per the checks above.
  * @throws {ApiResponseError | ApiNetworkError} From the single fetch.
@@ -530,6 +577,27 @@ export async function prepareBump(
 
   const { recipient, change } = classifyBumpOutputs(tx.vout, owned);
 
+  // F15: the recipient must be what THIS wallet originally broadcast — see the
+  // doc comment (check 5). Both sides are normalized (bech32 is
+  // case-insensitive; the record stores the canonical form) and the amount
+  // must match to the satoshi.
+  const record = getSendRecord(network, txidToBump);
+  if (record === null) {
+    throw new CannotBumpError(
+      'unverified',
+      'No local send record for this payment on this device',
+    );
+  }
+  if (
+    normalizeRecipientAddress(record.recipient) !== normalizeRecipientAddress(recipient.address) ||
+    record.amountSats !== recipient.value
+  ) {
+    throw new CannotBumpError(
+      'recipient-mismatch',
+      "The reported recipient does not match this wallet's local record of the payment",
+    );
+  }
+
   return {
     txid: tx.txid,
     utxos,
@@ -549,15 +617,23 @@ export async function prepareBump(
  * Idempotency: `buildRbfBumpTx` over the same prepared data + rate yields the
  * identical signed replacement (RFC6979 deterministic signatures), and
  * mempool.space treats a re-broadcast of an already-accepted tx as success —
- * so a retry cannot double-spend. `allowHighFee` bypasses only the 25% consent
- * rule, never the hard rate/absolute caps (F10).
+ * so a retry cannot double-spend (and rewrites an identical record).
+ * `allowHighFee` bypasses only the 25% consent rule, never the hard
+ * rate/absolute caps (F10).
+ *
+ * F15: the replacement gets its OWN send record under the returned txid — the
+ * recipient comes from `prepared`, which `prepareBump` verified against the
+ * ORIGINAL's record, and the amount is the replacement's actual
+ * recipient-output value (possibly reduced, for a sweep). A bump of a bump
+ * therefore verifies against the replacement's own record, keeping the chain
+ * of trust unbroken back to the user's original confirmation.
  */
 export async function bumpAndBroadcast(params: {
   network: Network;
   prepared: PreparedBump;
   feeRateSatVb: number;
   allowHighFee: boolean;
-}): Promise<string> {
+}): Promise<BroadcastResult> {
   const mnemonic = getMnemonic();
   const built = buildRbfBumpTx({
     mnemonic,
@@ -571,5 +647,12 @@ export async function bumpAndBroadcast(params: {
     feeRateSatVb: params.feeRateSatVb,
     allowHighFee: params.allowHighFee,
   });
-  return broadcastTx(params.network, built.txHex);
+  const txid = await broadcastTx(params.network, built.txHex);
+  const sendRecorded = recordSend(params.network, txid, {
+    recipient: params.prepared.recipient,
+    // The replacement's actual recipient-output value (inputs − fee − change):
+    // unchanged when change absorbs the bump, reduced for a sweep.
+    amountSats: built.totalInputSats - built.feeSats - built.changeSats,
+  });
+  return { txid, sendRecorded };
 }

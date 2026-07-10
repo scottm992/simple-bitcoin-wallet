@@ -13,7 +13,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { Activity } from '../screens/Activity';
 import { strings } from '../strings';
-import { CannotBumpError, type FeeEstimates } from '../lib';
+import { CannotBumpError, chunkAddress, type FeeEstimates } from '../lib';
 import type { AccountSnapshot, ActivityItem } from '../lib/account';
 import type { PreparedBump } from '../actions';
 
@@ -158,6 +158,12 @@ describe('Activity — Speed-up offer → success', () => {
     expect(container.textContent).toContain(strings.speedUp.newFeeLabel);
     expect(container.textContent).toContain(strings.speedUp.extraCostLabel);
 
+    // F15: the offer re-confirms the DESTINATION — the verified recipient
+    // address (chunked, Review-style) and the amount going to it.
+    expect(container.textContent).toContain(strings.speedUp.destinationLabel);
+    expect(container.textContent).toContain(chunkAddress(PREPARED.recipient));
+    expect(container.textContent).toContain(strings.speedUp.destinationAmountLabel);
+
     // No consent gates for an ordinary bump: the primary button is enabled.
     const confirm = findButtonStartsWith('Speed up —');
     expect(confirm).not.toBeNull();
@@ -192,5 +198,37 @@ describe('Activity — Speed-up dead-end', () => {
     // No way to trigger a bump from a dead-end.
     expect(findButtonStartsWith('Speed up —')).toBeNull();
     expect(onBumpConfirm).not.toHaveBeenCalled();
+  });
+
+  it('F15 recipient-mismatch: calm-but-firm copy, Close only, no override anywhere', async () => {
+    const onPrepareBump = vi.fn(async () => {
+      throw new CannotBumpError('recipient-mismatch', 'record does not match');
+    });
+    const onBumpConfirm = vi.fn(async () => {});
+    await mountActivity({ onPrepareBump, onBumpConfirm });
+    await openSheet();
+
+    await act(async () => findButton(strings.speedUp.cta)!.click());
+    await flush();
+
+    expect(container.textContent).toContain(strings.speedUp.deadMismatch);
+    expect(findButton(strings.speedUp.close)).not.toBeNull();
+    expect(findButtonStartsWith('Speed up —')).toBeNull();
+    expect(onBumpConfirm).not.toHaveBeenCalled();
+  });
+
+  it('F15 unverified (restored wallet): honest dead-end copy, Close only', async () => {
+    const onPrepareBump = vi.fn(async () => {
+      throw new CannotBumpError('unverified', 'no local record');
+    });
+    await mountActivity({ onPrepareBump });
+    await openSheet();
+
+    await act(async () => findButton(strings.speedUp.cta)!.click());
+    await flush();
+
+    expect(container.textContent).toContain(strings.speedUp.deadUnverified);
+    expect(findButton(strings.speedUp.close)).not.toBeNull();
+    expect(findButtonStartsWith('Speed up —')).toBeNull();
   });
 });

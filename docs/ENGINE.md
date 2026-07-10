@@ -46,7 +46,7 @@ the mnemonic in at call time and let it go out of scope.
 **RBF fee bump (Speed-up)**: `INCREMENTAL_RELAY_SAT_VB = 1` (the BIP125 rule-4 relay floor).
 - `estimateBumpFee({ utxos, recipientAmountSats, hasChangeOutput, oldFeeSats, oldVsize, feeRateSatVb }): BumpFeeEstimate` — pure dry-run of a replacement: SAME inputs (exactly the original outpoints; v1 adds none, keeping the BIP125 conflict set identical) and SAME recipient. The fee increase comes out of change; a no-change (sweep) original reduces the recipient amount instead (`reducesRecipientBy > 0` → the UI must collect explicit consent). Change squeezed sub-dust folds into the fee (same dust rule as sends). Enforces the BIP125 floors — new fee ≥ old fee + `INCREMENTAL_RELAY_SAT_VB` × new vsize AND effective rate strictly > old rate — by RAISING the fee to the floor and reporting it (`rateWasRaised`); never describes a replacement relays would reject. Verifies the caller's numbers reconcile (`inputs = amount + change + fee`, else `InvalidTxParamsError`) and bounds `oldVsize` to a plausible window. Throws `CannotBumpError('insufficient-change')` when nothing in the payment can absorb any increase. Computes `needsHighFeeConsent` and `exceedsRateCeiling` for the build to enforce.
 - `buildRbfBumpTx({ mnemonic; network; utxos; recipient; recipientAmountSats; changeAddress: string | null; oldFeeSats; oldVsize; feeRateSatVb; allowHighFee? }): BuiltTx` — CONSUMES `estimateBumpFee` (never a parallel computation, F11) and signs the replacement; every input re-signals `RBF_SEQUENCE`, so a bump can itself be re-bumped. All send fee guards apply unchanged (F1/F10): requested rate > `MAX_FEE_RATE_SAT_VB` — **hard**; floors pushing the fee past that ceiling for the replacement's size (`exceedsRateCeiling`) — **hard**; fee > `MAX_FEE_ABSOLUTE_SATS` — **hard**; the 25% consent rule bypassable **only** via `allowHighFee` (compared to amount + fee, or total input for a sweep — same semantics as sends).
-- `CannotBumpError` (`.reason`) — machine-readable dead-ends: `'confirmed' | 'not-signaling' | 'foreign-inputs' | 'insufficient-change' | 'unsupported-shape'`.
+- `CannotBumpError` (`.reason`) — machine-readable dead-ends: `'confirmed' | 'not-signaling' | 'foreign-inputs' | 'insufficient-change' | 'unsupported-shape' | 'recipient-mismatch' | 'unverified'` (the last two are the F15 send-record verification: mismatch = possible attack, hard fail, no override; unverified = no local record on this device, e.g. a wallet restored from its 12 words).
 
 **Errors**: `InsufficientFundsError` (`.available`, `.required`), `InvalidRecipientError`, `InvalidTxParamsError`, `FeeTooHighError` (`.feeSats`, `.feeRateSatVb`, `.comparedToSats`), `CannotBumpError` (`.reason`).
 
@@ -122,6 +122,17 @@ remains a fallback. Secrets are never logged or placed in errors.
 
 ---
 
+## `sendLog.ts` — the local send record (F15)
+
+Non-secret, per-network localStorage log (own key `sbw.sends.v1`; vault.ts untouched) of this wallet's OWN broadcasts: txid → { recipient, amountSats }, written at broadcast time from the USER-confirmed values. It is the Speed-up flow's verification baseline: `prepareBump` hard-fails a bump whose API-reported recipient/amount don't match the record, so the wallet never signs a bump to a destination it didn't itself send to. Bounded (`MAX_SEND_RECORDS_PER_NETWORK = 200` most-recent per network, oldest-first eviction) and best-effort (a storage failure never breaks broadcasting). Corrupt/absent data degrades to "no record" (a fail-safe dead-end), never a crash.
+
+- `recordSend(network, txid, { recipient, amountSats }): boolean` — persists one record (replaces same-txid; caps the list). `false` = write failed (surfaced via `BroadcastResult.sendRecorded`).
+- `getSendRecord(network, txid): SendRecord | null` — `null` = never broadcast on this device / evicted.
+- `normalizeRecipientAddress(address): string` — trims; lowercases bech32 (BIP173 case-insensitivity — the API reports lowercase); preserves base58 verbatim (case-sensitive).
+- `SEND_LOG_STORAGE_KEY = 'sbw.sends.v1'`, `MAX_SEND_RECORDS_PER_NETWORK = 200`.
+
+---
+
 ## `format.ts` — display helpers
 
 **Constants**: `SATS_PER_BTC = 100_000_000n`, `MAX_SUPPLY_SATS`.
@@ -173,10 +184,15 @@ BIP44/F8), `DISCOVERY_DEADLINE_MS = 20_000`, `POLL_CONCURRENCY = 4`.
 - Also here: `loadPrice()` (null on failure — offline-tolerant), `loadFees(network)`,
   `feeRateForTier(fees, tier)` — second independent clamp into
   `[MIN_ACCEPTED_FEE_RATE, MAX_ACCEPTED_FEE_RATE]` (F1), and
-  `signAndBroadcast(params)` — reads the mnemonic at call time, never returns it;
-  idempotent on retry (same UTXO set + params ⇒ same signed tx; mempool.space
-  treats re-broadcast of an accepted tx as success). `allowHighFee` bypasses only
-  the 25% consent rule, never the hard rate/absolute caps (F10).
+  `signAndBroadcast(params): Promise<BroadcastResult>` — reads the mnemonic at
+  call time, never returns it; idempotent on retry (same UTXO set + params ⇒
+  same signed tx; mempool.space treats re-broadcast of an accepted tx as
+  success). `allowHighFee` bypasses only the 25% consent rule, never the hard
+  rate/absolute caps (F10). After a successful broadcast it writes the F15 send
+  record (returned txid → user-confirmed recipient + exact recipient-output
+  amount). `BroadcastResult { txid; sendRecorded }` — `sendRecorded: false`
+  means the best-effort record write failed: the payment is unaffected but
+  cannot later be sped up (`'unverified'`).
 - `prepareBump(network, txid, account, signal?): Promise<PreparedBump>` — the
   Speed-up flow's gather step. Costs exactly ONE network request
   (`getTransaction`); the input/output ownership mapping is LOCAL derivation
@@ -186,16 +202,27 @@ BIP44/F8), `DISCOVERY_DEADLINE_MS = 20_000`, `POLL_CONCURRENCY = 4`.
   input must carry sequence < 0xfffffffe — pre-v1.1 sends don't);
   `foreign-inputs` (an input's prevout address isn't one we derive);
   `unsupported-shape` (not this wallet's send shape: >2 outputs, >1 foreign
-  output, an address-less output, or an ambiguous self-send). Output
-  classification: the foreign output is the recipient and the owned one is
-  change; a SELF-SEND resolves as receive-chain output = recipient,
-  change-chain output = change; a single all-ours output = recipient
-  (self-sweep). `PreparedBump { txid; utxos; recipient; recipientAmountSats;
-  changeAddress: string | null; oldFeeSats; oldVsize; oldRateSatVb }` — the
-  ORIGINAL recipient/change addresses are reused verbatim in the replacement.
-- `bumpAndBroadcast({ network, prepared, feeRateSatVb, allowHighFee })` — reads
-  the mnemonic at call time, builds via `buildRbfBumpTx`, broadcasts, returns
-  the new txid. Same idempotency argument as `signAndBroadcast` (deterministic
-  signatures ⇒ a retry re-broadcasts the identical replacement). The new fee
-  rate comes from the existing `loadFees`/`feeRateForTier` path (already
-  clamped, F1).
+  output, an address-less output, or an ambiguous self-send); and the **F15
+  verification**: the classified recipient's address AND amount must exactly
+  match the local send record for this txid — `recipient-mismatch` (hard fail,
+  no override: inputs/change are provably ours by derivation, the recipient is
+  the one field we can't derive, and without this check a hostile API could
+  substitute an attacker's address) or `unverified` (no record on this device;
+  legitimate only for a wallet restored from its 12 words — every bumpable tx
+  is v1.1+, and v1.1 writes records). Output classification: the foreign
+  output is the recipient and the owned one is change; a SELF-SEND resolves as
+  receive-chain output = recipient, change-chain output = change; a single
+  all-ours output = recipient (self-sweep). `PreparedBump { txid; utxos;
+  recipient; recipientAmountSats; changeAddress: string | null; oldFeeSats;
+  oldVsize; oldRateSatVb }` — the ORIGINAL recipient/change addresses are
+  reused verbatim in the replacement.
+- `bumpAndBroadcast({ network, prepared, feeRateSatVb, allowHighFee }):
+  Promise<BroadcastResult>` — reads the mnemonic at call time, builds via
+  `buildRbfBumpTx`, broadcasts. Same idempotency argument as `signAndBroadcast`
+  (deterministic signatures ⇒ a retry re-broadcasts the identical replacement
+  and rewrites an identical record). Writes the replacement's OWN F15 record
+  (returned txid → the verified recipient + the replacement's actual
+  recipient-output amount, reduced for a sweep), so a bump of a bump verifies
+  against the replacement's record — the chain of trust runs unbroken back to
+  the user's original confirmation. The new fee rate comes from the existing
+  `loadFees`/`feeRateForTier` path (already clamped, F1).

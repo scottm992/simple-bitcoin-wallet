@@ -825,3 +825,73 @@ source files were modified. Empirically verified: the recipient-substitution red
 signed replacement pays the attacker), the change-swap fail-safe, the change-absorbs and sweep
 accounting identities (byte-parsed, `reducesRecipientBy` exact), and the BIP125 boundary-bump
 floors; ingest validation was confirmed against the shipped `api.tx.test.ts` fuzz suite._
+
+---
+
+# Round 8 closure — F15 re-audit
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 0**
+
+`npm test` = 233 passing, `tsc --noEmit` clean, `npm run build` clean, prod CSP still
+`script-src 'self'`. Re-ran the Round-8 exploit and its variants against the fixed working
+tree (throwaway deleted); every attack now dead-ends before anything is built, signed, or
+broadcast.
+
+## F15 — CLOSED
+
+The fix is a new local send log (`src/lib/sendLog.ts`) written at broadcast time by both
+`signAndBroadcast` and `bumpAndBroadcast` (keyed by the RETURNED txid), plus `prepareBump`
+check 5 verifying the API's recipient **address and amount** against that record, plus the
+offer sheet now leading with the destination address (chunked) + amount. Verified:
+
+- **The exploit is dead (test).** With a genuine local record for the real recipient, a
+  hostile `getTransaction` that (a) substitutes the recipient **address**, or (b) keeps the
+  address but **inflates the recipient-output value** (stealing from change), both throw
+  `CannotBumpError('recipient-mismatch')` — a hard fail with no override — and `broadcastTx`
+  is never called (nothing built/signed/broadcast). The Round-8 redirect that previously
+  paid the attacker the full amount no longer reaches the builder.
+- **Variants the fix might have missed — all closed (test).** An UPPERCASE-bech32 attacker
+  address cannot forge a match (normalization lowercases both sides, so a *different* address
+  still mismatches), while a legitimate case difference on the *same* address still verifies
+  (no false mismatch that would block honest bumps). The `'unverified'` no-record path fires
+  *before* any fee math, key use, or broadcast. A bump-of-a-bump with a substituted address
+  on the replacement's own record also dead-ends `recipient-mismatch`, so the trust chain
+  holds across re-bumps.
+- **No bypass into the builder (traced).** `buildRbfBumpTx` is called only by
+  `bumpAndBroadcast` (actions.ts), which is called only from `App.tsx` `speedUpConfirm` with
+  `offer.prepared`, which the sheet obtains only from `onPrepareBump` → `prepareBump` (check
+  5). The sheet's own `estimateBumpFee` call is pure/display and cannot build or broadcast.
+  There is no path to a signed replacement that skips check 5. The `mismatch` and
+  `unverified` dead-ends render the single-Close `deadend` phase — no retry/override
+  affordance in `speedUp.ts` or the sheet (only the network-`error` phase offers Try again).
+- **sendLog integrity (test).** Poisoned localStorage — non-JSON, wrong-typed
+  (`mainnet: 'nope'`), short/garbage txids, non-string recipients, `NaN`/over-long amounts,
+  a 10,000-element array — all degrade to `null` (→ `'unverified'` fail-safe) with no throw,
+  and a pre-existing corrupt document does not block a subsequent legitimate write. Eviction
+  is oldest-first at the 200/network cap (verified: writing 205 keeps the newest 200); since
+  only *pending* payments are bumpable and 200 ≫ any realistic pending count, normal use
+  cannot age out a still-bumpable record. Per-network keying holds: a `testnet` record can
+  never satisfy a `mainnet` bump (→ `'unverified'`).
+- **No regressions / no secret exposure.** `BroadcastResult { txid, sendRecorded }` threads
+  cleanly through `App.tsx confirmSend` (destructures `txid`; `sendRecorded:false` never
+  blocks a send). The store holds only `{ txid, recipient, amountSats }` — public on-chain
+  data, no mnemonic/paths/keys — in its own module and storage key; `vault.ts` is untouched.
+  The fix adds ZERO network calls (`prepareBump` is still exactly one `getTransaction`;
+  verification is pure localStorage + local derivation). Hard caps, consent gating, and
+  single-fetch discipline (Round-8 areas b/g/i) are undisturbed, and the reviewer's exploit
+  is now a permanent regression test (both variants) in `src/__tests__/actions.bump.test.ts`.
+- Gates re-confirmed by me: `tsc --noEmit` clean, `npm test` = 233 passing, `npm run build`
+  clean, `dist` CSP `script-src 'self'`.
+
+**Note for a successor reviewer (this file is the handoff):** F15's defence rests on the
+integrity of `sbw.sends.v1` in same-origin localStorage. That is sound under the app's threat
+model (the attacker is a hostile *chain API*, not a same-origin script — the strict CSP and
+zero-dependency supply chain keep hostile JS out). The residual, *acknowledged* trade-off is
+the honest `'unverified'` dead-end after a legitimate 12-word restore on a new device: such a
+wallet cannot speed up a payment it made elsewhere (records don't travel with the seed). That
+is the correct fail-safe (never a silent bypass) and is documented in `prepareBump`. If a
+future change ever lets the recipient reach signing from any source other than a
+check-5-verified `PreparedBump`, F15 reopens — keep the single-path invariant intact.
+
+_Round-8-closure throwaway tests used the `.review.test.ts` suffix, were executed, and were
+deleted; no source files were modified._

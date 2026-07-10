@@ -18,7 +18,9 @@ export type SpeedUpDeadEnd =
   | 'not-signaling'
   | 'insufficient-change'
   | 'cannot'
-  | 'fee-cap';
+  | 'fee-cap'
+  | 'mismatch'
+  | 'unverified';
 
 /**
  * Whether an activity item is a candidate for speed-up: a still-pending payment
@@ -43,6 +45,13 @@ export function deadEndFromReason(reason: CannotBumpReason): SpeedUpDeadEnd {
     case 'foreign-inputs':
     case 'unsupported-shape':
       return 'cannot';
+    // F15: the fetched payment doesn't match this wallet's local send record —
+    // a possible attack. Calm but firm copy, hard fail, no override anywhere.
+    case 'recipient-mismatch':
+      return 'mismatch';
+    // F15: no local record (wallet restored on a new device) — honest dead-end.
+    case 'unverified':
+      return 'unverified';
   }
 }
 
@@ -80,5 +89,9 @@ export function deadEndCopy(kind: SpeedUpDeadEnd): string {
       return strings.speedUp.deadCannot;
     case 'fee-cap':
       return strings.speedUp.deadFeeCap;
+    case 'mismatch':
+      return strings.speedUp.deadMismatch;
+    case 'unverified':
+      return strings.speedUp.deadUnverified;
   }
 }

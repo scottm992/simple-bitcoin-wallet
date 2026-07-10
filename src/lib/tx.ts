@@ -216,13 +216,21 @@ export class FeeTooHighError extends Error {
  *   amount below dust).
  * - `unsupported-shape` — the transaction isn't a shape this wallet builds
  *   (multiple recipients, address-less outputs, ambiguous self-send).
+ * - `recipient-mismatch` — the API's recipient/amount for this payment do NOT
+ *   match the local send record written when this wallet broadcast it (F15).
+ *   A possible attack: hard fail, no override anywhere.
+ * - `unverified` — no local send record exists for this payment on this
+ *   device (F15): the wallet was restored from its 12 words on a new device,
+ *   so the record didn't travel. Honest dead-end — never a silent bypass.
  */
 export type CannotBumpReason =
   | 'confirmed'
   | 'not-signaling'
   | 'foreign-inputs'
   | 'insufficient-change'
-  | 'unsupported-shape';
+  | 'unsupported-shape'
+  | 'recipient-mismatch'
+  | 'unverified';
 
 /**
  * Thrown when a transaction cannot be replaced (sped up). Carries a

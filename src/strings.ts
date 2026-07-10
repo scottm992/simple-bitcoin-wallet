@@ -248,6 +248,10 @@ export const strings = {
       'Paying a little more to the bitcoin network can help a slow payment go through sooner.',
     // Busy label while we look up the payment (one network request).
     checking: 'Checking…',
+    // The destination the payment is going to (F15): the sheet re-confirms
+    // WHERE the money goes, chunked like the Review screen, above the fee rows.
+    destinationLabel: 'Going to this address',
+    destinationAmountLabel: 'Amount being sent',
     // Offer rows (each shows USD, with sats beneath).
     feePaidLabel: 'Fee paid so far',
     newFeeLabel: 'New fee',
@@ -280,6 +284,13 @@ export const strings = {
       "This payment can't be sped up from here. It will still go through — it just may take a while.",
     deadFeeCap:
       'Speeding this up would cost more than this wallet will ever send — that usually means the network fee estimate is off right now. This payment will still go through on its own — it just may take a while.',
+    // F15 verification dead-ends. Mismatch is a possible attack: calm but firm,
+    // no override anywhere. Unverified is the honest restored-wallet case
+    // (send records don't travel with the 12 words).
+    deadMismatch:
+      "Something doesn't match on this payment's details, so we won't speed it up. Your money is safe and the original payment is unchanged.",
+    deadUnverified:
+      "This payment was made before this wallet was set up on this device, so it can't be sped up from here. It will still go through — it just may take a while.",
     // Network failure while looking up the payment (nothing was sent).
     errorHeading: "We couldn't check this just now",
     errorBody:

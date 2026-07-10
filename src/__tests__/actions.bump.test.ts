@@ -34,6 +34,8 @@ import {
   CannotBumpError,
   FeeTooHighError,
   deriveAddress,
+  getSendRecord,
+  recordSend,
   type AccountSnapshot,
   type ApiTransaction,
 } from '../lib';
@@ -92,6 +94,15 @@ function mockTx(tx: ApiTransaction): void {
   vi.mocked(getTransaction).mockResolvedValue(tx);
 }
 
+/**
+ * Seeds the F15 local send record for the payment being bumped — what this
+ * wallet would have written at broadcast time. Happy-path prepareBump tests
+ * need one (v1.1 writes a record for every send it broadcasts).
+ */
+function seedRecord(recipient: string, amountSats: bigint, txid: string = PENDING_TXID): void {
+  expect(recordSend('mainnet', txid, { recipient, amountSats })).toBe(true);
+}
+
 async function reasonOf(promise: Promise<unknown>): Promise<string> {
   try {
     await promise;
@@ -105,6 +116,8 @@ async function reasonOf(promise: Promise<unknown>): Promise<string> {
 afterEach(() => {
   lockNow();
   vi.clearAllMocks();
+  vi.unstubAllGlobals();
+  localStorage.clear();
 });
 
 describe('prepareBump — dead-end detection (typed reasons)', () => {
@@ -181,6 +194,7 @@ describe('prepareBump — dead-end detection (typed reasons)', () => {
 describe('prepareBump — mapping and classification', () => {
   it('maps inputs to derivation paths over BOTH chains and identifies recipient/change — one fetch only', async () => {
     setUnlocked(ABANDON);
+    seedRecord(EXTERNAL, 80_000n);
     mockTx(makePendingTx());
     const prepared = await prepareBump('mainnet', PENDING_TXID, ACCOUNT);
 
@@ -218,6 +232,7 @@ describe('prepareBump — mapping and classification', () => {
 
   it('self-send: the receive-chain output is the recipient, the change-chain output is change', async () => {
     setUnlocked(ABANDON);
+    seedRecord(r0.address, 50_000n);
     mockTx(
       makePendingTx({
         vout: [
@@ -234,6 +249,7 @@ describe('prepareBump — mapping and classification', () => {
 
   it('self-sweep: a single all-ours output is simply the recipient (no change)', async () => {
     setUnlocked(ABANDON);
+    seedRecord(r0.address, 99_000n);
     mockTx(makePendingTx({ vout: [{ value: 99_000n, address: r0.address }] }));
     const prepared = await prepareBump('mainnet', PENDING_TXID, ACCOUNT);
     expect(prepared.recipient).toBe(r0.address);
@@ -243,18 +259,20 @@ describe('prepareBump — mapping and classification', () => {
 });
 
 describe('bumpAndBroadcast — build + broadcast threading', () => {
-  it('builds the replacement from the prepared data and broadcasts real signed hex', async () => {
+  it('builds the replacement from the prepared data, broadcasts real signed hex, and records the replacement (F15)', async () => {
     setUnlocked(ABANDON);
+    seedRecord(EXTERNAL, 80_000n);
     mockTx(makePendingTx());
     const prepared = await prepareBump('mainnet', PENDING_TXID, ACCOUNT);
 
-    const newTxid = await bumpAndBroadcast({
+    const result = await bumpAndBroadcast({
       network: 'mainnet',
       prepared,
       feeRateSatVb: 20,
       allowHighFee: false,
     });
-    expect(newTxid).toBe('f'.repeat(64));
+    expect(result.txid).toBe('f'.repeat(64));
+    expect(result.sendRecorded).toBe(true);
 
     const mock = vi.mocked(broadcastTx);
     expect(mock).toHaveBeenCalledTimes(1);
@@ -263,10 +281,18 @@ describe('bumpAndBroadcast — build + broadcast threading', () => {
     expect(typeof txHex).toBe('string');
     expect((txHex as string).length).toBeGreaterThan(100);
     expect(/^[0-9a-f]+$/i.test(txHex as string)).toBe(true);
+
+    // F15: the replacement got its OWN record under the RETURNED txid — same
+    // (verified) recipient, same amount (change absorbed the bump).
+    expect(getSendRecord('mainnet', result.txid)).toEqual({
+      recipient: EXTERNAL,
+      amountSats: 80_000n,
+    });
   });
 
   it('the 25% consent rule blocks before broadcast without allowHighFee, and passes with it (F10 semantics)', async () => {
     setUnlocked(ABANDON);
+    seedRecord(EXTERNAL, 5_000n);
     // Small recipient amount, large change: a 20 sat/vB bump fee (4,160 sats)
     // dwarfs the 5,000-sat payment → consent required.
     mockTx(
@@ -284,23 +310,156 @@ describe('bumpAndBroadcast — build + broadcast threading', () => {
     ).rejects.toBeInstanceOf(FeeTooHighError);
     expect(vi.mocked(broadcastTx)).not.toHaveBeenCalled();
 
-    const txid = await bumpAndBroadcast({
+    const result = await bumpAndBroadcast({
       network: 'mainnet',
       prepared,
       feeRateSatVb: 20,
       allowHighFee: true,
     });
-    expect(txid).toBe('f'.repeat(64));
+    expect(result.txid).toBe('f'.repeat(64));
     expect(vi.mocked(broadcastTx)).toHaveBeenCalledTimes(1);
   });
 
   it('a hostile rate stays blocked even with allowHighFee — nothing reaches broadcast', async () => {
     setUnlocked(ABANDON);
+    seedRecord(EXTERNAL, 80_000n);
     mockTx(makePendingTx());
     const prepared = await prepareBump('mainnet', PENDING_TXID, ACCOUNT);
     await expect(
       bumpAndBroadcast({ network: 'mainnet', prepared, feeRateSatVb: 5_000, allowHighFee: true }),
     ).rejects.toBeInstanceOf(FeeTooHighError);
     expect(vi.mocked(broadcastTx)).not.toHaveBeenCalled();
+  });
+});
+
+// --- F15: recipient verification against the local send record --------------
+
+describe('prepareBump — F15 recipient verification (Round 8 exploit regression)', () => {
+  it("the reviewer's exploit: a substituted recipient ADDRESS → 'recipient-mismatch', hard fail", async () => {
+    setUnlocked(ABANDON);
+    // What the user actually confirmed at send time:
+    seedRecord(EXTERNAL, 80_000n);
+    // A hostile getTransaction response: real owned inputs, real owned change,
+    // same value — only the recipient address swapped for the attacker's.
+    const tx = makePendingTx();
+    mockTx({
+      ...tx,
+      vout: [
+        { value: 80_000n, address: EXTERNAL_2 }, // attacker
+        { value: 19_000n, address: c1.address },
+      ],
+    });
+    expect(await reasonOf(prepareBump('mainnet', PENDING_TXID, ACCOUNT))).toBe(
+      'recipient-mismatch',
+    );
+    expect(vi.mocked(broadcastTx)).not.toHaveBeenCalled();
+  });
+
+  it("a substituted recipient AMOUNT → 'recipient-mismatch', hard fail", async () => {
+    setUnlocked(ABANDON);
+    seedRecord(EXTERNAL, 80_000n);
+    const tx = makePendingTx();
+    mockTx({
+      ...tx,
+      vout: [
+        { value: 79_000n, address: EXTERNAL }, // same address, wrong amount
+        { value: 19_000n, address: c1.address },
+      ],
+    });
+    expect(await reasonOf(prepareBump('mainnet', PENDING_TXID, ACCOUNT))).toBe(
+      'recipient-mismatch',
+    );
+  });
+
+  it("no local record (wallet restored on a new device) → 'unverified' honest dead-end", async () => {
+    setUnlocked(ABANDON);
+    mockTx(makePendingTx()); // nothing seeded
+    expect(await reasonOf(prepareBump('mainnet', PENDING_TXID, ACCOUNT))).toBe('unverified');
+  });
+
+  it("a record on the OTHER network does not count (practice/live never cross) → 'unverified'", async () => {
+    setUnlocked(ABANDON);
+    expect(recordSend('testnet', PENDING_TXID, { recipient: EXTERNAL, amountSats: 80_000n })).toBe(
+      true,
+    );
+    mockTx(makePendingTx());
+    expect(await reasonOf(prepareBump('mainnet', PENDING_TXID, ACCOUNT))).toBe('unverified');
+  });
+
+  it('an uppercase-bech32 recipient recorded at send time still verifies (case normalization)', async () => {
+    setUnlocked(ABANDON);
+    seedRecord(EXTERNAL.toUpperCase(), 80_000n);
+    mockTx(makePendingTx());
+    const prepared = await prepareBump('mainnet', PENDING_TXID, ACCOUNT);
+    expect(prepared.recipient).toBe(EXTERNAL);
+  });
+});
+
+describe('bumpAndBroadcast — F15 record chain', () => {
+  it("a bump of a bump verifies via the replacement's OWN record (sweep: reduced amount recorded)", async () => {
+    setUnlocked(ABANDON);
+    // A sweep original: 100k in, 99k to the recipient, no change.
+    seedRecord(EXTERNAL, 99_000n);
+    mockTx(makePendingTx({ vout: [{ value: 99_000n, address: EXTERNAL }] }));
+    const prepared = await prepareBump('mainnet', PENDING_TXID, ACCOUNT);
+    expect(prepared.changeAddress).toBeNull();
+
+    // Bump at 20 sat/vB: fee 4,160 (vsize 208), so the recipient amount drops
+    // to 95,840. The replacement's record must carry the REDUCED amount.
+    const result = await bumpAndBroadcast({
+      network: 'mainnet',
+      prepared,
+      feeRateSatVb: 20,
+      allowHighFee: false,
+    });
+    expect(result.sendRecorded).toBe(true);
+    expect(getSendRecord('mainnet', result.txid)).toEqual({
+      recipient: EXTERNAL,
+      amountSats: 95_840n,
+    });
+
+    // The replacement later shows up pending; its fetched view matches its own
+    // record, so a second bump verifies — the chain of trust is unbroken.
+    mockTx({
+      txid: result.txid,
+      confirmed: false,
+      feeSats: 4_160n,
+      weight: 832,
+      vsize: 208,
+      vin: makePendingTx().vin,
+      vout: [{ value: 95_840n, address: EXTERNAL }],
+    });
+    const rePrepared = await prepareBump('mainnet', result.txid, ACCOUNT);
+    expect(rePrepared.recipientAmountSats).toBe(95_840n);
+    expect(rePrepared.recipient).toBe(EXTERNAL);
+  });
+
+  it('a storage failure never blocks the broadcast — it surfaces as sendRecorded: false', async () => {
+    setUnlocked(ABANDON);
+    seedRecord(EXTERNAL, 80_000n);
+    mockTx(makePendingTx());
+    const prepared = await prepareBump('mainnet', PENDING_TXID, ACCOUNT);
+
+    // Break storage AFTER prepare (the verification read already happened).
+    const saved = localStorage.getItem('sbw.sends.v1');
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => (k === 'sbw.sends.v1' ? saved : null),
+      setItem: () => {
+        throw new Error('QuotaExceededError');
+      },
+      removeItem: () => {},
+      clear: () => {},
+    });
+
+    const result = await bumpAndBroadcast({
+      network: 'mainnet',
+      prepared,
+      feeRateSatVb: 20,
+      allowHighFee: false,
+    });
+    // The payment went out; only the verification coverage was lost.
+    expect(result.txid).toBe('f'.repeat(64));
+    expect(result.sendRecorded).toBe(false);
+    expect(vi.mocked(broadcastTx)).toHaveBeenCalledTimes(1);
   });
 });

@@ -7,6 +7,8 @@ A dead-simple, beginner-friendly Bitcoin wallet that runs entirely in your brows
 - **Create a wallet** — generates a standard 12-word seed phrase (BIP39)
 - **Receive bitcoin** — shows your address as text + QR code
 - **Send bitcoin** — paste an address, enter an amount, review, send
+- **Speed up a stuck payment** — if a payment is taking too long because its
+  fee was low, tap "Speed up" to re-send it with a higher fee (BIP125 RBF)
 - **Your keys never leave your device** — all key generation and transaction
   signing happens locally in the browser; the app only talks to the public
   [mempool.space](https://mempool.space) API for balances and broadcasting
@@ -17,13 +19,13 @@ A dead-simple, beginner-friendly Bitcoin wallet that runs entirely in your brows
   icon, full-screen launch, and the app shell opens even offline (checking
   your balance still needs a connection)
 
-> ⚠️ **Status: new software.** The code has been through a seven-round adversarial
+> ⚠️ **Status: new software.** The code has been through an eight-round adversarial
 > security audit (see `docs/review/`) with all findings resolved, but it is young
 > and lightly road-tested. Start in **Practice mode**, then use small amounts you
 > can afford to lose. Known limitations: the app trusts mempool.space for chain
 > data (it validates everything, but a compromised endpoint could still mislead
-> the display); there is no fee-bumping (RBF) for stuck transactions; reusing a
-> receive address reduces privacy; the unlock throttle is client-side only.
+> the display); reusing a receive address reduces privacy; the unlock throttle is
+> client-side only.
 
 ## Security model
 

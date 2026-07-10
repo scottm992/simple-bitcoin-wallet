@@ -509,12 +509,17 @@ for pending, outgoing items — never for received or already-confirmed ones.
 - **Entry point → loading.** Tapping it does one network look-up of the pending
   payment (busy label: *Checking…*), then the sheet becomes an offer or an
   honest dead-end.
-- **Offer.** Three rows — **Fee paid so far**, **New fee**, **Extra cost**
-  (USD hero, sats beneath) — showing the *effective* numbers the build will use.
-  The new fee comes from the current **Faster** fee estimate; the network may
-  raise it to the minimum a replacement is allowed to pay, and we display that
-  raised figure, never our own arithmetic. Primary: **[Speed up — pay {extra}
-  more]**; text: **[Not now]**.
+- **Offer.** First, the destination (F15): **Going to this address** — the
+  recipient address, chunked exactly like the Send review — and **Amount being
+  sent** (what the replacement will pay them). The wallet has already verified
+  both against its own local record of the original send (see below), but the
+  sheet still shows them: review is sacred, and a fee-only sheet would hide
+  where the money goes. Then three rows — **Fee paid so far**, **New fee**,
+  **Extra cost** (USD hero, sats beneath) — showing the *effective* numbers the
+  build will use. The new fee comes from the current **Faster** fee estimate;
+  the network may raise it to the minimum a replacement is allowed to pay, and
+  we display that raised figure, never our own arithmetic. Primary: **[Speed
+  up — pay {extra} more]**; text: **[Not now]**.
   - *Full-balance send (a sweep, so the fee must come out of the amount sent):* a
     warning strip — *"…whoever you're paying will receive {X} less."* — gated
     behind a required checkbox (**I understand they'll receive less.**), the same
@@ -526,7 +531,13 @@ for pending, outgoing items — never for received or already-confirmed ones.
   payment still goes through, it may just be slow): already-confirmed; sent
   before speed-up existed; nothing left over to raise the fee from; a shape we
   can't bump; or a fee that would exceed the wallet's hard safety ceiling
-  (no-recovery copy consistent with Review's hard-block state).
+  (no-recovery copy consistent with Review's hard-block state). Two more from
+  the F15 verification: *"Something doesn't match on this payment's details…"*
+  when the network's description of the payment disagrees with the wallet's own
+  record of it (a possible attack — calm but firm, no override anywhere), and
+  *"This payment was made before this wallet was set up on this device…"* when
+  there is no local record to verify against (a wallet restored from its 12
+  words — send records don't travel with the seed).
 - **Network hiccup (while checking, or broadcasting).** A non-destructive sheet —
   *your bitcoin is safe, nothing was sent* — with **[Try again]**, mirroring
   Send's broadcast-failure pattern.
