@@ -88,13 +88,17 @@ describe('getTransaction — happy path', () => {
     expect(tx.vout[0]?.address).toBe('bc1qexamplerecipient');
     // Exactly ONE request went out — no bursts.
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(`https://mempool.space/api/tx/${TXID}`);
+    // v1.2.0: getTransaction is CHAIN DATA, so it hits blockstream.info (not
+    // mempool.space — fees/price alone stay there).
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(`https://blockstream.info/api/tx/${TXID}`);
   });
 
   it('uses the testnet base URL for testnet', async () => {
     stubFetchWith(makePayload());
     await getTransaction('testnet', TXID);
-    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(`https://mempool.space/testnet/api/tx/${TXID}`);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      `https://blockstream.info/testnet/api/tx/${TXID}`,
+    );
   });
 
   it('accepts a coinbase-style vin (no prevout) and an address-less vout (nonstandard script)', async () => {

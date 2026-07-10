@@ -1,5 +1,17 @@
 /**
- * api.ts — thin REST client for the public mempool.space API.
+ * api.ts — thin REST client for two public Esplora-shaped APIs.
+ *
+ * v1.2.0 SPLITS the base URL by concern (a trust-model change; Round 13 audit
+ * OWED). CHAIN DATA (address stats / utxos / txs / one-tx fetch / broadcast) now
+ * goes to blockstream.info via {@link chainApiBaseUrl}: the owner's IP is
+ * currently HTTP-429 rate-limited by mempool.space while blockstream serves the
+ * same connection flawlessly, and blockstream's address/tx endpoints return
+ * byte-identical shapes (chain_stats / mempool_stats, same field names —
+ * live-verified), so every F2 ingest validator transfers unchanged. FEES + PRICE
+ * (getFeeEstimates / getBtcUsdPrice) stay on mempool.space via {@link apiBaseUrl}
+ * — blockstream serves a DIFFERENT fee shape (a confirmation-target map) and no
+ * price endpoint, so keeping them here leaves the F1-audited fee path
+ * byte-identical.
  *
  * Every call is network-scoped. Non-discovery GETs (fees / price / one-tx
  * fetch) get a single retry on transport failure; the DISCOVERY GETs
@@ -18,10 +30,13 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 
 /**
  * Timeout for address-discovery GETs (stats / utxos / txs). Deliberately short:
- * mempool.space stalls burst traffic until the client gives up, so a long
- * timeout turns a throttled burst into minutes of dead air. 8s per request, and
- * NO per-request retry (§1c) — a retry only piles more load onto a
- * stall-throttler — keeps a stalled lane from wedging a scan.
+ * a stall-throttler hangs burst traffic until the client gives up, so a long
+ * timeout turns a throttled burst into minutes of dead air. Kept provider-
+ * agnostic on purpose (v1.2.0 moved chain data to blockstream, which serves
+ * cleanly today, but mempool.space's stall-throttle tier — the 2026-07-09
+ * behavior — may return, and this defense must survive a future fail-back). 8s
+ * per request, and NO per-request retry (§1c) — a retry only piles more load
+ * onto a stall-throttler — keeps a stalled lane from wedging a scan.
  */
 const DISCOVERY_TIMEOUT_MS = 8_000;
 
@@ -63,11 +78,34 @@ const MAX_TX_WEIGHT = 4_000_000;
  */
 const MAX_ADDRESS_LENGTH = 100;
 
-/** Base URL for the mempool.space REST API for a given network. */
+/**
+ * Base URL for the mempool.space REST API (mainnet / testnet). Since v1.2.0 this
+ * serves ONLY the fee-estimate + price path (getFeeEstimates / getBtcUsdPrice):
+ * blockstream has a different fee shape and no price endpoint, so keeping these
+ * here leaves the F1-audited fee path byte-identical. Chain data moved to
+ * {@link chainApiBaseUrl}. Also used by the Activity screen's explorer deep-link
+ * (display-only).
+ */
 export function apiBaseUrl(network: Network): string {
   return network === 'mainnet'
     ? 'https://mempool.space/api'
     : 'https://mempool.space/testnet/api';
+}
+
+/**
+ * Base URL for the CHAIN-DATA REST API (address stats / utxos / txs / one-tx
+ * fetch / broadcast). v1.2.0 points these at blockstream.info: the owner's IP is
+ * currently HTTP-429 rate-limited by mempool.space while blockstream serves the
+ * same connection flawlessly, and blockstream's Esplora address/tx endpoints
+ * return byte-identical shapes to mempool.space (chain_stats / mempool_stats,
+ * same field names — live-verified), so every F2 ingest validator below
+ * transfers unchanged. Split out from {@link apiBaseUrl} so fees/price can stay
+ * on mempool.space (see there). Trust-model change — Round 13 audit OWED.
+ */
+export function chainApiBaseUrl(network: Network): string {
+  return network === 'mainnet'
+    ? 'https://blockstream.info/api'
+    : 'https://blockstream.info/testnet/api';
 }
 
 /** A transport-level failure: DNS, connection, timeout/abort, offline. */
@@ -98,8 +136,10 @@ export class ApiResponseError extends Error {
 // ---------------------------------------------------------------------------
 // Untrusted-response validation (F2)
 //
-// Every numeric/string field consumed from mempool.space is validated on ingest
-// so a hostile or buggy response surfaces as a typed ApiResponseError rather
+// Every numeric/string field consumed from an untrusted Esplora endpoint
+// (blockstream.info for chain data, mempool.space for fees/price — v1.2.0) is
+// validated on ingest so a hostile or buggy response surfaces as a typed
+// ApiResponseError rather
 // than a NaN, a thrown BigInt(), or an implausible balance wedging the wallet.
 // ---------------------------------------------------------------------------
 
@@ -374,7 +414,7 @@ export async function getAddressStats(
   address: string,
   signal?: AbortSignal,
 ): Promise<AddressStats> {
-  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}`, {
+  const raw = await getJson<unknown>(`${chainApiBaseUrl(network)}/address/${encodeURIComponent(address)}`, {
     signal,
     timeoutMs: DISCOVERY_TIMEOUT_MS,
     retry: false,
@@ -408,7 +448,7 @@ export async function getUtxos(
   signal?: AbortSignal,
 ): Promise<ApiUtxo[]> {
   const raw = await getJson<unknown>(
-    `${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/utxo`,
+    `${chainApiBaseUrl(network)}/address/${encodeURIComponent(address)}/utxo`,
     { signal, timeoutMs: DISCOVERY_TIMEOUT_MS, retry: false },
   );
   const arr = asArray(raw, 'utxo list');
@@ -467,7 +507,7 @@ export async function getFeeEstimates(network: Network): Promise<FeeEstimates> {
  */
 export async function broadcastTx(network: Network, txHex: string): Promise<string> {
   const res = await fetchOnce(
-    `${apiBaseUrl(network)}/tx`,
+    `${chainApiBaseUrl(network)}/tx`,
     { method: 'POST', body: txHex, headers: { 'Content-Type': 'text/plain' } },
     DEFAULT_TIMEOUT_MS,
   );
@@ -475,7 +515,7 @@ export async function broadcastTx(network: Network, txHex: string): Promise<stri
   if (!res.ok) {
     throw new ApiResponseError(res.status, body);
   }
-  return body; // mempool.space returns the txid as plain text
+  return body; // Esplora (mempool.space / blockstream.info) returns the txid as plain text
 }
 
 /**
@@ -493,7 +533,7 @@ export async function getAddressTxs(
   signal?: AbortSignal,
 ): Promise<AddressTx[]> {
   const raw = await getJson<unknown>(
-    `${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/txs`,
+    `${chainApiBaseUrl(network)}/address/${encodeURIComponent(address)}/txs`,
     { signal, timeoutMs: DISCOVERY_TIMEOUT_MS, retry: false },
   );
   const arr = asArray(raw, 'tx list');
@@ -559,7 +599,7 @@ export async function getTransaction(
   if (!/^[0-9a-f]{64}$/.test(txidArg)) {
     throw new ApiResponseError(400, 'Invalid txid argument (expected 64 lowercase hex chars)');
   }
-  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/tx/${txidArg}`, { signal });
+  const raw = await getJson<unknown>(`${chainApiBaseUrl(network)}/tx/${txidArg}`, { signal });
   const obj = asObject(raw, 'transaction');
 
   const responseTxid = txid(obj['txid'], 'tx txid');
