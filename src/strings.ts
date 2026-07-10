@@ -201,6 +201,13 @@ export const strings = {
     customFeeMalformed: "That doesn't look like a number. Plain digits work best, like 5 or 2.5.",
     customFeeOutOfRange: (min: string, max: string): string =>
       `This wallet sends at rates between ${min} and ${max} sat/vB. Pick a number in that range.`,
+    // Shown under the fee chips while fee estimates are unavailable: the tier
+    // chips render disabled with no costs (never fabricated numbers), and this
+    // line points at the one path that still works — a typed custom rate
+    // (owner decision 2026-07-10: an explicit rate may send during an
+    // estimates outage).
+    feesUnavailable:
+      "Fee suggestions aren't loading right now, so the speeds above are unavailable. You can still send by choosing Custom and typing your own rate.",
     // Sub-1 sat/vB "slow lane" hint — informational only, never a consent gate
     // (the 25% fee-vs-amount rule stays the only consent flow). Honest about
     // accepted ≠ confirmed: the node takes sub-1 payments (verified live

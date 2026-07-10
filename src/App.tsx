@@ -200,7 +200,9 @@ export default function App(): JSX.Element {
     void loadFees(network)
       .then((feeEstimates) => dispatch({ type: 'feesLoaded', feeEstimates }))
       .catch(() => {
-        /* fees unavailable; Send disables Review until present */
+        /* fees unavailable: Send disables the tier chips (no fabricated
+           costs), but a typed CUSTOM rate may still send (owner decision —
+           see Send.tsx canReview) */
       });
   }, []);
 
