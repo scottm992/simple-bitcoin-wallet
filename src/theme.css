@@ -431,6 +431,14 @@ body {
 .pending-line--out { color: var(--warning); }
 .pending-line--in { color: var(--success); }
 .pending-line--checking { color: var(--text-muted); font-weight: var(--fw-regular); }
+/* Tappable "balance may be behind — tap to check now" cue (scan-progress
+   State B): a full-width button that reads like the checking line but in the
+   accent colour to signal it is interactive. */
+.pending-line--tappable {
+  background: none; border: none; padding: 0;
+  width: 100%; cursor: pointer; font-family: inherit;
+  color: var(--accent);
+}
 
 /* ---- Home verb tiles ---- */
 .verb-row { display: flex; gap: var(--sp-3); margin: var(--sp-5) 0 var(--sp-2); }

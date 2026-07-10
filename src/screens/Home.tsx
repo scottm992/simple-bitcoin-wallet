@@ -6,7 +6,7 @@ import { Balance } from '../components/Balance';
 import { ActivityRow } from '../components/ActivityRow';
 import { fmtUsd, type DisplayUnit } from '../display';
 import type { AccountSnapshot } from '../lib/account';
-import type { LoadStatus } from '../state';
+import type { LoadStatus, ScanProgress } from '../state';
 import type { Network } from '../lib';
 
 /** Home: balance hero, Receive/Send, recent activity preview. */
@@ -16,6 +16,9 @@ export function Home(props: {
   accountStatus: LoadStatus;
   /** False while only the fast partial scan is on screen (F12): show a cue. */
   accountComplete: boolean;
+  /** Live scan position for the cue's "address N of ~M" text; null when no run
+   *  is actively scanning (the cue then shows the deliberate-wait text). */
+  scanProgress?: ScanProgress | null;
   btcUsd: number | null;
   unit: DisplayUnit;
   onCycleUnit: (u: DisplayUnit) => void;
@@ -49,6 +52,17 @@ export function Home(props: {
   const activity = props.account?.activity ?? [];
   const recent = activity.slice(0, 3);
 
+  // The "checking" cue (shown while account !== null && !accountComplete — F12
+  // visibility UNCHANGED) has two honest states, chosen by whether a discovery
+  // run is actually working right now. This is DERIVED FROM STATE — Home never
+  // reaches into the discovery controller. A run is scanning while status is
+  // 'loading' (run started, first paint not yet in) OR while a live progress
+  // count is arriving. When neither holds but the snapshot is still incomplete,
+  // the v1.1.1 backoff ladder is deliberately waiting between checks → the
+  // deliberate-wait, tappable cue (never a frozen stale count).
+  const progress = props.scanProgress ?? null;
+  const scanning = props.accountStatus === 'loading' || progress !== null;
+
   return (
     <Chrome
       network={props.network}
@@ -74,9 +88,26 @@ export function Home(props: {
         />
 
         {props.account !== null && !props.accountComplete ? (
-          <div className="pending-line pending-line--checking" role="status">
-            {strings.home.stillChecking}
-          </div>
+          scanning ? (
+            // State A — a run is actively scanning. Name the address it's on
+            // (falling back to the calm generic cue until the first count lands).
+            <div className="pending-line pending-line--checking" role="status">
+              {progress
+                ? strings.home.checkingAddress(progress.checked, progress.estimatedTotal)
+                : strings.home.stillChecking}
+            </div>
+          ) : (
+            // State B — snapshot incomplete but no run in flight (backed off). A
+            // deliberate, tappable wait: tapping runs the manual refresh, which
+            // is never throttled (v1.1.1). Same visibility gate as State A.
+            <button
+              type="button"
+              className="pending-line pending-line--checking pending-line--tappable"
+              onClick={props.onRefresh}
+            >
+              {strings.home.balanceBehind}
+            </button>
+          )
         ) : null}
         {props.accountStatus === 'ready' && pendingOut > 0n ? (
           <div className="pending-line pending-line--out">

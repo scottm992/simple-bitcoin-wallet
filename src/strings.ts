@@ -112,8 +112,22 @@ export const strings = {
     pendingOut: (amount: string): string => `${amount} on its way out, waiting to confirm`,
     pendingIn: (amount: string): string => `${amount} on its way in, waiting to confirm`,
     // Shown while only the quick first look at your balance is on screen (F12):
-    // calm, non-alarming, disappears once the deeper check finishes.
+    // calm, non-alarming, disappears once the deeper check finishes. Also the
+    // scanning cue's fallback text before a precise address count is available.
     stillChecking: 'Checking for updates…',
+    // Scan-progress cue, State A (a run is actively scanning): names the address
+    // being checked so a slow deep scan never looks stuck. The "~" is
+    // load-bearing — M is an ESTIMATE that GROWS as used addresses extend the
+    // scan, so it is never shown as an exact total. Cache hits count toward N
+    // (scan position, not network traffic).
+    checkingAddress: (checked: number, estimatedTotal: number): string =>
+      `Checking address ${checked} of ~${estimatedTotal}…`,
+    // Scan-progress cue, State B (snapshot incomplete but NO run in flight — the
+    // v1.1.1 backoff ladder is deliberately waiting between checks). Honest
+    // ("may be behind"), never alarming, and TAPPABLE: the manual refresh path is
+    // never throttled, so a tap checks right now. No live countdown — "soon" is
+    // enough (deliberately no 1s timer).
+    balanceBehind: 'Balance may be behind — will check again soon. Tap to check now.',
   },
 
   receive: {
