@@ -61,7 +61,7 @@ import { Qr } from '../components/Qr';
 import { Receive } from '../screens/Receive';
 import { strings } from '../strings';
 import { bitcoinUri } from '../display';
-import { deriveReceiveAddress, getCachedReceiveIndex } from '../lib';
+import { deriveReceiveAddress, getCachedReceiveIndex, DEFAULT_DISCOVERY_OPTIONS } from '../lib';
 
 const PASSWORD = 'test-password-11';
 
@@ -72,6 +72,10 @@ beforeEach(() => {
   localStorage.clear();
   mockNet.fail = true;
   mockNet.used.clear();
+  // This suite tests Receive's local-derivation fallback, not Stage-2 pacing, so
+  // run discovery unpaced for deterministic timing (pacing lives in
+  // discovery.test.ts).
+  (DEFAULT_DISCOVERY_OPTIONS as { waveDelayMs?: number }).waveDelayMs = 0;
   container = document.createElement('div');
   document.body.appendChild(container);
 });

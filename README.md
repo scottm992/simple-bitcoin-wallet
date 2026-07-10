@@ -19,7 +19,7 @@ A dead-simple, beginner-friendly Bitcoin wallet that runs entirely in your brows
   icon, full-screen launch, and the app shell opens even offline (checking
   your balance still needs a connection)
 
-> ⚠️ **Status: new software.** The code has been through an eight-round adversarial
+> ⚠️ **Status: new software.** The code has been through a nine-round adversarial
 > security audit (see `docs/review/`) with all findings resolved, but it is young
 > and lightly road-tested. Start in **Practice mode**, then use small amounts you
 > can afford to lose. Known limitations: the app trusts mempool.space for chain

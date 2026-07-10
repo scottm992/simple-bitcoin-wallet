@@ -33,6 +33,7 @@ import {
 import {
   DiscoveryController,
   bumpAndBroadcast,
+  invalidateScanCache,
   loadFees,
   loadPrice,
   prepareBump,
@@ -129,11 +130,13 @@ export default function App(): JSX.Element {
     });
     const teardown = installSessionGuards();
     const unsub = onLock(() => {
-      // Wipe any in-flight draft secrets, stop any in-flight discovery, and
-      // route to Unlock.
+      // Wipe any in-flight draft secrets, stop any in-flight discovery, drop the
+      // cross-run scan cache (§1b — lock clears every network's cached
+      // responses so the next unlock starts fresh), and route to Unlock.
       draftWordsRef.current = null;
       restorePhraseRef.current = null;
       discoveryRef.current?.abort();
+      invalidateScanCache();
       clearSettingsReveal();
       dispatch({ type: 'locked' });
     });
@@ -149,21 +152,15 @@ export default function App(): JSX.Element {
   }, [state.network]);
 
   // ---- Data loading: account, price, fees --------------------------------
-  // Full (two-phase) discovery. Used ONLY on: unlock, network switch, manual
-  // Try again / refresh, and after a broadcast. Single-flight: a new call
-  // aborts any in-flight run and starts fresh (Bug A). The run itself is
-  // deadline-bounded, so accountStatus can never sit on 'loading' forever.
-  const refreshAll = useCallback(() => {
+  // Full (two-phase) discovery, account only. Single-flight: a new call aborts
+  // any in-flight run and starts fresh (Bug A). The run is deadline-bounded, so
+  // accountStatus can never sit on 'loading' forever. Kept SEPARATE from the
+  // price/fees fetch so the automatic poll path can refresh the account without
+  // re-fetching price/fees the tick already got (§1d — one of each per cycle).
+  const refreshAccount = useCallback(() => {
     if (!isUnlocked()) return;
     const network = state.network;
     dispatch({ type: 'accountLoading' });
-    // Price + fees are independent, cheap single requests.
-    void loadPrice().then((btcUsd) => dispatch({ type: 'priceLoaded', btcUsd }));
-    void loadFees(network)
-      .then((feeEstimates) => dispatch({ type: 'feesLoaded', feeEstimates }))
-      .catch(() => {
-        /* fees unavailable; Send disables Review until present */
-      });
     discovery().refresh({
       network,
       onSnapshot: (account, complete) => dispatch({ type: 'accountLoaded', account, complete }),
@@ -171,6 +168,26 @@ export default function App(): JSX.Element {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.network]);
+
+  // Price + fees are independent, cheap single requests. Fetched in exactly one
+  // place per cycle (§1d): here for the manual/unlock/switch/broadcast paths,
+  // and once by the 30s tick for the periodic refresh — never both in a cycle.
+  const refreshPriceFees = useCallback((network: Network) => {
+    void loadPrice().then((btcUsd) => dispatch({ type: 'priceLoaded', btcUsd }));
+    void loadFees(network)
+      .then((feeEstimates) => dispatch({ type: 'feesLoaded', feeEstimates }))
+      .catch(() => {
+        /* fees unavailable; Send disables Review until present */
+      });
+  }, []);
+
+  // The full manual refresh: price + fees + account. Used ONLY on unlock,
+  // network switch, manual Try again / refresh, and after a broadcast.
+  const refreshAll = useCallback(() => {
+    if (!isUnlocked()) return;
+    refreshPriceFees(state.network);
+    refreshAccount();
+  }, [state.network, refreshPriceFees, refreshAccount]);
 
   // Load whenever we're on a wallet screen and unlocked.
   const onWalletScreen =
@@ -189,30 +206,29 @@ export default function App(): JSX.Element {
   // Cheap poll every 30s while unlocked + visible (Bug A): NEVER a full rescan.
   // Re-checks only the known-used addresses plus the receive/change tips (a
   // fresh wallet costs 2 requests) and refreshes fees/price. Skipped entirely
-  // while a discovery run is in flight. A detected on-chain change triggers one
-  // full discovery.
+  // while a discovery run is in flight. A detected on-chain change (or an
+  // incomplete snapshot needing self-heal) triggers an ACCOUNT-ONLY refresh —
+  // this tick already fetched price/fees, so refreshAccount (not refreshAll)
+  // avoids a duplicate price/fees fetch in the same cycle (§1d). The controller
+  // gates the automatic path with its backoff ladder (§1a); this interval stays
+  // a dumb 30s clock.
   useEffect(() => {
     if (!onWalletScreen) return;
     const id = setInterval(() => {
       if (!isUnlocked() || document.visibilityState !== 'visible') return;
       if (discovery().busy) return; // a full run is already crawling: skip
-      void loadPrice().then((btcUsd) => dispatch({ type: 'priceLoaded', btcUsd }));
-      void loadFees(state.network)
-        .then((feeEstimates) => dispatch({ type: 'feesLoaded', feeEstimates }))
-        .catch(() => {
-          /* fees unavailable; retried next tick */
-        });
+      refreshPriceFees(state.network);
       const account = accountRef.current;
       if (!account) return; // nothing known: wait for a manual Try again
       discovery().pollTick({
         network: state.network,
         account,
         accountComplete: accountCompleteRef.current,
-        onChanged: () => refreshAll(),
+        onChanged: () => refreshAccount(),
       });
     }, 30_000);
     return () => clearInterval(id);
-  }, [onWalletScreen, state.network, refreshAll]);
+  }, [onWalletScreen, state.network, refreshPriceFees, refreshAccount]);
 
   // ---- Navigation helpers -------------------------------------------------
   const goHome = useCallback(() => dispatch({ type: 'navigate', screen: 'home' }), []);
@@ -334,6 +350,11 @@ export default function App(): JSX.Element {
     // reducer then blanks the account synchronously (a skeleton on switch is
     // correct at the practice/live trust boundary).
     discoveryRef.current?.abort();
+    // §1b: invalidate the cache for the network we're switching TO, so the
+    // balance we're about to show is fetched fresh — never a stale response for
+    // the network the user just selected. The from-network's cache is keyed
+    // separately (F13) and harmless; it too is invalidated on any switch back.
+    invalidateScanCache(to);
     setVaultNetwork(to);
     applyNetworkTheme(to);
     dispatch({ type: 'setNetwork', network: to });

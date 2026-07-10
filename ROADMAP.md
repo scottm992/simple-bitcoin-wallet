@@ -3,29 +3,25 @@
 Where Simple Bitcoin Wallet could go from v1.0 (July 2026). Items are ordered
 by value-for-effort within each phase; nothing here is committed work.
 
-## v1.1.1 — OPEN BUG, next work: discovery retry loop self-throttles the API
+## v1.1.1 — ✅ shipped 2026-07-10: discovery retry loop self-throttles the API
 
-**The one thing that should be fixed before anything else on this list.** For a
-wallet with no used addresses, one full scan costs ~40 mempool.space requests;
-the API stall-throttles bursts by hanging connections; the run dies on its 20s
-deadline; nothing is cached across runs; and the app retries the identical burst
-every 30 seconds forever with no backoff. It manufactures its own outage
-("Checking for updates…" that never clears, then "couldn't reach the bitcoin
-network"). Found in the field 2026-07-09; **no funds at risk** (display path only).
+**Fixed and shipped** (security review round 9; F16/F17 found and closed; 261
+tests). The empty-wallet scan used to re-fire its full ~40-request burst every
+30 seconds forever when mempool.space stall-throttled it — manufacturing its own
+outage. The fix: an exponential backoff ladder on automatic rescans (manual
+retry always instant); a cross-run in-memory scan cache (per-network, ~100s TTL,
+generation-fenced invalidation on every change signal) so an interrupted scan
+*converges* instead of restarting; no api-layer retry on discovery GETs;
+de-duplicated price/fee fetches; paced scan waves (concurrency 2, ~200ms
+jittered inter-wave delay, applied only to waves that actually hit the
+network — F17); and the `isEmpty` Home flicker fix. History and design
+constraints: **`docs/HANDOFF-discovery-throttle.md`** (status updated) and
+review rounds 9 + closure in `docs/review/round1.md`.
 
-Full brief, measured numbers, staged plan, correctness landmines and a "do not"
-list: **`docs/HANDOFF-discovery-throttle.md`**. Needs a Fable review round
-(next finding number: F16).
-
-- **Stage 1 (hotfix):** exponential backoff + cap on self-heal rescans; a scan
-  cache that survives across runs (in-memory, per-network, short TTL, invalidated
-  on any change signal) so an interrupted scan *converges* instead of restarting;
-  drop the api-layer retry on discovery GETs; de-duplicate price/fee fetches;
-  back off the error state; fix the `isEmpty` gating that makes Home flicker.
-- **Stage 2:** pace a single run (concurrency 4 → 2, jittered waves).
-- **Stage 3 (v1.1.2, needs owner sign-off):** pull the v1.2 second-source item
-  forward — `blockstream.info` failover. Verified identical Esplora shape. **Must
-  not ship before Stage 1**, or both providers get throttled.
+- **Stage 3 (v1.1.2, needs owner sign-off — NOT started):** pull the v1.2
+  second-source item forward — `blockstream.info` failover. Verified identical
+  Esplora shape. Now safe to consider since the loop fix shipped; still a
+  trust-model change awaiting Scott's explicit go-ahead.
 
 ## v1.1 — Feels like a real app (near-term, small pieces)
 

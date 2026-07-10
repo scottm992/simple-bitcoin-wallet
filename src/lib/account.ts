@@ -33,19 +33,121 @@ export interface AccountApi {
 }
 
 /**
- * A run-scoped response cache shared between the fast phase-1 scan and the full
- * phase-2 scan of one discovery run, so phase 2 only pays for the EXTENSION of
- * the scan window rather than re-fetching everything phase 1 already saw.
+ * Default per-entry lifetime for a {@link ScanCache}, in milliseconds. Long
+ * enough that a run cut by the deadline can RESUME within a tick or two paying
+ * only for the remainder (the heart of the v1.1.1 fix), short enough that a
+ * cached "unused" response can't mask a landed payment for long — and every
+ * change signal invalidates the cache outright regardless (see the
+ * cross-run cache owner + invalidation API in `actions.ts`). ~100s sits inside
+ * the 90–120s band the hotfix brief specifies.
  */
-export interface ScanCache {
-  readonly stats: Map<string, AddressStats>;
-  readonly utxos: Map<string, ApiUtxo[]>;
-  readonly txs: Map<string, AddressTx[]>;
+export const SCAN_CACHE_TTL_MS = 100_000;
+
+/** One cached response, stamped with the time it was stored, for TTL expiry. */
+interface CacheEntry<T> {
+  readonly value: T;
+  readonly storedAt: number;
 }
 
-/** Creates an empty {@link ScanCache} for one discovery run. */
-export function createScanCache(): ScanCache {
-  return { stats: new Map(), utxos: new Map(), txs: new Map() };
+/**
+ * A response cache shared between the fast phase-1 scan and the full phase-2
+ * scan, so phase 2 only pays for the EXTENSION of the scan window rather than
+ * re-fetching everything phase 1 already saw.
+ *
+ * v1.1.1: this cache now also survives ACROSS runs (the owner in `actions.ts`
+ * holds one per network in memory — never persisted, see the handoff §7/§8), so
+ * a run the deadline cut at 25/40 resumes and pays only the remaining ~15
+ * instead of restarting the 40-request burst forever. Two invariants keep that
+ * safe: every entry carries a {@link SCAN_CACHE_TTL_MS} TTL (a stale response is
+ * ignored and re-fetched), and any on-chain change signal must call the owner's
+ * invalidation API — a cached "unused" response must never un-detect a payment
+ * the cheap poll just found.
+ */
+export interface ScanCache {
+  readonly stats: Map<string, CacheEntry<AddressStats>>;
+  readonly utxos: Map<string, CacheEntry<ApiUtxo[]>>;
+  readonly txs: Map<string, CacheEntry<AddressTx[]>>;
+  /** Per-entry lifetime in ms; a hit older than this is ignored (re-fetched). */
+  readonly ttlMs: number;
+  /** Clock source, injectable for tests; defaults to `Date.now`. */
+  readonly now: () => number;
+  /**
+   * Monotonic generation counter, bumped by {@link clear} (F16). A wrapped-api
+   * write captures this value BEFORE its `await` and stores the response only if
+   * the generation is unchanged when the response lands. This makes invalidation
+   * authoritative ON ITS OWN — it never depends on being paired with a
+   * synchronous abort of the in-flight run by every future call site. The two
+   * BROADCAST paths (`signAndBroadcast` / `bumpAndBroadcast`) invalidate a
+   * microtask BEFORE their abort fires, a gap the signal-only guard cannot cover:
+   * a run's already-resolved continuation would otherwise write pre-broadcast
+   * data back into the just-cleared cache. Bumping the generation on every
+   * `clear()` closes that gap for any invalidation, abort-paired or not.
+   */
+  readonly generation: number;
+  /**
+   * Count of REAL network fetches made through this cache — a cache MISS that
+   * hit the wrapped api, recorded by {@link recordFetch} (F17). `scanChain`
+   * reads it to pace ONLY waves that actually issued requests: a fully-cached
+   * wave (a warm re-walk, or a resumed run's already-fetched range) advances
+   * nothing, so there is nothing to burst and no reason to wait — pacing it
+   * would starve deep wallets (phase 1 AND phase 2 each re-walk 0..high-water
+   * under the single 20s deadline; before this, a moderately deep wallet's
+   * cache-hit re-walk was paced to death and phase 2 never completed). Monotonic
+   * — {@link clear} does NOT reset it, because `scanChain` compares per-wave
+   * DELTAS, not absolute values, so an interleaved reset could only mislead.
+   */
+  readonly fetches: number;
+  /** Records one real network fetch (called by `withScanCache` on a miss). */
+  recordFetch(): void;
+  /**
+   * Drops every cached entry AND bumps {@link generation} — call on ANY change
+   * signal (see `actions.ts`). The generation bump is what makes an
+   * invalidation drop even the in-flight landings whose writes are still queued.
+   */
+  clear(): void;
+}
+
+/**
+ * Creates an empty {@link ScanCache}. `ttlMs`/`now` are injectable for tests;
+ * production uses {@link SCAN_CACHE_TTL_MS} and the wall clock.
+ */
+export function createScanCache(
+  ttlMs: number = SCAN_CACHE_TTL_MS,
+  // Looked up at call time (not captured) so a cache created once at module
+  // scope still reads the live clock — including a test's fake timers.
+  now: () => number = () => Date.now(),
+): ScanCache {
+  const stats = new Map<string, CacheEntry<AddressStats>>();
+  const utxos = new Map<string, CacheEntry<ApiUtxo[]>>();
+  const txs = new Map<string, CacheEntry<AddressTx[]>>();
+  // F16: bumped by clear(); read (as a getter) by withScanCache to fence any
+  // in-flight write against an invalidation that landed during its await.
+  let generation = 0;
+  // F17: incremented on every real network fetch; read (as a getter) by
+  // scanChain to pace only waves that actually hit the network.
+  let fetches = 0;
+  return {
+    stats,
+    utxos,
+    txs,
+    ttlMs,
+    now,
+    get generation(): number {
+      return generation;
+    },
+    get fetches(): number {
+      return fetches;
+    },
+    recordFetch(): void {
+      fetches++;
+    },
+    clear(): void {
+      stats.clear();
+      utxos.clear();
+      txs.clear();
+      generation++;
+    },
+  };
 }
 
 /** Known highest USED index per chain from a previous scan (-1 = none known). */
@@ -74,7 +176,12 @@ export interface DiscoveryOptions {
    * comfortably above the gap limit so a legitimately deep chain is still found.
    */
   readonly maxIndex: number;
-  /** How many address lookups to run at once. Default 4. */
+  /**
+   * How many address lookups to run at once. Default 2 (Stage 2, v1.1.1),
+   * lowered from 4: the receive + change chains scan concurrently, so a run's
+   * peak in-flight is ~4 rather than ~8 — gentler on mempool.space's
+   * stall-throttle, which hangs bursts silently.
+   */
   readonly concurrency: number;
   /** Cap on merged activity items returned. Default 25. */
   readonly activityLimit: number;
@@ -87,16 +194,37 @@ export interface DiscoveryOptions {
   readonly highWater?: ChainHighWater;
   /** Aborts the whole discovery run (threaded into every request). */
   readonly signal?: AbortSignal;
-  /** Run-scoped response cache shared between phases (see {@link ScanCache}). */
+  /** Response cache shared between phases and across runs (see {@link ScanCache}). */
   readonly cache?: ScanCache;
+  /**
+   * Delay (ms, plus jitter) inserted BETWEEN scan waves within a chain (Stage 2,
+   * v1.1.1). Paces a full run over several seconds so the request pattern stops
+   * looking like a burst. Default {@link PACING_WAVE_DELAY_MS}; tests pass 0.
+   * Safe only WITH the cross-run cache (§1b): a slower run cut by the deadline
+   * resumes rather than restarts. The overall run stays bounded by
+   * `DISCOVERY_DEADLINE_MS` (20s) — the pacing never lengthens the deadline.
+   */
+  readonly waveDelayMs?: number;
 }
+
+/**
+ * Base delay between scan waves (Stage 2). ~200 ms plus up to
+ * {@link PACING_JITTER_MS} jitter spreads a full 40-request run over several
+ * seconds. NEVER raise `DISCOVERY_DEADLINE_MS` to compensate — a bigger deadline
+ * only increases offered load against a stall-throttler.
+ */
+export const PACING_WAVE_DELAY_MS = 200;
+
+/** Additive jitter (0..this ms) on each inter-wave delay, to de-correlate. */
+const PACING_JITTER_MS = 100;
 
 /** Default discovery options. Gap limit follows the BIP44 standard (F8). */
 export const DEFAULT_DISCOVERY_OPTIONS: DiscoveryOptions = {
   gapLimit: 20,
   maxIndex: 200,
-  concurrency: 4,
+  concurrency: 2,
   activityLimit: 25,
+  waveDelayMs: PACING_WAVE_DELAY_MS,
 };
 
 /** One merged activity item: a transaction with the wallet's net delta. */
@@ -189,6 +317,27 @@ function isUsed(stats: AddressStats): boolean {
   return stats.fundedSats > 0n || stats.spentSats > 0n || stats.pendingSats !== 0n;
 }
 
+/**
+ * A short, jittered delay between scan waves (Stage 2 pacing). Resolves early if
+ * `signal` aborts, so the run's deadline can still cut a paced scan cleanly.
+ */
+function pacedDelay(baseMs: number, signal?: AbortSignal): Promise<void> {
+  const ms = baseMs + Math.floor(Math.random() * PACING_JITTER_MS);
+  return new Promise((resolve) => {
+    const t = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(t);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    if (signal?.aborted) {
+      done();
+      return;
+    }
+    signal?.addEventListener('abort', done);
+  });
+}
+
 /** A used address plus the metadata we gathered while scanning it. */
 interface ScannedAddress {
   readonly derived: DerivedAddress;
@@ -224,8 +373,33 @@ async function scanChain(
   let firstUnusedRecorded = false;
   let highestUsedIndex = -1;
 
+  const waveDelayMs = opts.waveDelayMs ?? 0;
+  // F17: pace ONLY waves that follow a wave which actually hit the network. The
+  // cache's monotonic real-fetch counter is snapshotted around each wave; if the
+  // PREVIOUS wave advanced it, this one is a genuine burst and gets the
+  // inter-wave delay; if the previous wave was fully cached (zero requests — a
+  // warm re-walk or a resumed run's already-fetched range), there is nothing to
+  // burst, so this wave proceeds immediately. That kills the dead air that had
+  // phase 2's cache-hit re-walk of 0..high-water paced to death for deep wallets
+  // (never completing within the 20s deadline), while preserving the anti-burst
+  // property EXACTLY where it matters: cold fetching still spaces every wave. A
+  // cold below-high-water walk after a TTL expiry re-fetches, so it advances the
+  // counter and is still paced — we deliberately do NOT skip pacing by
+  // index-below-mark alone. When no cache is present (`fetches` undefined),
+  // `prevWaveFetched` stays true so pacing behaves as before (every wave paced).
+  const fetchCount = (): number | undefined => opts.cache?.fetches;
+  let prevWaveFetched = true; // the first wave is never paced regardless (see below)
+  let firstWave = true;
   let index = 0;
   while (index <= opts.maxIndex && (consecutiveUnused < opts.gapLimit || index <= highWater)) {
+    // A jittered pause BETWEEN genuine fetch waves (never before the first)
+    // spreads a real burst out; the deadline (via `signal`) cuts a paced scan
+    // cleanly. See the F17 note above for why cache-hit waves skip the pause.
+    if (!firstWave && prevWaveFetched && waveDelayMs > 0) {
+      await pacedDelay(waveDelayMs, opts.signal);
+    }
+    firstWave = false;
+
     // Derive a batch, but never scan past maxIndex; below the high-water mark
     // the gap counter must not shrink the batch (those indices are scanned
     // unconditionally — their balances are needed regardless).
@@ -237,12 +411,20 @@ async function scanChain(
     const batch: DerivedAddress[] = [];
     for (let k = 0; k < batchSize; k++) batch.push(derive(chain, index + k));
 
+    const fetchesBefore = fetchCount();
     const statsList = await mapWithConcurrency(
       batch,
       opts.concurrency,
       (d) => api.getAddressStats(network, d.address, opts.signal),
       opts.signal,
     );
+    // Did THIS wave hit the network? (Undefined counter ⇒ no cache ⇒ assume yes,
+    // preserving the pre-F17 pace-every-wave behavior for the cacheless path.)
+    const fetchesAfter = fetchCount();
+    prevWaveFetched =
+      fetchesBefore === undefined || fetchesAfter === undefined
+        ? true
+        : fetchesAfter > fetchesBefore;
 
     for (let k = 0; k < batch.length; k++) {
       const derived = batch[k];
@@ -359,30 +541,78 @@ export async function discoverAccount(
 }
 
 /**
- * Wraps an {@link AccountApi} with a run-scoped cache so the second (full)
- * phase of a discovery run never re-fetches what the first (fast) phase saw.
+ * Wraps an {@link AccountApi} with a {@link ScanCache} so a scan never re-fetches
+ * a response that is still fresh — within one run (phase 2 reusing phase 1) and,
+ * for the cross-run cache, across runs (a resumed run pays only the remainder).
+ * A hit older than the cache's TTL is ignored and re-fetched, so a stale
+ * "unused" answer can never be served past its lifetime.
  */
 function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
+  /** Returns a still-fresh cached value, or undefined (miss or expired). */
+  function fresh<T>(entry: CacheEntry<T> | undefined): T | undefined {
+    if (entry === undefined) return undefined;
+    return cache.now() - entry.storedAt < cache.ttlMs ? entry.value : undefined;
+  }
+  // WRITE GUARD (§7 + F16): every write is fenced by TWO complementary checks,
+  // evaluated AFTER the await, against state captured BEFORE it. A response that
+  // resolves just before an invalidation has its continuation sitting in the
+  // microtask queue; writing it then would repopulate the freshly invalidated
+  // cache with a fresh-stamped but PRE-change response — hiding, for up to the
+  // TTL, the very change that invalidation exists to surface (the "un-detect"
+  // the invalidation rule forbids, §7). The two guards cover the two ways that
+  // race arrives:
+  //
+  //  1. GENERATION (F16). `clear()` bumps `cache.generation`; a write proceeds
+  //     only if the generation is unchanged since the request was issued. This
+  //     makes invalidation authoritative ON ITS OWN — it does NOT depend on
+  //     being paired with a synchronous abort of the in-flight run. The two
+  //     broadcast paths invalidate a microtask BEFORE their aborting refresh
+  //     fires (the abort straddles an `await` in App.tsx), so at the moment the
+  //     continuation runs the run's own signal is NOT yet aborted; only the
+  //     generation bump catches it. Invalidation must never rely on every future
+  //     call site remembering to abort in the same frame — the generation guard
+  //     removes that fragility.
+  //  2. SIGNAL (unchanged). A superseding refresh aborts the prior run WITHOUT
+  //     invalidating the cache (resume semantics — the new run must reuse the
+  //     old landings), so the generation is unchanged there; the abort guard is
+  //     what drops that superseded run's post-abort landings, keeping the
+  //     round-5 regression semantics intact.
+  //
+  // Either way, an aborted/superseded run's post-abort landings are returned to
+  // their (doomed) scan but never cached: resume relies only on writes that
+  // landed before the invalidation/abort.
   return {
     getAddressStats: async (network, address, signal) => {
-      const hit = cache.stats.get(address);
+      const hit = fresh(cache.stats.get(address));
       if (hit !== undefined) return hit;
+      const gen = cache.generation;
+      cache.recordFetch(); // F17: a real network hit — this wave paces.
       const value = await api.getAddressStats(network, address, signal);
-      cache.stats.set(address, value);
+      if (cache.generation === gen && signal?.aborted !== true) {
+        cache.stats.set(address, { value, storedAt: cache.now() });
+      }
       return value;
     },
     getUtxos: async (network, address, signal) => {
-      const hit = cache.utxos.get(address);
+      const hit = fresh(cache.utxos.get(address));
       if (hit !== undefined) return hit;
+      const gen = cache.generation;
+      cache.recordFetch();
       const value = await api.getUtxos(network, address, signal);
-      cache.utxos.set(address, value);
+      if (cache.generation === gen && signal?.aborted !== true) {
+        cache.utxos.set(address, { value, storedAt: cache.now() });
+      }
       return value;
     },
     getAddressTxs: async (network, address, signal) => {
-      const hit = cache.txs.get(address);
+      const hit = fresh(cache.txs.get(address));
       if (hit !== undefined) return hit;
+      const gen = cache.generation;
+      cache.recordFetch();
       const value = await api.getAddressTxs(network, address, signal);
-      cache.txs.set(address, value);
+      if (cache.generation === gen && signal?.aborted !== true) {
+        cache.txs.set(address, { value, storedAt: cache.now() });
+      }
       return value;
     },
   };
