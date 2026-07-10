@@ -24,6 +24,20 @@ review rounds 9 + closure in `docs/review/round1.md`.
   failover-only if/when revisited; still requires explicit owner sign-off
   (trust-model change) and a review round.
 
+## v1.1.2 — ✅ shipped 2026-07-10: continuous scans on slow networks
+
+**Owner field report, same day as v1.1.1:** on a slow network the scan reached
+"22 of ~40", sat on the wait state for ~a minute, then finished — correct but a
+bad flow. Fixed (security review round 11 + F18 closure; 276 tests then, 279
+with the fee display): the fixed 20s run deadline became a **12s inactivity
+cutoff** (every landed response resets it — a slow-but-moving scan now runs
+continuously to completion) plus a **120s hard cap** (a run always settles;
+F12's never-open-ended property). Cut runs that made progress self-heal in
+**~8s** instead of a minute (progress-gated quick retry, **budgeted to 5
+windows** between complete snapshots — F18 — so offered load still always
+decays); no-progress runs walk the unchanged v1.1.1 ladder, and a fully wedged
+network behaves byte-identically to v1.1.1.
+
 ## v1.1 — Feels like a real app (near-term, small pieces)
 
 - **PWA packaging** — ✅ **shipped 2026-07-09** (security review round 7,
@@ -46,10 +60,11 @@ review rounds 9 + closure in `docs/review/round1.md`.
   Receive screen to the next one automatically (with the old one still valid).
   Improves privacy for free.
 
-- **Show fee rates in sat/vB** *(owner request, 2026-07-10)* — display the
-  actual sat/vB rate alongside each recommended fee choice on Send (today the
-  tiers show cost but not the underlying rate). Display-only: the rates already
-  arrive via `getFeeEstimates`/`feeRateForTier`; this just surfaces them.
+- **Show fee rates in sat/vB** — ✅ **shipped 2026-07-10** (owner request;
+  security review round 12, 0 findings). Each fee tier chip on Send now shows
+  its sat/vB rate; the displayed number and the rate the engine signs provably
+  terminate in the same F1-clamped `feeRateForTier` evaluation (round 12
+  traced chip-to-broadcast equality, including clamped extremes).
 
 - **Custom fee rate** *(owner request, 2026-07-10)* — let the sender type
   their own sat/vB rate as an advanced option next to the recommended tiers.
