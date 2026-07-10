@@ -169,7 +169,20 @@ ONLY because of the cross-run cache below: a paced run the deadline cuts RESUMES
 rather than restarts. `DISCOVERY_DEADLINE_MS` stays 20_000 — pacing never
 lengthens the deadline (`waveDelayMs` is threaded through `startDiscovery` /
 `DiscoveryController.refresh`, defaulting to the production value; tests pass 0).
-The cheap poll keeps `POLL_CONCURRENCY = 4` and is not paced.
+The cheap poll keeps `POLL_CONCURRENCY = 4` and is not paced. **Only waves that
+actually hit the network are paced (F17).** `scanChain` snapshots the
+`ScanCache`'s monotonic real-fetch counter around each wave and inserts the
+inter-wave delay only when the PREVIOUS wave advanced it. A fully-cached wave (a
+warm re-walk, or a resumed run's already-fetched range) issued zero requests, so
+there is nothing to burst — it proceeds immediately. This matters because phase 1
+AND phase 2 each re-walk `0..high-water` under the SINGLE 20s deadline: pacing
+every wave (including the cache-hit re-walk) starved deep wallets — a
+moderately-deep one (~80+ used receive addresses) never completed phase 2 (the
+"Checking for updates…" cue stuck forever) and a very-deep one (~155+) never
+painted phase 1 (a false network-error on a healthy connection), with manual
+retry paced identically so there was no in-app recovery. A cold below-high-water
+walk (e.g. after a TTL expiry) re-fetches, advances the counter, and is STILL
+paced — pacing is skipped by zero-fetch, never by index-below-mark.
 
 **Cross-run scan cache (§1b, v1.1.1) — the heart of the self-DoS fix.** One
 `ScanCache` per network (`account.ts`), held in module memory ONLY — **never

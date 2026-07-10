@@ -883,6 +883,164 @@ describe('Stage 2 — single-run pacing', () => {
 });
 
 // ---------------------------------------------------------------------------
+// F17 — pacing must not starve deep wallets. Phase 1 AND phase 2 each re-walk
+// 0..high-water under the SINGLE 20s deadline; if every wave is paced (including
+// pure cache-hit re-walks), a moderately-deep wallet's phase 2 never completes
+// and a very-deep wallet's phase 1 never paints — the "cue never clears" symptom
+// the hotfix exists to cure, now on a perfectly healthy network. The fix paces
+// ONLY waves that actually hit the network, so a cache-hit re-walk converges
+// immediately while genuine cold bursts stay spaced. Timing is made deterministic
+// by pinning Math.random (jitter), so these fake-timer budgets are exact.
+// ---------------------------------------------------------------------------
+
+/** Marks receive indices 0..count-1 as used on-chain in the mock. */
+function fundDeepReceiveChain(count: number): void {
+  for (let i = 0; i < count; i++) {
+    mockNet.used.add(deriveReceiveAddress(ABANDON, 'testnet', i).address);
+  }
+}
+
+describe('Stage 2 pacing — deep wallets (F17)', () => {
+  it('(a) cold cache: genuine fetch waves are STILL spaced apart (anti-burst preserved)', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0); // jitter 0 → exact 200ms gaps
+    fundDeepReceiveChain(20);
+
+    const handle = startDiscovery({
+      network: 'testnet',
+      waveDelayMs: PACING_WAVE_DELAY_MS,
+      onSnapshot: vi.fn(),
+      onError: vi.fn(),
+    });
+
+    // Wave 1 fires immediately (a first wave is never paced).
+    await vi.advanceTimersByTimeAsync(0);
+    const afterWave1 = mockNet.statsCalls.length;
+    expect(afterWave1).toBeGreaterThan(0);
+
+    // Cold cache ⇒ wave 1 hit the network ⇒ wave 2 IS paced: within the delay
+    // window no further requests go out.
+    await vi.advanceTimersByTimeAsync(PACING_WAVE_DELAY_MS - 1);
+    expect(mockNet.statsCalls.length).toBe(afterWave1);
+
+    // Past the delay the next fetch wave fires — pacing is intact for real bursts.
+    await vi.advanceTimersByTimeAsync(2);
+    expect(mockNet.statsCalls.length).toBeGreaterThan(afterWave1);
+
+    handle.abort();
+    vi.mocked(Math.random).mockRestore();
+    vi.useRealTimers();
+  });
+
+  it('(b) a deep wallet (~80 used) completes phase 2 within the 20s deadline (reviewer regression)', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5); // deterministic 250ms/wave
+    fundDeepReceiveChain(80);
+
+    const flags: boolean[] = [];
+    const onError = vi.fn();
+    const handle = startDiscovery({
+      network: 'testnet',
+      waveDelayMs: PACING_WAVE_DELAY_MS,
+      onSnapshot: (_s, complete) => flags.push(complete),
+      onError,
+    });
+
+    // Advance PAST the deadline so the run always settles (no hang regardless of
+    // outcome). With pacing confined to genuine fetch waves, phase 1 (cold,
+    // paced) then phase 2 (its 0..high-water re-walk now a free cache-hit pass)
+    // both land BEFORE the 20s cut → a complete (true) snapshot. Before F17 the
+    // paced cache-hit re-walk pushed phase 2 past 20s and it never completed.
+    await vi.advanceTimersByTimeAsync(25_000);
+    await handle.done;
+
+    expect(flags).toContain(true); // phase 2 reached complete within the deadline
+    expect(onError).not.toHaveBeenCalled();
+    vi.mocked(Math.random).mockRestore();
+    vi.useRealTimers();
+  });
+
+  it('(c) a very deep wallet (~170 used), warm cache: phase 1 still paints on a healthy network', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    fundDeepReceiveChain(170);
+
+    // Warm the cross-run cache with an UNPACED full run — models the scan having
+    // converged over earlier resumed attempts, so every address is now cached.
+    const warm = startDiscovery({
+      network: 'testnet',
+      waveDelayMs: 0,
+      onSnapshot: vi.fn(),
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(50);
+    await warm.done;
+
+    // A paced run over the warm cache: phase 1's 0..high-water re-walk is all
+    // cache hits, so it is NOT paced and paints almost immediately — WELL inside
+    // the 20s deadline. Before F17, ~170 paced cache-hit waves blew past 20s and
+    // phase 1 never painted (a false "couldn't reach the network" on a healthy
+    // connection).
+    let painted = false;
+    const handle = startDiscovery({
+      network: 'testnet',
+      waveDelayMs: PACING_WAVE_DELAY_MS,
+      onSnapshot: () => {
+        painted = true;
+      },
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(2_000); // far short of the 20s deadline
+    expect(painted).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(20_000); // let it settle fully
+    await handle.done;
+    vi.mocked(Math.random).mockRestore();
+    vi.useRealTimers();
+    // ~170 real address derivations across a warm + a paced full scan are
+    // CPU-heavy; give this case a generous real-time budget (fake-time budgets
+    // above are unaffected).
+  }, 30_000);
+
+  it('(d) a fully-cached re-walk issues zero fetches and inserts no pacing delay', async () => {
+    vi.useFakeTimers();
+    fundDeepReceiveChain(40);
+
+    // Warm the cache with an unpaced full run.
+    const warm = startDiscovery({
+      network: 'testnet',
+      waveDelayMs: 0,
+      onSnapshot: vi.fn(),
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(50);
+    await warm.done;
+    const warmed = mockNet.statsCalls.length;
+    expect(warmed).toBeGreaterThan(40); // genuinely deep: many addresses cached
+
+    // Re-run WITH pacing on. Every wave is a pure cache hit, so NONE is paced:
+    // the whole two-phase run finishes in ≲ a few hundred ms of fake time — NOT
+    // (number-of-waves × ~250ms). Zero new fetches confirms it was fully cached.
+    const before = mockNet.statsCalls.length;
+    let complete = false;
+    const handle = startDiscovery({
+      network: 'testnet',
+      waveDelayMs: PACING_WAVE_DELAY_MS,
+      onSnapshot: (_s, c) => {
+        if (c) complete = true;
+      },
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    await handle.done;
+
+    expect(complete).toBe(true);
+    expect(mockNet.statsCalls.length - before).toBe(0);
+    vi.useRealTimers();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // §7 regression — post-abort cache writes. A response that RESOLVED just before
 // an abort has its continuation queued as a microtask; the poll's changed path
 // runs invalidate → refresh → abort synchronously, so that continuation

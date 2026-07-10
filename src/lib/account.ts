@@ -85,6 +85,21 @@ export interface ScanCache {
    */
   readonly generation: number;
   /**
+   * Count of REAL network fetches made through this cache — a cache MISS that
+   * hit the wrapped api, recorded by {@link recordFetch} (F17). `scanChain`
+   * reads it to pace ONLY waves that actually issued requests: a fully-cached
+   * wave (a warm re-walk, or a resumed run's already-fetched range) advances
+   * nothing, so there is nothing to burst and no reason to wait — pacing it
+   * would starve deep wallets (phase 1 AND phase 2 each re-walk 0..high-water
+   * under the single 20s deadline; before this, a moderately deep wallet's
+   * cache-hit re-walk was paced to death and phase 2 never completed). Monotonic
+   * — {@link clear} does NOT reset it, because `scanChain` compares per-wave
+   * DELTAS, not absolute values, so an interleaved reset could only mislead.
+   */
+  readonly fetches: number;
+  /** Records one real network fetch (called by `withScanCache` on a miss). */
+  recordFetch(): void;
+  /**
    * Drops every cached entry AND bumps {@link generation} — call on ANY change
    * signal (see `actions.ts`). The generation bump is what makes an
    * invalidation drop even the in-flight landings whose writes are still queued.
@@ -108,6 +123,9 @@ export function createScanCache(
   // F16: bumped by clear(); read (as a getter) by withScanCache to fence any
   // in-flight write against an invalidation that landed during its await.
   let generation = 0;
+  // F17: incremented on every real network fetch; read (as a getter) by
+  // scanChain to pace only waves that actually hit the network.
+  let fetches = 0;
   return {
     stats,
     utxos,
@@ -116,6 +134,12 @@ export function createScanCache(
     now,
     get generation(): number {
       return generation;
+    },
+    get fetches(): number {
+      return fetches;
+    },
+    recordFetch(): void {
+      fetches++;
     },
     clear(): void {
       stats.clear();
@@ -350,14 +374,30 @@ async function scanChain(
   let highestUsedIndex = -1;
 
   const waveDelayMs = opts.waveDelayMs ?? 0;
+  // F17: pace ONLY waves that follow a wave which actually hit the network. The
+  // cache's monotonic real-fetch counter is snapshotted around each wave; if the
+  // PREVIOUS wave advanced it, this one is a genuine burst and gets the
+  // inter-wave delay; if the previous wave was fully cached (zero requests — a
+  // warm re-walk or a resumed run's already-fetched range), there is nothing to
+  // burst, so this wave proceeds immediately. That kills the dead air that had
+  // phase 2's cache-hit re-walk of 0..high-water paced to death for deep wallets
+  // (never completing within the 20s deadline), while preserving the anti-burst
+  // property EXACTLY where it matters: cold fetching still spaces every wave. A
+  // cold below-high-water walk after a TTL expiry re-fetches, so it advances the
+  // counter and is still paced — we deliberately do NOT skip pacing by
+  // index-below-mark alone. When no cache is present (`fetches` undefined),
+  // `prevWaveFetched` stays true so pacing behaves as before (every wave paced).
+  const fetchCount = (): number | undefined => opts.cache?.fetches;
+  let prevWaveFetched = true; // the first wave is never paced regardless (see below)
   let firstWave = true;
   let index = 0;
   while (index <= opts.maxIndex && (consecutiveUnused < opts.gapLimit || index <= highWater)) {
-    // Stage 2 pacing: a jittered pause BETWEEN waves (never before the first)
-    // spreads the run out so it doesn't read as a burst. Cached-only waves still
-    // pause — a negligible cost, well within the 20s deadline — keeping the
-    // logic simple; the deadline (via `signal`) cuts a paced scan cleanly.
-    if (!firstWave && waveDelayMs > 0) await pacedDelay(waveDelayMs, opts.signal);
+    // A jittered pause BETWEEN genuine fetch waves (never before the first)
+    // spreads a real burst out; the deadline (via `signal`) cuts a paced scan
+    // cleanly. See the F17 note above for why cache-hit waves skip the pause.
+    if (!firstWave && prevWaveFetched && waveDelayMs > 0) {
+      await pacedDelay(waveDelayMs, opts.signal);
+    }
     firstWave = false;
 
     // Derive a batch, but never scan past maxIndex; below the high-water mark
@@ -371,12 +411,20 @@ async function scanChain(
     const batch: DerivedAddress[] = [];
     for (let k = 0; k < batchSize; k++) batch.push(derive(chain, index + k));
 
+    const fetchesBefore = fetchCount();
     const statsList = await mapWithConcurrency(
       batch,
       opts.concurrency,
       (d) => api.getAddressStats(network, d.address, opts.signal),
       opts.signal,
     );
+    // Did THIS wave hit the network? (Undefined counter ⇒ no cache ⇒ assume yes,
+    // preserving the pre-F17 pace-every-wave behavior for the cacheless path.)
+    const fetchesAfter = fetchCount();
+    prevWaveFetched =
+      fetchesBefore === undefined || fetchesAfter === undefined
+        ? true
+        : fetchesAfter > fetchesBefore;
 
     for (let k = 0; k < batch.length; k++) {
       const derived = batch[k];
@@ -538,6 +586,7 @@ function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
       const hit = fresh(cache.stats.get(address));
       if (hit !== undefined) return hit;
       const gen = cache.generation;
+      cache.recordFetch(); // F17: a real network hit — this wave paces.
       const value = await api.getAddressStats(network, address, signal);
       if (cache.generation === gen && signal?.aborted !== true) {
         cache.stats.set(address, { value, storedAt: cache.now() });
@@ -548,6 +597,7 @@ function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
       const hit = fresh(cache.utxos.get(address));
       if (hit !== undefined) return hit;
       const gen = cache.generation;
+      cache.recordFetch();
       const value = await api.getUtxos(network, address, signal);
       if (cache.generation === gen && signal?.aborted !== true) {
         cache.utxos.set(address, { value, storedAt: cache.now() });
@@ -558,6 +608,7 @@ function withScanCache(api: AccountApi, cache: ScanCache): AccountApi {
       const hit = fresh(cache.txs.get(address));
       if (hit !== undefined) return hit;
       const gen = cache.generation;
+      cache.recordFetch();
       const value = await api.getAddressTxs(network, address, signal);
       if (cache.generation === gen && signal?.aborted !== true) {
         cache.txs.set(address, { value, storedAt: cache.now() });
