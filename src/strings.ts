@@ -79,8 +79,12 @@ export const strings = {
     strengthFair: 'okay',
     strengthGood: 'good',
     strengthStrong: 'strong',
-    faceIdToggle: 'Unlock with Face ID',
-    faceIdSubtext: 'Skip typing your password on this phone.',
+    passkeyToggle: 'Unlock with a passkey',
+    // "next time" is load-bearing: the toggle sits under "Create a password", and
+    // a passkey never replaces making one — it only saves typing it on later
+    // unlocks (the password stays the fallback if the passkey is ever lost).
+    passkeySubtext:
+      'Skip typing your password next time — use your face, fingerprint, or device PIN.',
     submit: 'Set password',
     clarify:
       "Your password only unlocks this app on this phone. It can't recover your wallet — only your 12 words can do that.",
@@ -342,12 +346,12 @@ export const strings = {
   unlock: {
     heading: 'Welcome back',
     usePassword: 'Use password instead',
-    useFaceId: 'Unlock with Face ID',
+    usePasskey: 'Unlock with a passkey',
     passwordLabel: 'Password',
     unlock: 'Unlock',
     forgot: 'Forgot password?',
     wrongPassword: "That password isn't right. Try again.",
-    faceIdFailed: 'Face ID unlock did not work. Enter your password instead.',
+    passkeyFailed: "That didn't work. Enter your password instead.",
     // Forgot sheet.
     forgotHeading: "Passwords can't be reset",
     forgotBody:
@@ -368,12 +372,15 @@ export const strings = {
   },
 
   // Shown before we trigger the system passkey sheet (SetPassword toggle and
-  // Settings enable), so Apple's "passkey" jargon never lands cold (Bug B).
-  faceId: {
-    explainHeading: 'Turn on Face ID unlock',
+  // Settings enable), so the word "passkey" is explained before the OS says it
+  // (Bug B). We name the passkey plainly and describe the biometric generically
+  // — this is a web app, so the unlock gesture may be Face ID, a fingerprint,
+  // or a device PIN depending on the device.
+  passkey: {
+    explainHeading: 'Create a passkey',
     explainBody:
-      "Your phone will ask to save a passkey. That's just Apple's name for signing in with Face ID — it stays in your iCloud Keychain, and your 12 words are never shared.",
-    explainContinue: 'Continue',
+      "A passkey lets you unlock this wallet without typing your password. Your device saves it and checks it's you — with your face, fingerprint, or PIN. It only unlocks the app on this device: your password still works, and your 12 words are never shared.",
+    explainContinue: 'Create passkey',
     explainNotNow: 'Not now',
   },
 

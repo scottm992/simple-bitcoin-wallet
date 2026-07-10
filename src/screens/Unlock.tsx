@@ -101,7 +101,7 @@ export function Unlock(props: {
           </button>
           {faceId ? (
             <button className="btn btn--secondary btn--block" onClick={tryPasskey} disabled={busy}>
-              {strings.unlock.useFaceId}
+              {strings.unlock.usePasskey}
             </button>
           ) : null}
           <button className="btn btn--text btn--block" onClick={() => setShowForgot(true)}>

@@ -59,7 +59,16 @@ To keep the whole app consistent, always use these exact terms in UI copy:
 | Testnet | **Practice mode** | testnet (except once, in a subtitle) |
 | Mainnet | **Live mode** / (default, unlabeled) | mainnet |
 | Password unlock | **password** | passphrase (that's a different thing) |
-| Face ID / passkey | **Face ID** (iOS) / **quick unlock** | WebAuthn, PRF, passkey |
+| WebAuthn credential | **passkey** ("unlock with a passkey"), with the gesture described generically: *your face, fingerprint, or PIN* | WebAuthn, PRF; **"Face ID"** or "Touch ID" as a universal label |
+
+> **Naming change (2026-07-09, product owner):** this row previously said to use
+> "Face ID" and never the word "passkey". Reversed: the app now names the passkey
+> plainly and explains it as an alternative to typing your password. Two reasons —
+> (a) "Face ID" was hardcoded for every device, so it was simply wrong on Android,
+> Windows, or a fingerprint Mac; (b) naming the passkey tells the user what is
+> actually being created. The original concern behind the old rule still stands and
+> is still met: the word must be *explained before the operating system says it*
+> (see the explainer sheet in `strings.passkey`), never dropped on the user cold.
 
 ---
 
@@ -277,8 +286,14 @@ Copy:
 - Strength hint (live, under the first field): a 5-band strength meter
   (F3 — see `src/password.ts`). Empty state: **Use at least 10 characters. A few
   words strung together is easiest to remember.**
-- *(Face ID available):* toggle row —
-  **Unlock with Face ID** — Skip typing your password on this phone. *(subtext)*
+- *(passkey supported):* toggle row —
+  **Unlock with a passkey** — Skip typing your password next time — use your
+  face, fingerprint, or device PIN. *(subtext)*. Turning it on first shows the
+  plain-English explainer sheet (`strings.passkey`), which names the passkey and
+  says the password still works, *before* the operating system's own prompt.
+  **A password is always required**: the passkey is additive (a second,
+  independent ciphertext of the seed), never a replacement — so "next time" in
+  the subtext is load-bearing copy, not filler.
 - **[Set password]** (primary; disabled until both fields match and the
   password passes the meter: ≥ 10 characters and not a well-known common
   password — F3)
@@ -595,8 +610,9 @@ unlock button; small recovery link.
 
 Copy:
 - **H:** Welcome back
-- *(Face ID enabled):* auto-prompt Face ID on open; fallback text button
-  **[Use password instead]**.
+- *(passkey enabled):* auto-prompt the passkey on open; the password field stays
+  visible, and a manual retry button reads **[Unlock with a passkey]**. A failed
+  or cancelled attempt falls back silently — no error copy.
 - `Password` (field)
 - **[Unlock]** (primary)
 - **[Forgot password?]** (text link) → sheet:

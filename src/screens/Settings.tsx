@@ -61,7 +61,7 @@ export function Settings(props: {
     try {
       await props.onToggleFaceId(!props.passkeyEnabled);
     } catch {
-      setFaceIdErr(strings.unlock.faceIdFailed);
+      setFaceIdErr(strings.unlock.passkeyFailed);
     } finally {
       setFaceIdBusy(false);
     }
@@ -86,7 +86,7 @@ export function Settings(props: {
           {props.passkeySupported ? (
             <div className="settings-row" style={{ cursor: 'default' }}>
               <span>
-                {strings.password.faceIdToggle}
+                {strings.password.passkeyToggle}
                 {faceIdErr ? <div className="error-text">{faceIdErr}</div> : null}
               </span>
               <button
@@ -94,7 +94,7 @@ export function Settings(props: {
                 className="toggle"
                 role="switch"
                 aria-checked={props.passkeyEnabled}
-                aria-label={strings.password.faceIdToggle}
+                aria-label={strings.password.passkeyToggle}
                 onClick={() => {
                   // Bug B: explain the system "passkey" sheet in plain English
                   // BEFORE triggering it. Disabling needs no explainer.
@@ -190,8 +190,8 @@ export function Settings(props: {
       {/* Face ID explainer sheet (Bug B): shown before the system passkey sheet. */}
       {sheet === 'faceid' ? (
         <Sheet onScrim={closeSheet}>
-          <h2 className="sheet__title">{strings.faceId.explainHeading}</h2>
-          <p className="sheet__body">{strings.faceId.explainBody}</p>
+          <h2 className="sheet__title">{strings.passkey.explainHeading}</h2>
+          <p className="sheet__body">{strings.passkey.explainBody}</p>
           <div className="sheet__actions">
             <button
               className="btn btn--primary btn--block"
@@ -200,10 +200,10 @@ export function Settings(props: {
                 void toggleFaceId();
               }}
             >
-              {strings.faceId.explainContinue}
+              {strings.passkey.explainContinue}
             </button>
             <button className="btn btn--text btn--block" onClick={closeSheet}>
-              {strings.faceId.explainNotNow}
+              {strings.passkey.explainNotNow}
             </button>
           </div>
         </Sheet>

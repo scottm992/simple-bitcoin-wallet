@@ -45,7 +45,7 @@ function render(props: {
   });
 }
 
-describe('Unlock — Face ID auto-trigger (Bug B2)', () => {
+describe('Unlock — passkey auto-trigger (Bug B2)', () => {
   it('triggers exactly one attempt on mount and falls back to password silently on failure', async () => {
     const onUnlockPasskey = vi.fn(async () => false); // user cancelled / failed
     await render({ passkeyEnabled: true, passkeySupported: true, onUnlockPasskey });
@@ -73,18 +73,22 @@ describe('Unlock — Face ID auto-trigger (Bug B2)', () => {
     expect(container.textContent).toContain(strings.unlock.unlock);
 
     // Silent fallback: no error copy anywhere after the failed attempt.
-    expect(container.textContent).not.toContain(strings.unlock.faceIdFailed);
+    expect(container.textContent).not.toContain(strings.unlock.passkeyFailed);
     expect(container.textContent).not.toContain(strings.unlock.wrongPassword);
 
-    // A manual retry stays available (clearly labelled Face ID, not "passkey").
+    // A manual retry stays available, labelled in the app's own words.
     const retry = Array.from(container.querySelectorAll('button')).find(
-      (b) => b.textContent?.trim() === strings.unlock.useFaceId,
+      (b) => b.textContent?.trim() === strings.unlock.usePasskey,
     );
     expect(retry).not.toBeUndefined();
-    expect(container.textContent).not.toMatch(/passkey/i);
+    // "passkey" is now the deliberate user-facing word (it names the thing the
+    // device actually creates). What must never leak is implementation jargon,
+    // or a platform-specific biometric name — this is a web app and the unlock
+    // gesture may be a face, a fingerprint, or a PIN.
+    expect(container.textContent).not.toMatch(/webauthn|\bPRF\b|iCloud|Face ID|Touch ID/i);
   });
 
-  it('does not auto-trigger when Face ID is not enabled or not supported', async () => {
+  it('does not auto-trigger when the passkey is not enabled or not supported', async () => {
     const onUnlockPasskey = vi.fn(async () => true);
     await render({ passkeyEnabled: false, passkeySupported: true, onUnlockPasskey });
     expect(onUnlockPasskey).not.toHaveBeenCalled();

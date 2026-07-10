@@ -118,16 +118,16 @@ export function SetPassword(props: {
           <div className="toggle-row">
             <div className="toggle-row__text">
               <div className="body" style={{ fontWeight: 600 }}>
-                {strings.password.faceIdToggle}
+                {strings.password.passkeyToggle}
               </div>
-              <div className="small">{strings.password.faceIdSubtext}</div>
+              <div className="small">{strings.password.passkeySubtext}</div>
             </div>
             <button
               type="button"
               className="toggle"
               role="switch"
               aria-checked={faceId}
-              aria-label={strings.password.faceIdToggle}
+              aria-label={strings.password.passkeyToggle}
               onClick={() => {
                 if (faceId) setFaceId(false);
                 else setFaceIdExplainer(true); // explain before enabling (Bug B)
@@ -152,8 +152,8 @@ export function SetPassword(props: {
 
       {faceIdExplainer ? (
         <Sheet onScrim={() => setFaceIdExplainer(false)}>
-          <h2 className="sheet__title">{strings.faceId.explainHeading}</h2>
-          <p className="sheet__body">{strings.faceId.explainBody}</p>
+          <h2 className="sheet__title">{strings.passkey.explainHeading}</h2>
+          <p className="sheet__body">{strings.passkey.explainBody}</p>
           <div className="sheet__actions">
             <button
               className="btn btn--primary btn--block"
@@ -162,10 +162,10 @@ export function SetPassword(props: {
                 setFaceIdExplainer(false);
               }}
             >
-              {strings.faceId.explainContinue}
+              {strings.passkey.explainContinue}
             </button>
             <button className="btn btn--text btn--block" onClick={() => setFaceIdExplainer(false)}>
-              {strings.faceId.explainNotNow}
+              {strings.passkey.explainNotNow}
             </button>
           </div>
         </Sheet>
