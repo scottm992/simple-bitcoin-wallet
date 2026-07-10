@@ -190,6 +190,9 @@ export function startDiscovery(params: {
   onSnapshot: (snapshot: AccountSnapshot, complete: boolean) => void;
   onError: () => void;
   deadlineMs?: number;
+  /** Inter-wave pacing delay (Stage 2); omitted → the production default. Tests
+   *  pass 0 to keep request-count assertions fast and deterministic. */
+  waveDelayMs?: number;
 }): DiscoveryHandle {
   const { network, onSnapshot, onError } = params;
   const controller = new AbortController();
@@ -210,6 +213,7 @@ export function startDiscovery(params: {
       const cache = scanCacheFor(network);
       const shared = {
         ...(highWater !== undefined ? { highWater } : {}),
+        ...(params.waveDelayMs !== undefined ? { waveDelayMs: params.waveDelayMs } : {}),
         signal: controller.signal,
         cache,
       };
@@ -335,6 +339,7 @@ export class DiscoveryController {
     onSnapshot: (snapshot: AccountSnapshot, complete: boolean) => void;
     onError: () => void;
     deadlineMs?: number;
+    waveDelayMs?: number;
   }): void {
     this.current?.abort();
     // Observe whether this run produces a COMPLETE (phase-2) snapshot, to drive

@@ -75,8 +75,11 @@ import { getAddressStats } from '../lib/api';
 import { setUnlocked, lockNow } from '../session';
 import {
   createVault,
+  DEFAULT_DISCOVERY_OPTIONS,
   deriveReceiveAddress,
+  discoverAccount,
   getCachedHighWater,
+  PACING_WAVE_DELAY_MS,
   setCachedHighWater,
   type AccountSnapshot,
 } from '../lib';
@@ -101,6 +104,10 @@ beforeEach(() => {
   // The scan cache is now cross-run / module-scope (§1b), so it MUST be cleared
   // between cases or a prior test's cached responses leak in and skew counts.
   invalidateScanCache();
+  // These tests pin request COUNTS and orderings, so they run with Stage-2
+  // pacing OFF (waveDelayMs 0) — the pacing itself is exercised in its own suite
+  // below, which re-enables it explicitly. Concurrency stays at its real value.
+  (DEFAULT_DISCOVERY_OPTIONS as { waveDelayMs?: number }).waveDelayMs = 0;
   mockNet.mode = 'instant';
   mockNet.hangAfter = null;
   mockNet.used.clear();
@@ -401,14 +408,19 @@ describe('network switch — no stale dispatch after an eager abort (F13)', () =
     const onError = vi.fn();
     controller.refresh({ network: 'testnet', onSnapshot, onError });
 
-    // Phase 1, first batches: 4 requests per chain.
+    // Phase 1 is a gap-5 scan on each chain at concurrency 2 (Stage 2), so it
+    // resolves in three waves per chain: [0,1] then [2,3] then [4]. Drain the
+    // first two waves (4 requests each across the two chains).
     await tick();
-    expect(mockNet.pending.length).toBe(8);
+    expect(mockNet.pending.length).toBe(4); // wave 1: idx 0,1 on each chain
+    for (const resolve of mockNet.pending.splice(0)) resolve();
+    await tick();
+    expect(mockNet.pending.length).toBe(4); // wave 2: idx 2,3 on each chain
     for (const resolve of mockNet.pending.splice(0)) resolve();
 
     // Phase 1, final index per chain.
     await tick();
-    expect(mockNet.pending.length).toBe(2);
+    expect(mockNet.pending.length).toBe(2); // wave 3: idx 4 on each chain
 
     // Resolve the last requests and — SYNCHRONOUSLY, before any microtask can
     // run — abort, exactly as switchNetwork now does.
@@ -768,5 +780,104 @@ describe('high-water mark can never hide funds (F12, round-5 property)', () => {
     expect(snap.confirmedSats).toBe(10_000n);
     expect(snap.receiveHighWater).toBe(3);
     expect(getCachedHighWater('testnet')).toEqual({ receive: 3, change: -1 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stage 2 — single-run pacing: concurrency 2 + a jittered inter-wave delay,
+// spreading a run out so it stops looking like a burst. Safe ONLY with the
+// cross-run cache (§1b): a paced run the deadline cuts resumes, never restarts.
+// ---------------------------------------------------------------------------
+
+describe('Stage 2 — single-run pacing', () => {
+  it('the production default is concurrency 2 with a ~200ms wave delay', () => {
+    // (waveDelayMs is forced to 0 in beforeEach for the count tests; the real
+    // default is asserted from the source constant directly.)
+    expect(DEFAULT_DISCOVERY_OPTIONS.concurrency).toBe(2);
+    expect(PACING_WAVE_DELAY_MS).toBe(200);
+  });
+
+  it('caps peak in-flight requests at 2 per chain (~4 across both chains)', async () => {
+    // A counting api: track the max number of stats requests in flight at once.
+    let inFlight = 0;
+    let peak = 0;
+    const derive = (_chain: 0 | 1, index: number) =>
+      deriveReceiveAddress(ABANDON, 'testnet', index); // shape only; address unused here
+    const countingApi = {
+      getAddressStats: async () => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await Promise.resolve();
+        inFlight--;
+        return { confirmedSats: 0n, pendingSats: 0n, fundedSats: 0n, spentSats: 0n };
+      },
+      getUtxos: async () => [],
+      getAddressTxs: async () => [],
+    };
+    await discoverAccount('testnet', derive, countingApi, { waveDelayMs: 0 });
+    // concurrency 2 per chain × 2 chains scanned concurrently = ~4 peak, never 8.
+    expect(peak).toBeLessThanOrEqual(4);
+    expect(peak).toBeGreaterThanOrEqual(2); // genuine parallelism, not serial
+  });
+
+  it('paces a full run across several seconds and still completes within the 20s deadline', async () => {
+    vi.useFakeTimers();
+    let complete = false;
+    const handle = startDiscovery({
+      network: 'testnet',
+      waveDelayMs: PACING_WAVE_DELAY_MS, // opt back INTO pacing for this test
+      onSnapshot: (_s, c) => {
+        if (c) complete = true;
+      },
+      onError: vi.fn(),
+    });
+
+    // Pacing spreads the run out: it is NOT done almost immediately.
+    await vi.advanceTimersByTimeAsync(150);
+    expect(complete).toBe(false);
+
+    // ...but it completes comfortably before the 20s deadline.
+    await vi.advanceTimersByTimeAsync(10_000);
+    await handle.done;
+    expect(complete).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it('a paced run cut by the deadline RESUMES rather than restarts', async () => {
+    vi.useFakeTimers();
+    // Very slow pacing + a short deadline → the run is cut after landing only a
+    // couple of waves.
+    const h1 = startDiscovery({
+      network: 'testnet',
+      waveDelayMs: 2_000,
+      deadlineMs: 3_000,
+      onSnapshot: vi.fn(),
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(3_500); // deadline cuts it mid-scan
+    await h1.done;
+    const landed = mockNet.statsCalls.length;
+    expect(landed).toBeGreaterThan(0);
+    expect(landed).toBeLessThan(40); // cut before the full scan
+
+    // Resume with pacing off: it reuses what the cut run landed and pays only
+    // the remainder — the paced scan converges instead of restarting.
+    const before = mockNet.statsCalls.length;
+    let complete = false;
+    const h2 = startDiscovery({
+      network: 'testnet',
+      waveDelayMs: 0,
+      onSnapshot: (_s, c) => {
+        if (c) complete = true;
+      },
+      onError: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(100);
+    await h2.done;
+    const resumeCost = mockNet.statsCalls.length - before;
+    expect(complete).toBe(true);
+    expect(resumeCost).toBeLessThan(40); // did NOT restart the full burst
+    expect(resumeCost).toBeGreaterThan(0);
+    vi.useRealTimers();
   });
 });

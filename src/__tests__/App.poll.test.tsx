@@ -48,7 +48,7 @@ vi.mock('../lib/vault', async (importOriginal) => {
 
 import App from '../App';
 import { getBtcUsdPrice, getFeeEstimates } from '../lib/api';
-import { createVault, deriveReceiveAddress } from '../lib';
+import { createVault, deriveReceiveAddress, DEFAULT_DISCOVERY_OPTIONS } from '../lib';
 import { strings } from '../strings';
 
 const ABANDON =
@@ -61,6 +61,10 @@ let root: Root;
 beforeEach(() => {
   localStorage.clear();
   mockApi.used.clear();
+  // This suite tests the price/fees cadence, not Stage-2 pacing, so run
+  // discovery unpaced for deterministic timing (pacing is covered in
+  // discovery.test.ts).
+  (DEFAULT_DISCOVERY_OPTIONS as { waveDelayMs?: number }).waveDelayMs = 0;
   container = document.createElement('div');
   document.body.appendChild(container);
 });
@@ -100,7 +104,7 @@ async function bootToHome(): Promise<void> {
   await act(async () => (byText(strings.unlock.unlock) as HTMLElement).click());
   // Let unlock + the initial refreshAll (account + price + fees) settle.
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(200);
+    await vi.advanceTimersByTimeAsync(500);
   });
   // On Home now: the Receive/Send verb row is present regardless of balance.
   expect(container.querySelector('.verb-row')).not.toBeNull();

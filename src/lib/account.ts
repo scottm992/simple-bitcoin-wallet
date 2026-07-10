@@ -128,7 +128,12 @@ export interface DiscoveryOptions {
    * comfortably above the gap limit so a legitimately deep chain is still found.
    */
   readonly maxIndex: number;
-  /** How many address lookups to run at once. Default 4. */
+  /**
+   * How many address lookups to run at once. Default 2 (Stage 2, v1.1.1),
+   * lowered from 4: the receive + change chains scan concurrently, so a run's
+   * peak in-flight is ~4 rather than ~8 — gentler on mempool.space's
+   * stall-throttle, which hangs bursts silently.
+   */
   readonly concurrency: number;
   /** Cap on merged activity items returned. Default 25. */
   readonly activityLimit: number;
@@ -141,16 +146,37 @@ export interface DiscoveryOptions {
   readonly highWater?: ChainHighWater;
   /** Aborts the whole discovery run (threaded into every request). */
   readonly signal?: AbortSignal;
-  /** Run-scoped response cache shared between phases (see {@link ScanCache}). */
+  /** Response cache shared between phases and across runs (see {@link ScanCache}). */
   readonly cache?: ScanCache;
+  /**
+   * Delay (ms, plus jitter) inserted BETWEEN scan waves within a chain (Stage 2,
+   * v1.1.1). Paces a full run over several seconds so the request pattern stops
+   * looking like a burst. Default {@link PACING_WAVE_DELAY_MS}; tests pass 0.
+   * Safe only WITH the cross-run cache (§1b): a slower run cut by the deadline
+   * resumes rather than restarts. The overall run stays bounded by
+   * `DISCOVERY_DEADLINE_MS` (20s) — the pacing never lengthens the deadline.
+   */
+  readonly waveDelayMs?: number;
 }
+
+/**
+ * Base delay between scan waves (Stage 2). ~200 ms plus up to
+ * {@link PACING_JITTER_MS} jitter spreads a full 40-request run over several
+ * seconds. NEVER raise `DISCOVERY_DEADLINE_MS` to compensate — a bigger deadline
+ * only increases offered load against a stall-throttler.
+ */
+export const PACING_WAVE_DELAY_MS = 200;
+
+/** Additive jitter (0..this ms) on each inter-wave delay, to de-correlate. */
+const PACING_JITTER_MS = 100;
 
 /** Default discovery options. Gap limit follows the BIP44 standard (F8). */
 export const DEFAULT_DISCOVERY_OPTIONS: DiscoveryOptions = {
   gapLimit: 20,
   maxIndex: 200,
-  concurrency: 4,
+  concurrency: 2,
   activityLimit: 25,
+  waveDelayMs: PACING_WAVE_DELAY_MS,
 };
 
 /** One merged activity item: a transaction with the wallet's net delta. */
@@ -243,6 +269,27 @@ function isUsed(stats: AddressStats): boolean {
   return stats.fundedSats > 0n || stats.spentSats > 0n || stats.pendingSats !== 0n;
 }
 
+/**
+ * A short, jittered delay between scan waves (Stage 2 pacing). Resolves early if
+ * `signal` aborts, so the run's deadline can still cut a paced scan cleanly.
+ */
+function pacedDelay(baseMs: number, signal?: AbortSignal): Promise<void> {
+  const ms = baseMs + Math.floor(Math.random() * PACING_JITTER_MS);
+  return new Promise((resolve) => {
+    const t = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(t);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    if (signal?.aborted) {
+      done();
+      return;
+    }
+    signal?.addEventListener('abort', done);
+  });
+}
+
 /** A used address plus the metadata we gathered while scanning it. */
 interface ScannedAddress {
   readonly derived: DerivedAddress;
@@ -278,8 +325,17 @@ async function scanChain(
   let firstUnusedRecorded = false;
   let highestUsedIndex = -1;
 
+  const waveDelayMs = opts.waveDelayMs ?? 0;
+  let firstWave = true;
   let index = 0;
   while (index <= opts.maxIndex && (consecutiveUnused < opts.gapLimit || index <= highWater)) {
+    // Stage 2 pacing: a jittered pause BETWEEN waves (never before the first)
+    // spreads the run out so it doesn't read as a burst. Cached-only waves still
+    // pause — a negligible cost, well within the 20s deadline — keeping the
+    // logic simple; the deadline (via `signal`) cuts a paced scan cleanly.
+    if (!firstWave && waveDelayMs > 0) await pacedDelay(waveDelayMs, opts.signal);
+    firstWave = false;
+
     // Derive a batch, but never scan past maxIndex; below the high-water mark
     // the gap counter must not shrink the batch (those indices are scanned
     // unconditionally — their balances are needed regardless).

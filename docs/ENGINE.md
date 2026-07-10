@@ -160,6 +160,17 @@ just increases offered load), `POLL_CONCURRENCY = 4`. **Backoff ladder (§1a):**
 `BACKOFF_BASE_MS = 30_000`, `BACKOFF_CAP_MS = 480_000` (~8m), `MAX_BACKOFF_LEVEL
 = 8`, `BACKOFF_JITTER_MS = 10_000`.
 
+**Single-run pacing (Stage 2, v1.1.1).** The chain scan (`account.ts`
+`scanChain`) runs at `concurrency = 2` (down from 4) with a jittered
+`PACING_WAVE_DELAY_MS` (~200 ms + up to 100 ms jitter) delay BETWEEN waves, so a
+full run spreads over several seconds instead of firing as one burst. The two
+chains still scan concurrently, so peak in-flight is ~4 (not ~8). This is safe
+ONLY because of the cross-run cache below: a paced run the deadline cuts RESUMES
+rather than restarts. `DISCOVERY_DEADLINE_MS` stays 20_000 — pacing never
+lengthens the deadline (`waveDelayMs` is threaded through `startDiscovery` /
+`DiscoveryController.refresh`, defaulting to the production value; tests pass 0).
+The cheap poll keeps `POLL_CONCURRENCY = 4` and is not paced.
+
 **Cross-run scan cache (§1b, v1.1.1) — the heart of the self-DoS fix.** One
 `ScanCache` per network (`account.ts`), held in module memory ONLY — **never
 localStorage / disk / across sessions**. Because it survives across runs, a run

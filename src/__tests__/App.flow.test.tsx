@@ -44,12 +44,17 @@ vi.mock('../lib/vault', async (importOriginal) => {
 });
 
 import App from '../App';
+import { DEFAULT_DISCOVERY_OPTIONS } from '../lib';
 
 let container: HTMLDivElement;
 let root: Root;
 
 beforeEach(() => {
   localStorage.clear();
+  // Smoke test of the create→home flow, not Stage-2 pacing: run discovery
+  // unpaced so no paced run lingers past unmount (pacing lives in
+  // discovery.test.ts).
+  (DEFAULT_DISCOVERY_OPTIONS as { waveDelayMs?: number }).waveDelayMs = 0;
   container = document.createElement('div');
   document.body.appendChild(container);
 });
