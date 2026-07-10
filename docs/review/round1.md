@@ -1294,3 +1294,75 @@ _Round-10 throwaway tests used the `.review.test.ts` suffix, were executed, and 
 the only file modified is this `docs/review/round1.md`. Not committed, not pushed. Gates
 re-confirmed after deletion: `tsc --noEmit` clean, `npm test` = 268 passing, `npm run build`
 clean, `dist` CSP `script-src 'self'`. Next finding number: **F18**._
+
+# Round 12 — sat/vB rate display on the Send fee tiers (display-only)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 0**
+
+Deliberately light round, scoped to the single `fee-rate-display` commit (`bb8c0ca`): each
+Send fee chip now shows the underlying sat/vB rate in a new `.fee__rate` line. Diff touches
+only `src/screens/Send.tsx`, `src/strings.ts`, `src/theme.css`, and the new
+`src/__tests__/Send.feerate.test.tsx` — nothing else was re-audited. (Round 11 is a separate
+discovery-layer review landing independently; rounds may appear out of order here. Any finding
+in this round would have been numbered F18-R12 to dodge a collision, with the PM renumbering
+at merge; none arose.) `npm test` = **271 passing** (268 baseline + the 3 shipped feature
+tests), `tsc --noEmit` clean, `npm run build` clean, prod CSP byte-identical in
+`dist/index.html` (`default-src 'self'; connect-src 'self' https://mempool.space; …;
+script-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'`), no `console.*`
+in source, `public/sw.js` absent from the diff (its cache-first scope is only content-hashed
+`/assets/` urls, so the css change rides a new hashed filename — no `CACHE_NAME` bump owed).
+Verified with throwaway `feerate.review.test.tsx` (6 cases, executed, deleted).
+
+## Per-area verdicts
+
+- **1. Honesty (displayed rate === signed rate) — SOUND, traced chip-to-broadcast.** Both
+  ends terminate in the SAME pure function on the SAME props: the chip paints
+  `feeRateForTier(props.fees, c.tier)` (Send.tsx `tierRate`), and the selected tier's
+  `feeRate` (Send.tsx line 61, unchanged) is the identical `feeRateForTier(props.fees, tier)`
+  evaluated in the same render pass; `review()` copies it into
+  `PendingSend.feeRateSatVb`, which App.tsx hands VERBATIM to the Review dry-run and to
+  `signAndBroadcast` (`feeRateSatVb: pending.feeRateSatVb`). `feeRateForTier`
+  (actions.ts:499) is deterministic and side-effect-free, so two same-pass evaluations
+  cannot diverge; there is no second computation, no rounding step (the template string
+  renders the exact number transmitted), and no stale-props path — a fees refresh re-renders
+  chip text and `feeRate` together, and the click handler that fires is the committed
+  render's own. Probe pinned this end-to-end: for every tier, the number parsed off the
+  painted chip strictly equals the `feeRateSatVb` in the `onReview` PendingSend — including
+  the F1-clamped cases (raw 9999 → chip shows 500, pending carries 500; raw 0 → both 1) and
+  a fractional case (7.3 displays as `7.3 sat/vB` and transmits as the same double). The raw
+  pre-clamp API value is unreachable by the display (shipped test also pins no `9999`
+  leakage).
+- **2. Fee-math surface untouched — CONFIRMED byte-identical.** `git diff main..fee-rate-display`
+  contains zero hunks in `src/lib/tx.ts`, `src/lib/api.ts`, `src/actions.ts` (so
+  `feeRateForTier`, `estimateSendFee`, `signAndBroadcast`, `bumpAndBroadcast` and the
+  F1/F10/F11 guards are untouched), and no existing test file changed — the only test delta
+  is the ADDED `Send.feerate.test.tsx`; every prior pin runs unmodified in the 271. The one
+  behavioral-adjacent edit in Send.tsx refactors `rate` into `tierRate ?? 1`, which is
+  value-identical to the old `props.fees ? … : 1` for the USD placeholder line.
+- **3. Degradation — SOUND.** `fees === null` → `tierRate` is null → the `.fee__rate` node is
+  not rendered at all (shipped test: 3 chips, zero `.fee__rate`, no stray `sat/vB` text, no
+  crash); `canReview` already requires `props.fees !== null` and `review()` re-checks it, so
+  the placeholder `1` can never reach a PendingSend. Hostile estimates (NaN / Infinity /
+  negative) collapse through F1's second guard to MIN before display — probe confirmed no
+  `NaN`/`Infinity` text can paint and the shown/transmitted value is 1. Fractional rates
+  render verbatim (`7.3 sat/vB`) — mempool.space serves integers and both clamps preserve
+  values without rounding, so in practice integers; a long-decimal rate would render ugly
+  but honestly (cosmetic only, no action).
+- **4. Injection / secrets — SOUND.** The rate is a number interpolated into a template
+  string rendered as a React text node (auto-escaped); no `dangerouslySetInnerHTML` in the
+  diff, nothing persisted, no new network access, CSP unchanged. The css addition is
+  presentation-only (`font-variant-numeric: tabular-nums` and muted color on the new line).
+
+## Ship recommendation
+
+**SHIP.** The feature is exactly its claim: a display-only surfacing of the rate the engine
+was already going to sign. The displayed and transmitted values are the same evaluation of
+the same clamped function — verified by trace and pinned end-to-end by probe — the fee-math
+surface is byte-identical, degradation is graceful on every absent/hostile-estimate path,
+and the render is injection-safe. Zero findings.
+
+_Round-12 throwaway tests used the `.review.test.tsx` suffix, were executed, and were
+deleted; the only file modified is this `docs/review/round1.md`, committed on
+`fee-rate-display` (not pushed). Gates re-confirmed after deletion: `tsc --noEmit` clean,
+`npm test` = 271 passing, `npm run build` clean, `dist` CSP `script-src 'self'`. Next finding
+number: **F18** (or F19 if Round 11 claims F18 first)._
