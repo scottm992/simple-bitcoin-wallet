@@ -3,6 +3,30 @@
 Where Simple Bitcoin Wallet could go from v1.0 (July 2026). Items are ordered
 by value-for-effort within each phase; nothing here is committed work.
 
+## v1.1.1 — OPEN BUG, next work: discovery retry loop self-throttles the API
+
+**The one thing that should be fixed before anything else on this list.** For a
+wallet with no used addresses, one full scan costs ~40 mempool.space requests;
+the API stall-throttles bursts by hanging connections; the run dies on its 20s
+deadline; nothing is cached across runs; and the app retries the identical burst
+every 30 seconds forever with no backoff. It manufactures its own outage
+("Checking for updates…" that never clears, then "couldn't reach the bitcoin
+network"). Found in the field 2026-07-09; **no funds at risk** (display path only).
+
+Full brief, measured numbers, staged plan, correctness landmines and a "do not"
+list: **`docs/HANDOFF-discovery-throttle.md`**. Needs a Fable review round
+(next finding number: F16).
+
+- **Stage 1 (hotfix):** exponential backoff + cap on self-heal rescans; a scan
+  cache that survives across runs (in-memory, per-network, short TTL, invalidated
+  on any change signal) so an interrupted scan *converges* instead of restarting;
+  drop the api-layer retry on discovery GETs; de-duplicate price/fee fetches;
+  back off the error state; fix the `isEmpty` gating that makes Home flicker.
+- **Stage 2:** pace a single run (concurrency 4 → 2, jittered waves).
+- **Stage 3 (v1.1.2, needs owner sign-off):** pull the v1.2 second-source item
+  forward — `blockstream.info` failover. Verified identical Esplora shape. **Must
+  not ship before Stage 1**, or both providers get throttled.
+
 ## v1.1 — Feels like a real app (near-term, small pieces)
 
 - **PWA packaging** — ✅ **shipped 2026-07-09** (security review round 7,
@@ -38,11 +62,12 @@ by value-for-effort within each phase; nothing here is committed work.
 
 ## v1.2 — Trust hardening
 
-- **Second chain-data source** — add an Esplora-compatible fallback (e.g.
+- **Second chain-data source** — *(being pulled forward to v1.1.2 — see the
+  v1.1.1 section above)* add an Esplora-compatible fallback (e.g.
   blockstream.info) used when mempool.space is unreachable or throttling,
   and optionally cross-check displayed balances between the two. Directly
   shrinks the "trusts one endpoint for display" caveat and the throttling
-  failure mode found in field testing.
+  failure mode found in field testing — which bit for real on 2026-07-09.
 - **Smarter password strength** — a proper local estimator (zxcvbn-class,
   vendored/audited) instead of the current heuristic; still no server, still
   plain-English guidance.
