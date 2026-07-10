@@ -117,15 +117,20 @@ network behaves byte-identically to v1.1.1.
   terminate in the same F1-clamped `feeRateForTier` evaluation (round 12
   traced chip-to-broadcast equality, including clamped extremes).
 
-- **Custom fee rate** *(owner request, 2026-07-10)* — let the sender type
-  their own sat/vB rate as an advanced option next to the recommended tiers.
-  **Money-path change — needs a security review round when built:** the input
-  must clamp into the F1 window (`MIN_ACCEPTED_FEE_RATE`–`MAX_ACCEPTED_FEE_RATE`;
-  the hard 500 sat/vB / 1M-sat caps stay non-overridable) and must flow through
-  the same `estimateSendFee` single path as the tiers (F11 — no parallel fee
-  computation). The 25%-of-amount consent rule applies unchanged. Interacts
-  with the sub-1 sat/vB item below: a custom rate under 1 sat/vB raises the
-  same relay-floor questions, so decide the floor once, for both.
+- **Custom fee rate** *(owner request, 2026-07-10)* — 🚧 **built 2026-07-10
+  (branch `custom-fee`), awaiting security review Round 14.** A fourth
+  "Custom" chip on Send reveals a sat/vB input. Owner design decisions as
+  built: the input **REJECTS, never clamps** — anything outside
+  [`MIN_CUSTOM_FEE_RATE` = 0.1, `MAX_ACCEPTED_FEE_RATE` = 500] (decimals
+  allowed; strict parse, no scientific notation) disables Review with a
+  plain-English message, so a typed money number is either used exactly as
+  entered or refused with a reason. The validated rate enters the compose flow
+  at the SAME single point as a tier rate and flows through the same
+  `estimateSendFee` dry-run, `PendingSend.feeRateSatVb`, and broadcast build
+  (F11 — no parallel fee computation); the engine's hard caps (500 sat/vB,
+  1M-sat absolute) stay non-overridable beneath it (F1), and the
+  25%-of-amount consent rule applies unchanged (F10). Absorbs the sub-1
+  decision below. Send screen only — Speed-up keeps its tiers.
 
 - **Scan progress on the "Checking for updates…" cue** — ✅ **shipped
   2026-07-10** (owner request; security review round 10, 0 findings). While
@@ -139,16 +144,21 @@ network behaves byte-identically to v1.1.1.
   phase-2 seam (sub-second, only on self-heal re-runs) — smooth with a
   phase-1 offset if it ever bothers anyone.
 
-- **Sub-1 sat/vB "super economy" fee** — Bitcoin Core 30 (Oct 2025) lowered the
-  default minimum relay feerate to 0.1 sat/vB, so in a quiet mempool a payment
-  can confirm for less than the app's current 1 sat/vB floor. The engine's fee
-  math is already fraction-safe (`ceil(vsize × rate)`); the floor lives in
-  `MIN_ACCEPTED_FEE_RATE` (api.ts) and `feeRateForTier`, both part of the F1
-  fee-sanity fix — so lowering it is a money-path change needing a review round.
-  Savings are small (≈100 sats on a typical send) and a sub-1 payment is more
-  likely to stall, so this only became sane once **Speed up** shipped. Requires
-  checking what mempool.space actually serves for fractional rates (the
-  `/v1/fees/recommended` endpoint returns integers) and accepts on broadcast.
+- **Sub-1 sat/vB "super economy" fee** — ✅ **absorbed into the Custom fee
+  rate item above (owner decision 2026-07-10).** The floor decision is made
+  once, for user-typed rates only: `MIN_CUSTOM_FEE_RATE = 0.1` (Send.tsx),
+  matching Bitcoin Core 30's default minimum relay feerate. Verified live
+  2026-07-10 against our broadcast node (blockstream.info): its mempool's
+  bottom fee-histogram buckets carry large accepted volume at ≈0.1 sat/vB and
+  its `/api/fee-estimates` returns sub-1 rates, so its relay floor is the
+  Core-30 default. The recommended TIERS keep their [1, 500] clamp untouched
+  (`MIN_ACCEPTED_FEE_RATE` in api.ts and `feeRateForTier` — mempool.space's
+  own recommended minimum is 1, consistent with that clamp): only typed
+  intent goes below 1. A sub-1 entry shows a non-blocking slow-lane hint
+  (accepted ≠ confirmed; may wait a long time or be dropped), a node
+  rejection at broadcast gets honest fee-too-low copy instead of the generic
+  connection error, and **Speed up is the rescue** — a 0.1 sat/vB send is
+  proven bump-rescuable in tests (the BIP125 floors handle a sub-1 original).
 
 ## v1.2 — Trust hardening
 
