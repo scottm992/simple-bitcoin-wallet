@@ -9,11 +9,15 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
 // Mock only the broadcast endpoint; everything else in api.ts stays real.
+// F19: the mocked relay deliberately returns GARBAGE — nothing in the broadcast
+// path may depend on the relay's echo (the authoritative txid is the locally
+// computed BuiltTx.txid). Every assertion below holds despite this body.
+const RELAY_GARBAGE = 'relay-garbage-not-a-txid';
 vi.mock('../lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/api')>();
   return {
     ...actual,
-    broadcastTx: vi.fn(async (_network: 'mainnet' | 'testnet', _txHex: string) => 'f'.repeat(64)),
+    broadcastTx: vi.fn(async (_network: 'mainnet' | 'testnet', _txHex: string) => RELAY_GARBAGE),
   };
 });
 
@@ -62,7 +66,10 @@ describe('signAndBroadcast — allowHighFee threading (F10)', () => {
   it('with informed consent the same small send builds, signs, and reaches broadcast', async () => {
     setUnlocked(ABANDON);
     const result = await signAndBroadcast({ ...SMALL_SEND, allowHighFee: true });
-    expect(result.txid).toBe('f'.repeat(64));
+    // F19: the txid is the LOCALLY computed one (64-hex, deterministic from the
+    // signed bytes) — never the relay's garbage echo.
+    expect(result.txid).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.txid).not.toBe(RELAY_GARBAGE);
 
     const mock = vi.mocked(broadcastTx);
     expect(mock).toHaveBeenCalledTimes(1);
@@ -73,8 +80,9 @@ describe('signAndBroadcast — allowHighFee threading (F10)', () => {
     expect((txHex as string).length).toBeGreaterThan(100);
     expect(/^[0-9a-f]+$/i.test(txHex as string)).toBe(true);
 
-    // F15: the local send record was written, keyed by the RETURNED txid, with
-    // the user-confirmed recipient and the exact recipient-output amount.
+    // F15: the local send record was written, keyed by the LOCALLY computed
+    // txid (F19), with the user-confirmed recipient and the exact
+    // recipient-output amount.
     expect(result.sendRecorded).toBe(true);
     expect(getSendRecord('mainnet', result.txid)).toEqual({
       recipient: RECIPIENT,

@@ -7,14 +7,20 @@ import react from '@vitejs/plugin-react';
 
 /**
  * The strict production Content-Security-Policy (per docs brief):
- *   default-src 'self'; connect-src 'self' https://mempool.space;
- *   img-src 'self' data:; style-src 'self' 'unsafe-inline'; no script-src
- *   beyond 'self'.
+ *   default-src 'self'; connect-src 'self' https://mempool.space
+ *   https://blockstream.info; img-src 'self' data:; style-src 'self'
+ *   'unsafe-inline'; no script-src beyond 'self'.
  * `object-src 'none'` and `base-uri 'self'` are added as standard hardening.
+ *
+ * v1.2.0 adds https://blockstream.info to connect-src: chain data (address stats
+ * / utxos / txs / one-tx fetch / broadcast) now goes there, while mempool.space
+ * is KEPT for fee estimates + USD price. Two hosts, each seeing limited request
+ * types (trust-model change — audited pre-ship in security review Round 13,
+ * docs/review/round1.md).
  */
 const PROD_CSP = [
   "default-src 'self'",
-  "connect-src 'self' https://mempool.space",
+  "connect-src 'self' https://mempool.space https://blockstream.info",
   "img-src 'self' data:",
   "style-src 'self' 'unsafe-inline'",
   "script-src 'self'",
@@ -31,7 +37,7 @@ const PROD_CSP = [
  */
 const DEV_CSP = [
   "default-src 'self'",
-  "connect-src 'self' https://mempool.space ws: wss:",
+  "connect-src 'self' https://mempool.space https://blockstream.info ws: wss:",
   "img-src 'self' data:",
   "style-src 'self' 'unsafe-inline'",
   "script-src 'self' 'unsafe-inline' 'unsafe-eval'",

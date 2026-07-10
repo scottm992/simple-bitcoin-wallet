@@ -88,6 +88,21 @@ const DISCOVERY_INACTIVITY_MS = 12_000;
  */
 const DISCOVERY_HARD_CAP_MS = 120_000;
 
+/**
+ * Cap on how many times ONE discovery run may PAUSE for a server-priced HTTP 429
+ * (v1.2.0). Each grant waits `RATE_LIMIT_PAUSE_MS` (~12s, api.ts) and retries the
+ * paused request; past this cap the run is cut exactly as a stall is (phase-1
+ * kept, cue shown, resume later from the cross-run cache). 3 bounds the total
+ * deliberate wait one run can incur at ~36s — comfortably inside the 120s hard
+ * cap — so a persistent rate-limit wall decays offered load onto the backoff
+ * ladder instead of parking a run in a pause loop. This is NOT the §1c-forbidden
+ * transport retry: a 429 is the server explicitly pricing a wait, and honoring a
+ * bounded number of them REDUCES offered load. While a pause is active the run's
+ * INACTIVITY cutoff is suspended (a deliberate wait is not a stall); the HARD CAP
+ * is never extended and still binds a pathological pause loop.
+ */
+const MAX_RATE_LIMIT_PAUSES = 3;
+
 /** Concurrency for the cheap poll's stats re-checks. */
 const POLL_CONCURRENCY = 4;
 
@@ -295,11 +310,16 @@ export function startDiscovery(params: {
   /** Inter-wave pacing delay (Stage 2); omitted → the production default. Tests
    *  pass 0 to keep request-count assertions fast and deterministic. */
   waveDelayMs?: number;
+  /** Per-run cap on server-priced 429 pauses (v1.2.0); omitted →
+   *  {@link MAX_RATE_LIMIT_PAUSES}. Tests inject a small/large value to exercise
+   *  the budget-cut and the hard-cap-cuts-a-pause-loop paths deterministically. */
+  maxRateLimitPauses?: number;
 }): DiscoveryHandle {
   const { network, onSnapshot, onError } = params;
   const controller = new AbortController();
   const inactivityMs = params.inactivityMs ?? DISCOVERY_INACTIVITY_MS;
   const hardCapMs = params.hardCapMs ?? params.deadlineMs ?? DISCOVERY_HARD_CAP_MS;
+  const maxRateLimitPauses = params.maxRateLimitPauses ?? MAX_RATE_LIMIT_PAUSES;
   let gotSnapshot = false;
   // An externally aborted (superseded) run must stay silent: the aborter owns
   // the UI state now. Only a cutoff / genuine failure with no result may settle
@@ -313,9 +333,16 @@ export function startDiscovery(params: {
   // network fetches that resolved — cache hits don't count). ≥1 ⇒ the run made
   // forward progress; the controller reads this via {@link DiscoveryHandle.madeProgress}.
   let landedResponses = 0;
+  // v1.2.0 429-pause state: how many server-priced pauses this run has granted
+  // (budgeted by `maxRateLimitPauses`), and how many are CURRENTLY active (a
+  // depth counter, since ~4 requests scan concurrently and several can 429 at
+  // once). While `pauseDepth > 0` the inactivity clock is suspended outright.
+  let rateLimitPauses = 0;
+  let pauseDepth = 0;
 
   // The HARD CAP: an unconditional wall so the run always settles (F12). Never
-  // reset — a run never outlives it regardless of activity.
+  // reset — a run never outlives it regardless of activity, INCLUDING a 429 pause
+  // loop (the inactivity suspension below never touches this timer).
   const hardCap = setTimeout(() => controller.abort(), hardCapMs);
   // The INACTIVITY cutoff: (re-)armed on every landed response. A total stall
   // (nothing lands) fires it after one full window — faster than the old fixed
@@ -324,8 +351,39 @@ export function startDiscovery(params: {
   const onResponse = (): void => {
     if (settled) return;
     landedResponses++;
+    // While a deliberate 429 pause is active the pause OWNS the inactivity clock
+    // (it is cleared). A concurrent landing during the wait must NOT re-arm a
+    // short window that would then fire mid-pause — it still counts as progress,
+    // but the clock stays suspended until the last pause releases.
+    if (pauseDepth > 0) return;
     clearTimeout(inactivity);
     inactivity = setTimeout(() => controller.abort(), inactivityMs);
+  };
+  // v1.2.0: a chain-data GET returned HTTP 429 (a server-priced wait). Grant a
+  // bounded in-run pause up to `maxRateLimitPauses` times; past the budget (or
+  // once settled) deny by returning null, and the run is cut exactly like a stall
+  // (phase-1 kept, resume from the cross-run cache). On grant, SUSPEND the
+  // inactivity cutoff for the wait — a deliberate pause must never be read as a
+  // stall — and return a release that resumes a fresh inactivity window once the
+  // LAST concurrent pause ends. The HARD CAP is deliberately left alone, so a
+  // pathological pause loop is still cut by it. This is the §1c distinction made
+  // concrete: honoring an explicit 429 REDUCES offered load, unlike a blind retry.
+  const onRateLimitPause = (): (() => void) | null => {
+    if (settled) return null;
+    if (rateLimitPauses >= maxRateLimitPauses) return null;
+    rateLimitPauses++;
+    pauseDepth++;
+    clearTimeout(inactivity);
+    return () => {
+      if (pauseDepth > 0) pauseDepth--;
+      // Resume a fresh inactivity window only when every concurrent pause has
+      // ended and the run is still live (not settled, not aborted) — arming a
+      // timer for a doomed run would just be cleared in `finally` anyway.
+      if (pauseDepth === 0 && !settled && !controller.signal.aborted) {
+        clearTimeout(inactivity);
+        inactivity = setTimeout(() => controller.abort(), inactivityMs);
+      }
+    };
   };
 
   const done = (async () => {
@@ -346,6 +404,10 @@ export function startDiscovery(params: {
         // {@link DiscoveryOptions.onResponse}). Covers stats AND the utxo/txs
         // fetches uniformly, since all three go through `withScanCache`.
         onResponse,
+        // v1.2.0 429-pause hook (shared across BOTH phases, so the pause budget
+        // is per-RUN): grants/denies a bounded in-run pause on a server 429 and
+        // suspends the inactivity clock for its duration (see onRateLimitPause).
+        onRateLimitPause,
         // Scan-progress (display-only): forward each aggregated tick to the
         // caller, but ONLY while this run still owns the UI. A superseded/aborted
         // run must fall silent (same rule as the onSnapshot dispatches below,
@@ -379,6 +441,13 @@ export function startDiscovery(params: {
       });
       if (externallyAborted) return;
       persistScanMarks(network, full);
+      // v1.2.0 convergence-scoped TTL: a FULL gap-20 scan just completed, so the
+      // per-network cache leaves "converging" mode — subsequent rescans honor the
+      // normal SCAN_CACHE_TTL_MS again. `complete=true` only ever comes from this
+      // full-scan completion; any change signal (invalidateScanCache → clear())
+      // flips it straight back to converging. Skipped for a superseded run (the
+      // `externallyAborted` guard above), so a doomed run never marks complete.
+      cache.markComplete();
       onSnapshot(full, true);
     } catch {
       // Inactivity/cap cutoff or network failure. With a phase-1 result already
@@ -695,7 +764,15 @@ export function feeRateForTier(fees: FeeEstimates, tier: FeeTier): number {
  * the Speed-up flow's verification baseline (F15) — was persisted.
  */
 export interface BroadcastResult {
-  /** The broadcast transaction id. */
+  /**
+   * The broadcast transaction id — computed LOCALLY from the signed bytes
+   * (`BuiltTx.txid`, F19), never taken from the relay's response. The txid is
+   * derivable from what we signed, so trusting a remote echo for it would
+   * violate the F15 never-trust-the-API-for-derivable-facts principle: a
+   * hostile relay returning a wrong/garbage body would otherwise poison the
+   * displayed id AND mis-key the send record, silently voiding this payment's
+   * Speed-up coverage.
+   */
   readonly txid: string;
   /**
    * Whether the local send record (txid → recipient + amount, sendLog.ts) was
@@ -713,15 +790,23 @@ export interface BroadcastResult {
  * tx, broadcasts it, and returns the txid. The mnemonic is not returned.
  *
  * Idempotency: buildAndSignTx over the same UTXO set + params yields the same
- * signed tx, and mempool.space treats a re-broadcast of an already-accepted tx
- * as success (returns the same txid), so a retry cannot double-spend (and its
- * record write just rewrites identical data).
+ * signed tx, and an Esplora relay treats a re-broadcast of an already-accepted
+ * tx as success, so a retry cannot double-spend (and its record write just
+ * rewrites identical data).
  *
  * F15: immediately after a successful broadcast, the send is recorded locally
- * (returned txid → the USER-confirmed recipient + the exact amount the signed
- * tx pays them, from the engine's own accounting). This record is what lets
- * the Speed-up flow later prove the chain API isn't lying about where the
- * payment goes.
+ * (txid → the USER-confirmed recipient + the exact amount the signed tx pays
+ * them, from the engine's own accounting). This record is what lets the
+ * Speed-up flow later prove the chain API isn't lying about where the payment
+ * goes.
+ *
+ * F19: the txid used for the record AND the returned {@link BroadcastResult} is
+ * the LOCALLY computed `built.txid` (deterministic from the signed bytes) — the
+ * relay's response body is a diagnostic echo only, never an identifier. The
+ * txid is derivable from what we signed; trusting a remote echo for a derivable
+ * fact violates the F15 principle, and a hostile relay's wrong/garbage echo
+ * would mis-key the record and silently void Speed-up coverage. A divergent
+ * echo on success is NOT a failure mode — ours is simply authoritative.
  */
 export async function signAndBroadcast(params: {
   network: Network;
@@ -747,18 +832,21 @@ export async function signAndBroadcast(params: {
     sendMax: params.sendMax,
     allowHighFee: params.allowHighFee,
   });
-  const txid = await broadcastTx(params.network, built.txHex);
+  // F19: the response body (the relay's txid echo) is deliberately IGNORED as an
+  // identifier — broadcastTx still reads it for error surfacing on non-2xx, but
+  // on success the authoritative txid is built.txid (see the doc comment above).
+  await broadcastTx(params.network, built.txHex);
   // §1b: a broadcast changes our UTXO set and balances, so every cached
   // discovery response for this network is now potentially stale. Invalidate so
   // the post-send refresh re-fetches fresh rather than reusing pre-send data.
   invalidateScanCache(params.network);
   // The recipient-output value, exactly: inputs − fee − change covers normal
-  // sends, sendMax sweeps, and the dust-fold alike.
-  const sendRecorded = recordSend(params.network, txid, {
+  // sends, sendMax sweeps, and the dust-fold alike. Keyed by the LOCAL txid (F19).
+  const sendRecorded = recordSend(params.network, built.txid, {
     recipient: params.recipient,
     amountSats: built.totalInputSats - built.feeSats - built.changeSats,
   });
-  return { txid, sendRecorded };
+  return { txid: built.txid, sendRecorded };
 }
 
 // ---------------------------------------------------------------------------
@@ -992,18 +1080,24 @@ export async function prepareBump(
  * mnemonic at call time; never returns it.
  *
  * Idempotency: `buildRbfBumpTx` over the same prepared data + rate yields the
- * identical signed replacement (RFC6979 deterministic signatures), and
- * mempool.space treats a re-broadcast of an already-accepted tx as success —
+ * identical signed replacement (RFC6979 deterministic signatures), and an
+ * Esplora relay treats a re-broadcast of an already-accepted tx as success —
  * so a retry cannot double-spend (and rewrites an identical record).
  * `allowHighFee` bypasses only the 25% consent rule, never the hard
  * rate/absolute caps (F10).
  *
- * F15: the replacement gets its OWN send record under the returned txid — the
- * recipient comes from `prepared`, which `prepareBump` verified against the
+ * F15: the replacement gets its OWN send record under the replacement's txid —
+ * the recipient comes from `prepared`, which `prepareBump` verified against the
  * ORIGINAL's record, and the amount is the replacement's actual
  * recipient-output value (possibly reduced, for a sweep). A bump of a bump
  * therefore verifies against the replacement's own record, keeping the chain
  * of trust unbroken back to the user's original confirmation.
+ *
+ * F19: as in {@link signAndBroadcast}, the record key and the returned txid are
+ * the LOCALLY computed `built.txid` — the relay's echo is never trusted for a
+ * locally-derivable fact, so a hostile relay cannot mis-key the replacement's
+ * record (which would break the bump-of-a-bump chain above) or poison the
+ * displayed id.
  */
 export async function bumpAndBroadcast(params: {
   network: Network;
@@ -1024,15 +1118,17 @@ export async function bumpAndBroadcast(params: {
     feeRateSatVb: params.feeRateSatVb,
     allowHighFee: params.allowHighFee,
   });
-  const txid = await broadcastTx(params.network, built.txHex);
+  // F19: relay echo ignored as an identifier (error surfacing on non-2xx is
+  // unchanged inside broadcastTx); built.txid is authoritative — see the doc.
+  await broadcastTx(params.network, built.txHex);
   // §1b: same as signAndBroadcast — a broadcast (here, the replacement) moves
   // our chain state, so drop the stale cached responses for this network.
   invalidateScanCache(params.network);
-  const sendRecorded = recordSend(params.network, txid, {
+  const sendRecorded = recordSend(params.network, built.txid, {
     recipient: params.prepared.recipient,
     // The replacement's actual recipient-output value (inputs − fee − change):
     // unchanged when change absorbs the bump, reduced for a sweep.
     amountSats: built.totalInputSats - built.feeSats - built.changeSats,
   });
-  return { txid, sendRecorded };
+  return { txid: built.txid, sendRecorded };
 }

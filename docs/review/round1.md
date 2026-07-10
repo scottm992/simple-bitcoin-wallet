@@ -1602,3 +1602,340 @@ deleted; the only file modified is this `docs/review/round1.md`, committed on
 `fee-rate-display` (not pushed). Gates re-confirmed after deletion: `tsc --noEmit` clean,
 `npm test` = 271 passing, `npm run build` clean, `dist` CSP `script-src 'self'`. Next finding
 number: **F18** (or F19 if Round 11 claims F18 first)._
+
+---
+
+# Round 13 — blockstream.info as chain-data primary + 429-pause + convergence cache
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 2 (F19 Low, F20 Info)**
+
+FULL round (the change touches API ingestion AND the trust model — a second
+endpoint) on the four `blockstream-primary` commits: `634227c` (chain data →
+blockstream.info; fees/price stay mempool.space), `ef17059` (HTTP 429 = polite
+in-run pause), `5319609` (convergence-scoped cache lifetime), `f8e5a29` (v1.2.0 +
+docs). Run PRE-ship, before any merge to `main` — the branch docs said "Round 13
+OWED/deferred", written while the owner was out of credits; credits were restored
+and the round ran before shipping (the ROADMAP banner is corrected alongside this
+entry). `npm test` = **290 passing**, `tsc --noEmit` clean, `npm run build` clean,
+dist CSP = `default-src 'self'; connect-src 'self' https://mempool.space
+https://blockstream.info; …; script-src 'self'; object-src 'none'; base-uri
+'self'; form-action 'none'` (exactly the one origin added, nothing else), no
+`console.*` in `src/`, `package.json`/`package-lock.json` untouched (no new
+deps), `public/` untouched (no `CACHE_NAME` bump owed). Verified with throwaway
+`round13.review.test.ts` (6 probes, executed, deleted) plus THREE single, spaced
+live requests to blockstream.info only (never mempool.space): mainnet address
+stats, mainnet tx (the genesis coinbase — exercising `prevout: null` and an
+address-less p2pk vout), and one testnet address — all byte-compatible with the
+shapes the F2 validators expect.
+
+## Trust-model verdict (explicit)
+
+**The split is sound and strictly narrows what each party sees.** blockstream.info
+is now the SOLE source of address stats / UTXOs / address-txs / one-tx fetch /
+broadcast; mempool.space sees ONLY fee-estimate and price fetches — no addresses,
+ever. One party (not two) learns the wallet's address set; the F1-audited fee path
+is byte-identical.
+
+- **No validator was loosened.** The `api.ts` diff hunks are URL swaps
+  (`apiBaseUrl` → `chainApiBaseUrl` at the five chain-data call sites) and
+  comments/additions only; every F2 ingest guard (`asObject`/`asArray`/
+  `satAmount`/`nonNegInt`/`txid`/`asBool`/`asU32`/`optionalAddress`, the array/
+  vector/weight/address-length caps, `getTransaction`'s txid-echo, duplicate-
+  outpoint and exact fee = inputs − outputs cross-checks) is character-identical
+  to the round-9-audited code. Live probes confirmed blockstream serves the same
+  field names/types on both networks.
+- **A hostile/compromised blockstream is display-only + broadcast-relay.** It can
+  mis-state balances/activity (bounded by F2 plausibility caps, the honest
+  incomplete cue, and the uncached poll's heal cycle); it can refuse or censor
+  broadcasts (availability — the user sees the typed error; deterministic signing
+  makes a later re-broadcast idempotent); it CANNOT redirect funds: the send
+  recipient comes from user input at signing time, bump inputs/change are proven
+  ours by local derivation, and the bump recipient — the one non-derivable field —
+  is still F15-verified against the LOCAL send record. `getTransaction` (the
+  Speed-up data source) moved to blockstream WITH its full F2 validation intact,
+  and the F15 chain terminates in `sendLog.ts`, not in anything blockstream can
+  say. The one crack found in this trust seam is the broadcast RESPONSE (F19,
+  Low, fail-closed — see below).
+- **Failover honesty:** this is a primary SWAP, not a failover — a blockstream
+  outage now takes chain data down (mempool.space would still serve fees). The
+  ROADMAP correctly keeps true failover + cross-check as future work.
+
+## §1c adjudication — the 429 pause is NOT the forbidden transport retry
+
+**COMPLIANT.** The §1c/§8 prohibition targets blind per-request retries against a
+SILENT stall-throttler (no error returned), which double in-flight load exactly
+when punished. The 429 pause is the opposite on every axis: it triggers only on an
+explicit server verdict (HTTP 429 — the server pricing a wait), inserts ~12s of
+ZERO offered load sized to the field-measured ~1/s bucket refill, costs exactly
++1 request per grant (measured: a 40-address converge with three 429s = 43 calls,
+never more), is budgeted per run (`MAX_RATE_LIMIT_PAUSES = 3`), and is bounded by
+the unmodified 120s hard cap; a persistent 429 wall still decays onto the
+unchanged backoff ladder. Stall defenses are untouched (8s discovery timeout, no
+transport retry, inactivity cutoff) — a return of the mempool.space stall tier on
+a future fail-back is still covered.
+
+## Per-area verdicts
+
+- **1. Trust-model change — SOUND (verdict above).** One-line evidence: diff
+  contains zero validator hunks; F15 traced end-to-end (prepareBump →
+  `getSendRecord` local); live shapes byte-compatible incl. the optional-field
+  corners; `getFeeEstimates`/`getBtcUsdPrice` pinned to mempool.space by shipped
+  URL-split tests, chain data (both networks) pinned to blockstream.info — the
+  per-network split has no crossover (testnet → `blockstream.info/testnet/api`,
+  shipped test green).
+- **2. 429-pause correctness — SOUND, one bounded residual (noted).** Wrapping
+  order verified in source AND by probe: the pause wraps the RAW api innermost,
+  the cache wraps that — a cache hit returns before any pause logic exists to
+  reach, and `onResponse` fires only after a genuine landed response (a
+  paused-then-retried request lands once; an exhausted-budget 429 lands nothing).
+  Probe evidence, all deterministic interleavings:
+  (a) *suspension vs concurrent landings:* three concurrent grants with genuine
+  landings arriving at 2/4/6/8s MID-pause — an injected 5s inactivity window
+  (below the 12s pause, above the 2s landing gap) would have cut the run at 5s if
+  the grant failed to clear the clock, or at ~13s if any mid-pause landing
+  re-armed it; the run survived both discriminator windows and completed in ONE
+  run, zero aborted requests, zero leaked timers.
+  (b) *pause straddling an invalidation (F16 across the pause):* an
+  `invalidateScanCache` at t=6s inside a 12s pause — the retry landing at 12s was
+  NOT cached (generation captured before the pause), pinned by a three-fetch
+  discriminator (429 → dropped retry → phase-2 re-fetch; a broken fence yields
+  two), and a follow-up run cache-hits (no fourth).
+  (c) *pause straddling an abort:* an external abort at t=6s mid-pause ended the
+  wait promptly via `abortableSleep`, the release ran (balanced `finally`), the
+  paused request was NEVER retried, zero requests after the abort, zero timers,
+  and the run stayed silent (no onError, no snapshot) — supersede semantics
+  intact.
+  (d) *budget under concurrency (engineer-flagged) — adjudicated:* the budget can
+  burn CONCURRENTLY (a 429 wall in phase 1's first wave: three grants + a denial
+  at t≈0 → immediate cut, fastest possible decay onto the ladder) or SERIALLY
+  (waves serialize on their paused request: measured grants at t=0,0 then t=12s,
+  deny → cut at ~12–24s). Both are inside the documented ≤36s worst case (which
+  is the serial bound); concurrent burn strictly SHORTENS the deliberate wait —
+  conservative direction. Accepted.
+  (e) *the 120s hard cap at PRODUCTION constants:* a 100% 429 wall with an
+  effectively unlimited budget loops pause→retry as a slow drip (<50 requests
+  over 118s) and is settled by the cap just past 120s — `onError`,
+  `madeProgress() === false`, zero timers, nothing further ever.
+  (f) *scope pins:* a 429 on broadcast / getTransaction / fees still throws a
+  typed `ApiResponseError` immediately (shipped tests); `pollAccount` reads the
+  RAW api (no pause wrapper) so a poll 429 stays a caught, silent failure.
+  **Residual (accepted, not a finding): post-settle zombie retries.** When a run
+  settles by error/budget-cut (no abort — the controller is deliberately not
+  aborted on that path), pauses already granted keep sleeping and each retries
+  ONCE ~12s after the cut. Measured and pinned: ≤ budget (3) extra requests, each
+  re-429 is denied (`settled`) and dies — then silence forever; a retry that
+  LANDS is settle-guarded out of progress and generation/signal-fenced into the
+  cache only when still valid (it can only warm the resume). Bounded, spaced,
+  direction-safe.
+- **3. Convergence-scoped TTL — SOUND, with the honesty claim corrected (F20).**
+  `markComplete()` has exactly ONE production call site (`actions.ts` after the
+  full gap-20 phase-2 snapshot, behind the `externallyAborted` guard — a
+  superseded run never marks complete); `clear()` resets to converging AND bumps
+  the F16 generation (shipped state-machine test); an invalidation while
+  converging nukes the cache instantly (shipped test — nothing reused, full 40
+  re-paid). End-to-end probe of the staleness bound: a payment landing
+  MID-convergence on an address already cached "unused" is NOT seen by the
+  completing resume (the 150s-old converging entry is reused — the complete
+  snapshot UNDERSTATES, never overstates, for an incoming payment), and is then
+  caught by the UNCACHED cheap poll within ONE cycle OF COMPLETION — poll →
+  invalidate (converging cache cleared) → rescan lands the funds. That
+  "of completion" is the truth the in-code comments miss (F20): during
+  convergence the on-screen snapshot is incomplete, so `pollTick` takes the
+  self-heal branch and the cheap poll does not run at all. Direction adjudication:
+  understate-only for third-party payments, honest cue (scan-progress or the
+  tappable wait state) visible throughout; the pre-existing same-seed-elsewhere
+  OVERSTATE corner widens from ≤100s (old TTL) to convergence-duration — still
+  display-only (a stale UTXO in a compose is network-rejected; no signing/fund
+  path consumes it unsafely) and healed one poll cycle after completion.
+  **Permanent-partial-network memory adjudication: acceptable** — a
+  never-completing wallet holds converging entries for the session only
+  (in-memory maps, never persisted; lock/network-switch/broadcast/poll-movement
+  all clear them; size bounded by the ≤200-index scan window), with the honest
+  cue up the whole time; the alternative (TTL churn) is the measured 2026-07-10
+  field regression ("stuck at 22 of 40"), strictly worse.
+- **4. Regression sweep — GREEN.** 290/290 (all prior pins: 40/10/2 request
+  budgets, resume-remainder, §7 un-detect, F12 evaluate-from-0/complete-only-
+  from-gap-20, F13 per-network keying + the new per-network URL split, F16
+  generation fence, F17 fetch-gated pacing, F18 quick-retry budget, 12s/120s
+  cutoffs, scan-progress cue, F1 fee clamps + round-12 rate display — fee chips
+  still fed by mempool.space-shaped estimates). `tsc`/build clean; dist CSP
+  gains exactly `https://blockstream.info` in connect-src (dev CSP likewise);
+  `public/sw.js` absent from the diff (cross-origin passthrough by design — no
+  CACHE_NAME owed); no new deps; no console.
+- **5. Loose ends (noted, none blocking).**
+  (i) The Activity explorer deep-link (`Activity.tsx:154`) still points at
+  mempool.space while tx data comes from blockstream — deliberate, display-only,
+  and mempool.space's site remains a fine explorer; cosmetic.
+  (ii) The 429-pause path is mock-tested only (blockstream does not currently
+  429) — ACCEPTABLE for ship: the trigger is an explicit
+  `ApiResponseError(status 429)`, whose construction from any live non-2xx is
+  exercised by the api-layer tests; the behavior it models was live-measured
+  against mempool.space's limiter the night of the change; and the defense's
+  absence-case (no 429 ever arrives) is byte-identical to today's healthy path.
+  (iii) Fees/price stay on the endpoint that is actively 429-ing the owner's IP:
+  the steady 2-spaced-requests/30s sits far under the measured bucket (≈25–40,
+  ~1/s refill), a fees 429 is a typed error that is never retried, and Send
+  degrades gracefully (review is gated on fees being present). Availability
+  residual only.
+  (iv) In-code "Round 13 audit OWED" comments (`api.ts`, `vite.config.ts`,
+  ENGINE.md) are stale as of this entry — cosmetic; correct at next touch (a
+  review round does not edit source).
+  (v) A one-microtask F16-class corner: a phase 2 completing exactly inside the
+  broadcast invalidate→abort gap could `markComplete()` a just-cleared cache —
+  consequence is CONSERVATIVE (an empty cache under normal TTL; the stale
+  complete dispatch is immediately superseded by the post-broadcast refresh);
+  same class and bound as the round-9-accepted F16 residual, unreachable in
+  practice.
+
+## New findings
+
+### F19 — [SEV-Low] The broadcast response body is trusted as the txid — a hostile chain endpoint can poison the displayed id and silently void F15 speed-up coverage, while a locally-computed trusted txid already exists and is ignored
+
+- **Where:** `src/lib/api.ts` `broadcastTx` (returns `(await res.text()).trim()`
+  unvalidated); consumed by `src/actions.ts` `signAndBroadcast` (~:819, keys the
+  F15 send record on it and returns it) and `bumpAndBroadcast` (~:1096);
+  `App.tsx` dispatches it to state/display. Meanwhile `buildAndSignTx` /
+  `buildRbfBumpTx` already return the true, locally-computed `BuiltTx.txid`
+  (`tx.ts:143`) — which the broadcast path never uses.
+- **Scenario:** blockstream.info (now the sole broadcast relay) relays the tx but
+  responds with an arbitrary string, or a well-formed but WRONG 64-hex txid. The
+  F15 record is then written under the wrong key: `prepareBump` for the real
+  payment finds no record and dead-ends `'unverified'` — fail-closed, but the
+  user silently LOSES the ability to speed up that payment; the UI shows an id
+  the user cannot find in any explorer (a React text node — injection-safe; a
+  non-hex string is additionally dropped by sendLog's read-side
+  `/^[0-9a-f]{64}$/` filter on the next load). No fund redirection is possible:
+  the record's recipient/amount are LOCAL truth, and F15's compare runs against
+  the fetched tx's outputs, so a crafted record-key cannot make a hostile tx
+  pass. Pre-existing trust (mempool.space held the same position) — surfaced now
+  because this round re-adjudicates the chain-endpoint trust seam it sits on.
+- **Fix (one line each):** use `built.txid` as the authoritative id in
+  `signAndBroadcast`/`bumpAndBroadcast` (record + return it), treating the
+  response body as diagnostics only — optionally logging-free-comparing the two
+  and surfacing a mismatch as a typed error. This removes the endpoint's last
+  write into the F15 chain entirely.
+
+### F20 — [SEV-Info] The convergence-honesty comments overstate the poll's reach: mid-convergence detection is deferred until one poll cycle AFTER completion, not "within one poll cycle" of the payment
+
+- **Where:** the rationale repeated at `src/lib/account.ts` (~:116 the
+  `ScanCache.complete` doc; ~:795 the `fresh()` comment), `SCAN_CACHE_TTL_MS`
+  doc, and `docs/ENGINE.md` ("the uncached 30s poll still watches used addresses
+  + tips and invalidates on ANY movement, so a payment arriving mid-convergence
+  is detected within one poll cycle").
+- **Scenario (probe-verified):** while converging, the on-screen snapshot is
+  incomplete, so `pollTick` takes the `!accountComplete` self-heal branch — the
+  cheap uncached poll NEVER runs; the self-heal resumes from the converging
+  cache, where the paid address's "unused" entry no longer expires. The payment
+  stays invisible for the WHOLE convergence (previously bounded at ~100s by the
+  TTL); detection actually occurs one poll cycle after a complete snapshot lands
+  (measured: 150s-stale entry reused into a complete-but-understated snapshot;
+  the NEXT uncached poll detects, invalidates, and the rescan lands the funds).
+  Direction stays safe — understate-only for incoming payments, honest cue up
+  throughout, heal guaranteed on completion — so this is the deliberate,
+  correct trade that fixes the field regression; but the in-code/ENGINE claims
+  describe a mechanism that does not run when they say it does.
+- **Fix:** correct the comment sites (and ENGINE.md) to state the true bound:
+  "while converging, staleness is bounded by convergence itself (honest cue up,
+  understate-only); the uncached poll detects any missed movement within one
+  cycle of the next COMPLETE snapshot." No code change required — running the
+  cheap poll while incomplete would add offered load against the very endpoint
+  discipline this architecture exists to protect.
+
+## Ship recommendation
+
+**SHIP.** The trust-model change is clean (validators byte-identical, F15
+unbroken, strictly fewer parties see addresses), the 429 pause is a genuine
+load-REDUCING courtesy with every boundary tested at deterministic interleavings
+(suspension, fence, abort, budget, production hard cap), the convergence-scoped
+TTL fixes the measured field regression while keeping every invalidation signal
+authoritative in both modes, and all 290 prior pins are green. F19 is Low,
+fail-closed, pre-existing in kind, with a one-line fix recommended as a
+fast-follow; F20 is a documentation-accuracy correction. No fund-safety issue
+found.
+
+_Round-13 throwaway tests used the `.review.test.ts` suffix, were executed, and
+were deleted; the only files modified are this `docs/review/round1.md` and
+`ROADMAP.md` (the stale "Round 13 OWED" banner, rewritten to reflect the round
+ran pre-ship), committed on `blockstream-primary` (not pushed). Live API contact:
+three single, spaced GETs to blockstream.info (two mainnet, one testnet), zero to
+mempool.space. Gates re-confirmed after deletion: `tsc --noEmit` clean,
+`npm test` = 290 passing, `npm run build` clean, dist CSP `script-src 'self';
+connect-src 'self' https://mempool.space https://blockstream.info`. Next finding
+number: **F21**._
+
+---
+
+## Round 13 closure — F19 / F20 re-check
+
+**Both findings CLOSED. New findings: 0. Ship recommendation: SHIP `blockstream-primary`.**
+
+Re-audit of the two fix commits: `02585f6` (F19 — the locally computed txid is
+authoritative; the relay echo never keys anything) and `7fb8eff` (F20 — honest
+convergence-detection bound + the stale ROUND-13-OWED wording corrected at the
+four flagged source sites). `tsc --noEmit` clean, `npm test` = **294 passing**
+(290 + the 4-case shipped F19 suite), `npm run build` clean, dist CSP unchanged
+(`connect-src 'self' https://mempool.space https://blockstream.info`;
+`script-src 'self'`), no `console.*` in `src/`, no live API contact this pass
+(mocked only). Verified with throwaway `round13close.review.test.ts` (5 probes,
+independent harness) + `round13close.api.review.test.ts` (3 probes, real
+`broadcastTx`), executed, deleted.
+
+- **F19 — hostile relay re-run — CLOSED.** Independent re-run of the Round-13
+  adversary against the committed code: a relay answering a successful POST /tx
+  with a wrong-but-well-formed txid, or outright HTML garbage, changes NOTHING —
+  `BroadcastResult.txid` strictly equals the independently recomputed
+  `built.txid` (deterministic rebuild, exact equality), the F15 record is keyed
+  by it carrying the user-confirmed recipient/amount, and `getSendRecord` under
+  the lie is `null` — for sends AND for a bump whose own relay lies harder
+  (`not-even-hex`). The Speed-up chain verifies end to end on the REAL txid
+  (`prepareBump` → record match), and — the side the shipped suite doesn't
+  re-check — the F15 HARD FAIL is intact: a hostile `getTransaction`
+  substituting the recipient under the real txid still dead-ends
+  `recipient-mismatch` (typed `CannotBumpError`). The chain of trust now
+  terminates entirely in local values: `built.txid` → sendLog → prepareBump.
+- **F19 — no new failure mode — CONFIRMED.** Real `broadcastTx` + stubbed fetch:
+  a 2xx with a divergent/garbage body RESOLVES (trimmed echo returned,
+  diagnostics only — a lying success echo is deliberately not an error); a
+  non-2xx surfaces byte-identically (typed `ApiResponseError`, relay status AND
+  body verbatim — pinned independently and by the shipped api test); still
+  exactly ONE POST to `blockstream.info/api/tx`, never a retry. Consumer sweep:
+  `broadcastTx` has exactly two call sites in non-test `src/` (the two broadcast
+  paths in `actions.ts`), both now `await` it without binding the return —
+  nothing anywhere consumes the echo.
+- **F20 — corrected wording matches reality — CLOSED.** Grep of every claim
+  site: the two `account.ts` comments and `ENGINE.md` now state the true bound
+  ("detected within one poll cycle of the next COMPLETE snapshot — not of its
+  arrival") plus WHY the poll deliberately does not run while incomplete; no
+  overclaim survives anywhere in `src/`/`docs/` (the only remaining old-claim
+  text is this audit trail quoting it). Behavior re-pinned against the wording:
+  `pollTick` with an incomplete snapshot issues ZERO api requests and self-heals
+  via `onChanged`; with a complete snapshot it runs the uncached 2-request
+  tips poll. The stale "Round 13 audit OWED" wording is gone from `api.ts`
+  (header + `chainApiBaseUrl` doc), `vite.config.ts`, and `ENGINE.md` — all now
+  read "audited pre-ship in Round 13"; the ROADMAP banner records both findings
+  closed pre-merge.
+- **Scope + regression — GREEN.** `02585f6` touches only the two broadcast-path
+  identity bindings in `actions.ts` (plus docs/tests); its `api.ts` hunks are
+  comment-only (the return statement's behavior is unchanged). `7fb8eff` is
+  comments/docs only (`account.ts`, `api.ts`, `vite.config.ts`, `ENGINE.md`,
+  `ROADMAP.md`) — zero behavioral hunks. `tx.ts`, `sendLog.ts`, `vault.ts`,
+  `state.ts`, fee/price paths, and `public/` are untouched by both. Full suite
+  294/294 — every Round-13 pin (429-pause probes' shipped equivalents,
+  convergence tests, URL split, F1–F18 regressions) green. The updated
+  bump/highfee suites now run their relay mock as deliberate garbage — a
+  standing structural pin that no broadcast-path assertion can ever silently
+  re-grow a dependency on the echo.
+
+**SHIP.** F19's fix is exactly the recommended one and strictly strengthens the
+trust model (the relay lost its last write into the F15 chain — it is now purely
+display-source + relay, with identity fully local); F20's correction makes the
+documented honesty bound match the probe-verified behavior. Both fixes are
+minimal, correct, and regression-free.
+
+_Round-13-closure throwaway tests used the `.review.test.ts` suffix, were
+executed, and were deleted; the only file modified is this
+`docs/review/round1.md`, committed on `blockstream-primary` (not pushed). Zero
+live API calls this pass. Gates re-confirmed after deletion: `tsc --noEmit`
+clean, `npm test` = 294 passing, `npm run build` clean, dist CSP
+`connect-src 'self' https://mempool.space https://blockstream.info`. Next
+finding number: **F21**._

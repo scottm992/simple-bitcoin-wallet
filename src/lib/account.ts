@@ -19,6 +19,7 @@
  */
 import type { Chain, DerivedAddress, Network } from './wallet';
 import type { AddressStats, AddressTx, ApiUtxo } from './api';
+import { isRateLimitError, RATE_LIMIT_PAUSE_MS } from './api';
 import type { WalletUtxo } from './tx';
 
 /**
@@ -40,6 +41,12 @@ export interface AccountApi {
  * change signal invalidates the cache outright regardless (see the
  * cross-run cache owner + invalidation API in `actions.ts`). ~100s sits inside
  * the 90–120s band the hotfix brief specifies.
+ *
+ * v1.2.0 — this TTL applies ONLY once the account has completed a full scan
+ * (see {@link ScanCache.complete}). While still CONVERGING it is suspended: a
+ * ladder-spaced resume must be able to reuse a landing older than this, or the
+ * scan REGRESSES (entries dying faster than retries arrive — the 2026-07-10
+ * field bug, stuck at "22 of 40"). See {@link ScanCache.complete}.
  */
 export const SCAN_CACHE_TTL_MS = 100_000;
 
@@ -59,9 +66,9 @@ interface CacheEntry<T> {
  * a run the deadline cut at 25/40 resumes and pays only the remaining ~15
  * instead of restarting the 40-request burst forever. Two invariants keep that
  * safe: every entry carries a {@link SCAN_CACHE_TTL_MS} TTL (a stale response is
- * ignored and re-fetched), and any on-chain change signal must call the owner's
- * invalidation API — a cached "unused" response must never un-detect a payment
- * the cheap poll just found.
+ * ignored and re-fetched — but only once {@link complete}; see below), and any
+ * on-chain change signal must call the owner's invalidation API — a cached
+ * "unused" response must never un-detect a payment the cheap poll just found.
  */
 export interface ScanCache {
   readonly stats: Map<string, CacheEntry<AddressStats>>;
@@ -100,9 +107,39 @@ export interface ScanCache {
   /** Records one real network fetch (called by `withScanCache` on a miss). */
   recordFetch(): void;
   /**
-   * Drops every cached entry AND bumps {@link generation} — call on ANY change
-   * signal (see `actions.ts`). The generation bump is what makes an
-   * invalidation drop even the in-flight landings whose writes are still queued.
+   * Whether a FULL (gap-20) scan has completed since this cache was created or
+   * last invalidated (v1.2.0 convergence-scoped TTL). While `false`
+   * ("converging"), cached entries do NOT expire by {@link ttlMs} — the scan
+   * frontier can only advance, so a ladder-spaced resume MUST be able to reuse a
+   * landing older than the TTL, or the scan REGRESSES (entries dying faster than
+   * retries arrive — stuck at "22 of 40" forever, the 2026-07-10 field bug). Once
+   * `true`, normal TTL freshness applies to subsequent rescans.
+   *
+   * Honesty bound (corrected per F20, Round 13): while converging, staleness is
+   * bounded by CONVERGENCE ITSELF — the on-screen snapshot is flagged incomplete
+   * (honest cue up the whole time) and a payment missed by a stale "unused" entry
+   * is an UNDERSTATE, never an overstate. The cheap uncached poll does NOT run
+   * during convergence (an incomplete snapshot routes `pollTick` down the
+   * self-heal branch instead), so a payment arriving mid-convergence is detected
+   * within one poll cycle of the next COMPLETE snapshot — not of its arrival.
+   * That is the deliberate trade: running the poll while incomplete would add
+   * offered load against the very endpoint discipline this cache protects. Set
+   * by {@link markComplete}; reset to `false` by {@link clear}.
+   */
+  readonly complete: boolean;
+  /**
+   * Marks a FULL gap-20 scan as completed — call where the complete phase-2
+   * snapshot is persisted (see `actions.ts`). Flips {@link complete} to `true`,
+   * so subsequent rescans honor the normal {@link ttlMs} again. Idempotent.
+   */
+  markComplete(): void;
+  /**
+   * Drops every cached entry, bumps {@link generation} (F16), AND resets
+   * {@link complete} to `false` (back to converging) — call on ANY change signal
+   * (see `actions.ts`). The generation bump makes an invalidation drop even the
+   * in-flight landings whose writes are still queued; the convergence reset means
+   * the freshly-emptied cache re-converges under the no-TTL rule until the next
+   * full scan completes.
    */
   clear(): void;
 }
@@ -126,6 +163,10 @@ export function createScanCache(
   // F17: incremented on every real network fetch; read (as a getter) by
   // scanChain to pace only waves that actually hit the network.
   let fetches = 0;
+  // v1.2.0: false = "converging" (no full scan has completed since creation/last
+  // invalidation) → entries never expire by TTL; true = a full scan completed →
+  // normal TTL applies. Flipped true by markComplete(), reset false by clear().
+  let complete = false;
   return {
     stats,
     utxos,
@@ -138,14 +179,21 @@ export function createScanCache(
     get fetches(): number {
       return fetches;
     },
+    get complete(): boolean {
+      return complete;
+    },
     recordFetch(): void {
       fetches++;
+    },
+    markComplete(): void {
+      complete = true;
     },
     clear(): void {
       stats.clear();
       utxos.clear();
       txs.clear();
       generation++;
+      complete = false;
     },
   };
 }
@@ -242,6 +290,29 @@ export interface DiscoveryOptions {
    * only when a {@link ScanCache} is present. Absent ⇒ no-op (byte-identical).
    */
   readonly onResponse?: () => void;
+  /**
+   * Engine-internal hook fired when a DISCOVERY chain-data GET (stats / utxos /
+   * txs) is rejected with an explicit HTTP 429 — the server pricing a wait
+   * (v1.2.0). The orchestrator ({@link startDiscovery} in `actions.ts`) decides
+   * whether a polite in-run PAUSE is granted and returns:
+   *  - a RELEASE callback ⇒ the pause is granted: {@link withRateLimitPause}
+   *    waits {@link RATE_LIMIT_PAUSE_MS}, calls release, then RETRIES the same
+   *    request. The orchestrator suspends its INACTIVITY cutoff for the wait (a
+   *    deliberate pause must never be read as a stall), resuming it on release;
+   *    the HARD CAP is untouched and still binds.
+   *  - `null` ⇒ denied (the per-run pause budget `MAX_RATE_LIMIT_PAUSES` is
+   *    spent, or the run has settled): the 429 propagates and the run is cut
+   *    exactly as a stall is (phase-1 kept; resume later from the cross-run
+   *    cache).
+   *
+   * This is NOT the §1c-forbidden transport retry: a 429 is an explicit
+   * server-priced wait, and honoring it REDUCES offered load (unlike a blind
+   * retry against a silent staller, which doubled it). Absent ⇒ a 429 throws
+   * immediately with no pause — byte-identical to pre-v1.2.0. Only stats / utxos
+   * / txs route through here; broadcast / getTransaction / fees / price are never
+   * wrapped, so a 429 on those throws exactly as today.
+   */
+  readonly onRateLimitPause?: () => (() => void) | null;
 }
 
 /**
@@ -530,7 +601,15 @@ export async function discoverAccount(
   options: Partial<DiscoveryOptions> = {},
 ): Promise<AccountSnapshot> {
   const opts: DiscoveryOptions = { ...DEFAULT_DISCOVERY_OPTIONS, ...options };
-  const cachedApi = opts.cache ? withScanCache(api, opts.cache, opts.onResponse) : api;
+  // Layer the discovery api (v1.2.0): 429-pause wraps the RAW api INNERMOST, then
+  // the cache wraps THAT. So a cache HIT never reaches the pause logic (no 429 to
+  // handle), and `onResponse` (the landed-response / inactivity signal) fires in
+  // `withScanCache` only after a genuine successful response — a 429 that is
+  // paused-and-retried resolves as ONE landed response; a 429 that exhausts the
+  // budget throws and lands nothing. Both wrappers are opt-in: absent hooks ⇒
+  // byte-identical passthrough.
+  const baseApi = opts.onRateLimitPause ? withRateLimitPause(api, opts.onRateLimitPause) : api;
+  const cachedApi = opts.cache ? withScanCache(baseApi, opts.cache, opts.onResponse) : baseApi;
 
   // ---- Scan-progress aggregation (optional; onProgress absent ⇒ no-op) ------
   // discoverAccount owns the aggregation across the two CONCURRENTLY-scanning
@@ -623,6 +702,82 @@ export async function discoverAccount(
 }
 
 /**
+ * A plain delay that resolves early if `signal` aborts. Used for the 429 pause
+ * (a fixed wait, no jitter — unlike {@link pacedDelay}), so a run cutoff (hard
+ * cap / supersede) still ends the wait promptly instead of hanging the full pause.
+ */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(t);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    if (signal?.aborted) {
+      done();
+      return;
+    }
+    signal?.addEventListener('abort', done);
+  });
+}
+
+/**
+ * Wraps the discovery chain-data GETs (stats / utxos / txs) so an explicit HTTP
+ * 429 becomes a polite in-run PAUSE instead of a fatal run error (v1.2.0). On a
+ * 429 it asks the orchestrator (`onRateLimitPause`) whether a pause is granted:
+ *  - granted (a release callback) ⇒ wait {@link RATE_LIMIT_PAUSE_MS} honoring the
+ *    run's abort signal, release, then RETRY the same request against the
+ *    (partly-refilled) token bucket;
+ *  - denied (`null` — budget spent / run settled) ⇒ rethrow, and the run is cut
+ *    exactly as a stall is (phase-1 kept; resume later from the cross-run cache).
+ *
+ * ONLY an explicit 429 is handled here (see {@link isRateLimitError}); every other
+ * rejection — transport failure, any other non-2xx, a malformed body — propagates
+ * unchanged (§1c: discovery GETs never transport-retry). `release()` is called in
+ * a `finally`, so the orchestrator's pause bookkeeping (and its suspended
+ * inactivity clock) is always balanced even when the wait is cut by an abort. A
+ * signal already aborted at the top short-circuits (no pause), matching the
+ * mapWithConcurrency abort discipline.
+ */
+function withRateLimitPause(api: AccountApi, onRateLimitPause: () => (() => void) | null): AccountApi {
+  async function withPause<T>(
+    call: (signal?: AbortSignal) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    // A function (not a bare `signal?.aborted` read) so TS does not narrow the
+    // property and then wrongly assume it is unchanged across the `await` below —
+    // the signal can abort DURING the pause, which is the whole point.
+    const aborted = (): boolean => signal?.aborted === true;
+    for (;;) {
+      try {
+        return await call(signal);
+      } catch (err) {
+        // Only a server-priced 429 pauses; anything else (and any already-aborted
+        // run) is fatal to this request exactly as before.
+        if (!isRateLimitError(err) || aborted()) throw err;
+        const release = onRateLimitPause();
+        if (release === null) throw err; // budget spent / settled → cut like a stall
+        try {
+          await abortableSleep(RATE_LIMIT_PAUSE_MS, signal);
+        } finally {
+          release();
+        }
+        if (aborted()) throw err; // cut during the wait → don't retry
+        // else loop: retry the SAME request.
+      }
+    }
+  }
+  return {
+    getAddressStats: (network, address, signal) =>
+      withPause((s) => api.getAddressStats(network, address, s), signal),
+    getUtxos: (network, address, signal) => withPause((s) => api.getUtxos(network, address, s), signal),
+    getAddressTxs: (network, address, signal) =>
+      withPause((s) => api.getAddressTxs(network, address, s), signal),
+  };
+}
+
+/**
  * Wraps an {@link AccountApi} with a {@link ScanCache} so a scan never re-fetches
  * a response that is still fresh — within one run (phase 2 reusing phase 1) and,
  * for the cross-run cache, across runs (a resumed run pays only the remainder).
@@ -639,6 +794,20 @@ function withScanCache(api: AccountApi, cache: ScanCache, onResponse?: () => voi
   /** Returns a still-fresh cached value, or undefined (miss or expired). */
   function fresh<T>(entry: CacheEntry<T> | undefined): T | undefined {
     if (entry === undefined) return undefined;
+    // Convergence-scoped lifetime (v1.2.0): while the account is still CONVERGING
+    // (no full scan has completed since the cache was created/invalidated),
+    // entries never expire by TTL. The frontier only advances, so a ladder-spaced
+    // resume MUST reuse a landing older than the TTL — otherwise entries die
+    // faster than retries arrive and the scan REGRESSES (the 2026-07-10 field bug:
+    // stuck at "22 of 40"). Honesty bound (F20-corrected): staleness while
+    // converging is bounded by convergence itself — the snapshot is flagged
+    // incomplete (honest cue up) and a payment hidden by a stale "unused" entry
+    // is an UNDERSTATE only. The cheap uncached poll does NOT run while the
+    // snapshot is incomplete (pollTick self-heals instead), so missed movement is
+    // detected within one poll cycle of the next COMPLETE snapshot, not of its
+    // arrival. Once a full scan completes ({@link ScanCache.markComplete}),
+    // normal TTL freshness applies to rescans.
+    if (!cache.complete) return entry.value;
     return cache.now() - entry.storedAt < cache.ttlMs ? entry.value : undefined;
   }
   // WRITE GUARD (§7 + F16): every write is fenced by TWO complementary checks,

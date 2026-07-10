@@ -10,8 +10,10 @@ A dead-simple, beginner-friendly Bitcoin wallet that runs entirely in your brows
 - **Speed up a stuck payment** — if a payment is taking too long because its
   fee was low, tap "Speed up" to re-send it with a higher fee (BIP125 RBF)
 - **Your keys never leave your device** — all key generation and transaction
-  signing happens locally in the browser; the app only talks to the public
-  [mempool.space](https://mempool.space) API for balances and broadcasting
+  signing happens locally in the browser; the app only talks to two public
+  block-explorer APIs — [blockstream.info](https://blockstream.info) for chain
+  data (address balances, transactions, broadcasting) and
+  [mempool.space](https://mempool.space) for fee estimates and the USD price
 - **Mainnet by default, testnet toggle** for practicing with worthless coins
 - **Password-encrypted storage**, with optional Face ID / passkey unlock on
   supported devices (WebAuthn PRF)
@@ -19,13 +21,14 @@ A dead-simple, beginner-friendly Bitcoin wallet that runs entirely in your brows
   icon, full-screen launch, and the app shell opens even offline (checking
   your balance still needs a connection)
 
-> ⚠️ **Status: new software.** The code has been through a nine-round adversarial
+> ⚠️ **Status: new software.** The code has been through a multi-round adversarial
 > security audit (see `docs/review/`) with all findings resolved, but it is young
 > and lightly road-tested. Start in **Practice mode**, then use small amounts you
-> can afford to lose. Known limitations: the app trusts mempool.space for chain
-> data (it validates everything, but a compromised endpoint could still mislead
-> the display); reusing a receive address reduces privacy; the unlock throttle is
-> client-side only.
+> can afford to lose. Known limitations: the app trusts blockstream.info for chain
+> data and mempool.space for fees/price (it validates everything, but a
+> compromised endpoint could still mislead the display, and each party sees the
+> addresses it's asked about); reusing a receive address reduces privacy; the
+> unlock throttle is client-side only.
 
 ## Security model
 

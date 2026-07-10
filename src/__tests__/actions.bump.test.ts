@@ -19,12 +19,16 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
 // Mock only the two endpoints this flow touches; the rest of api.ts stays real.
+// F19: the mocked relay deliberately returns GARBAGE — nothing in the bump
+// broadcast path may depend on the relay's echo (the authoritative txid is the
+// locally computed BuiltTx.txid). Every assertion below holds despite this body.
+const RELAY_GARBAGE = 'relay-garbage-not-a-txid';
 vi.mock('../lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/api')>();
   return {
     ...actual,
     getTransaction: vi.fn(),
-    broadcastTx: vi.fn(async (_network: 'mainnet' | 'testnet', _txHex: string) => 'f'.repeat(64)),
+    broadcastTx: vi.fn(async (_network: 'mainnet' | 'testnet', _txHex: string) => RELAY_GARBAGE),
   };
 });
 
@@ -271,7 +275,10 @@ describe('bumpAndBroadcast — build + broadcast threading', () => {
       feeRateSatVb: 20,
       allowHighFee: false,
     });
-    expect(result.txid).toBe('f'.repeat(64));
+    // F19: the txid is the LOCALLY computed replacement id — never the relay's
+    // garbage echo.
+    expect(result.txid).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.txid).not.toBe(RELAY_GARBAGE);
     expect(result.sendRecorded).toBe(true);
 
     const mock = vi.mocked(broadcastTx);
@@ -282,8 +289,8 @@ describe('bumpAndBroadcast — build + broadcast threading', () => {
     expect((txHex as string).length).toBeGreaterThan(100);
     expect(/^[0-9a-f]+$/i.test(txHex as string)).toBe(true);
 
-    // F15: the replacement got its OWN record under the RETURNED txid — same
-    // (verified) recipient, same amount (change absorbed the bump).
+    // F15: the replacement got its OWN record under the LOCALLY computed txid
+    // (F19) — same (verified) recipient, same amount (change absorbed the bump).
     expect(getSendRecord('mainnet', result.txid)).toEqual({
       recipient: EXTERNAL,
       amountSats: 80_000n,
@@ -316,7 +323,7 @@ describe('bumpAndBroadcast — build + broadcast threading', () => {
       feeRateSatVb: 20,
       allowHighFee: true,
     });
-    expect(result.txid).toBe('f'.repeat(64));
+    expect(result.txid).toMatch(/^[0-9a-f]{64}$/); // local txid, not the echo (F19)
     expect(vi.mocked(broadcastTx)).toHaveBeenCalledTimes(1);
   });
 
@@ -457,8 +464,9 @@ describe('bumpAndBroadcast — F15 record chain', () => {
       feeRateSatVb: 20,
       allowHighFee: false,
     });
-    // The payment went out; only the verification coverage was lost.
-    expect(result.txid).toBe('f'.repeat(64));
+    // The payment went out; only the verification coverage was lost. The txid
+    // is still the LOCAL one (F19) — storage failure doesn't change identity.
+    expect(result.txid).toMatch(/^[0-9a-f]{64}$/);
     expect(result.sendRecorded).toBe(false);
     expect(vi.mocked(broadcastTx)).toHaveBeenCalledTimes(1);
   });

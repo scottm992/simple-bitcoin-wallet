@@ -1,5 +1,18 @@
 /**
- * api.ts — thin REST client for the public mempool.space API.
+ * api.ts — thin REST client for two public Esplora-shaped APIs.
+ *
+ * v1.2.0 SPLITS the base URL by concern (a trust-model change — audited pre-ship
+ * in security review Round 13, `docs/review/round1.md`: 0 blockers, F19/F20
+ * closed). CHAIN DATA (address stats / utxos / txs / one-tx fetch / broadcast) now
+ * goes to blockstream.info via {@link chainApiBaseUrl}: the owner's IP is
+ * currently HTTP-429 rate-limited by mempool.space while blockstream serves the
+ * same connection flawlessly, and blockstream's address/tx endpoints return
+ * byte-identical shapes (chain_stats / mempool_stats, same field names —
+ * live-verified), so every F2 ingest validator transfers unchanged. FEES + PRICE
+ * (getFeeEstimates / getBtcUsdPrice) stay on mempool.space via {@link apiBaseUrl}
+ * — blockstream serves a DIFFERENT fee shape (a confirmation-target map) and no
+ * price endpoint, so keeping them here leaves the F1-audited fee path
+ * byte-identical.
  *
  * Every call is network-scoped. Non-discovery GETs (fees / price / one-tx
  * fetch) get a single retry on transport failure; the DISCOVERY GETs
@@ -18,12 +31,29 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 
 /**
  * Timeout for address-discovery GETs (stats / utxos / txs). Deliberately short:
- * mempool.space stalls burst traffic until the client gives up, so a long
- * timeout turns a throttled burst into minutes of dead air. 8s per request, and
- * NO per-request retry (§1c) — a retry only piles more load onto a
- * stall-throttler — keeps a stalled lane from wedging a scan.
+ * a stall-throttler hangs burst traffic until the client gives up, so a long
+ * timeout turns a throttled burst into minutes of dead air. Kept provider-
+ * agnostic on purpose (v1.2.0 moved chain data to blockstream, which serves
+ * cleanly today, but mempool.space's stall-throttle tier — the 2026-07-09
+ * behavior — may return, and this defense must survive a future fail-back). 8s
+ * per request, and NO per-request retry (§1c) — a retry only piles more load
+ * onto a stall-throttler — keeps a stalled lane from wedging a scan.
  */
 const DISCOVERY_TIMEOUT_MS = 8_000;
+
+/**
+ * How long a discovery scan PAUSES in-run when a chain-data GET is rejected with
+ * an explicit HTTP 429 (see {@link isRateLimitError}). Sized to the field-measured
+ * token bucket (owner's IP vs mempool.space, 2026-07-10): the limiter refills at
+ * ~1 request/second, so a ~12s wait restores ~12 tokens — roughly a full scan
+ * wave — before the scan retries the paused request. Honoring the server's stated
+ * wait REDUCES offered load; it is emphatically NOT the §1c-forbidden per-request
+ * transport retry (which DOUBLED load against a silent staller that returned no
+ * error). The COUNT of pauses per run is capped by the orchestrator
+ * (`MAX_RATE_LIMIT_PAUSES`, actions.ts), so a persistent 429 wall still cuts the
+ * run onto the backoff ladder rather than parking it in a pause loop.
+ */
+export const RATE_LIMIT_PAUSE_MS = 12_000;
 
 /**
  * Fee-rate sanity window (sat/vByte) applied to untrusted estimates from
@@ -63,11 +93,35 @@ const MAX_TX_WEIGHT = 4_000_000;
  */
 const MAX_ADDRESS_LENGTH = 100;
 
-/** Base URL for the mempool.space REST API for a given network. */
+/**
+ * Base URL for the mempool.space REST API (mainnet / testnet). Since v1.2.0 this
+ * serves ONLY the fee-estimate + price path (getFeeEstimates / getBtcUsdPrice):
+ * blockstream has a different fee shape and no price endpoint, so keeping these
+ * here leaves the F1-audited fee path byte-identical. Chain data moved to
+ * {@link chainApiBaseUrl}. Also used by the Activity screen's explorer deep-link
+ * (display-only).
+ */
 export function apiBaseUrl(network: Network): string {
   return network === 'mainnet'
     ? 'https://mempool.space/api'
     : 'https://mempool.space/testnet/api';
+}
+
+/**
+ * Base URL for the CHAIN-DATA REST API (address stats / utxos / txs / one-tx
+ * fetch / broadcast). v1.2.0 points these at blockstream.info: the owner's IP is
+ * currently HTTP-429 rate-limited by mempool.space while blockstream serves the
+ * same connection flawlessly, and blockstream's Esplora address/tx endpoints
+ * return byte-identical shapes to mempool.space (chain_stats / mempool_stats,
+ * same field names — live-verified), so every F2 ingest validator below
+ * transfers unchanged. Split out from {@link apiBaseUrl} so fees/price can stay
+ * on mempool.space (see there). Trust-model change — audited pre-ship in Round
+ * 13 (`docs/review/round1.md`).
+ */
+export function chainApiBaseUrl(network: Network): string {
+  return network === 'mainnet'
+    ? 'https://blockstream.info/api'
+    : 'https://blockstream.info/testnet/api';
 }
 
 /** A transport-level failure: DNS, connection, timeout/abort, offline. */
@@ -95,11 +149,27 @@ export class ApiResponseError extends Error {
   }
 }
 
+/**
+ * Whether `err` is an explicit HTTP 429 (Too Many Requests). This is the ONE api
+ * rejection the discovery layer treats specially: a 429 is the server explicitly
+ * PRICING a wait (a token bucket refilling at ~1/s in tonight's field probes),
+ * not a silent stall. The orchestrator honors it as a bounded in-run PAUSE (see
+ * {@link RATE_LIMIT_PAUSE_MS}) that REDUCES offered load — the opposite of the
+ * §1c-forbidden transport retry, which doubled load against a stall-throttler
+ * that returns no error at all. Everything else (transport failure, any other
+ * non-2xx, a malformed body) is unaffected and propagates exactly as before.
+ */
+export function isRateLimitError(err: unknown): boolean {
+  return err instanceof ApiResponseError && err.status === 429;
+}
+
 // ---------------------------------------------------------------------------
 // Untrusted-response validation (F2)
 //
-// Every numeric/string field consumed from mempool.space is validated on ingest
-// so a hostile or buggy response surfaces as a typed ApiResponseError rather
+// Every numeric/string field consumed from an untrusted Esplora endpoint
+// (blockstream.info for chain data, mempool.space for fees/price — v1.2.0) is
+// validated on ingest so a hostile or buggy response surfaces as a typed
+// ApiResponseError rather
 // than a NaN, a thrown BigInt(), or an implausible balance wedging the wallet.
 // ---------------------------------------------------------------------------
 
@@ -374,7 +444,7 @@ export async function getAddressStats(
   address: string,
   signal?: AbortSignal,
 ): Promise<AddressStats> {
-  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/address/${encodeURIComponent(address)}`, {
+  const raw = await getJson<unknown>(`${chainApiBaseUrl(network)}/address/${encodeURIComponent(address)}`, {
     signal,
     timeoutMs: DISCOVERY_TIMEOUT_MS,
     retry: false,
@@ -408,7 +478,7 @@ export async function getUtxos(
   signal?: AbortSignal,
 ): Promise<ApiUtxo[]> {
   const raw = await getJson<unknown>(
-    `${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/utxo`,
+    `${chainApiBaseUrl(network)}/address/${encodeURIComponent(address)}/utxo`,
     { signal, timeoutMs: DISCOVERY_TIMEOUT_MS, retry: false },
   );
   const arr = asArray(raw, 'utxo list');
@@ -459,15 +529,28 @@ export async function getFeeEstimates(network: Network): Promise<FeeEstimates> {
 
 /**
  * Broadcasts a raw signed transaction. Does not retry.
+ *
+ * F19: the returned string is the RELAY'S ECHO of the txid (an Esplora relay
+ * answers a successful POST /tx with the txid as plain text) — callers must
+ * NEVER treat it as the authoritative transaction id. The txid is derivable
+ * locally from the signed bytes (`BuiltTx.txid`, tx.ts), and trusting a remote
+ * echo for a locally-derivable fact violates the F15
+ * never-trust-the-API-for-derivable-facts principle: a hostile relay could
+ * return a wrong/garbage id, poisoning the displayed id and mis-keying the F15
+ * send record. The broadcast paths in `actions.ts` therefore use `built.txid`
+ * for the record and the returned {@link BroadcastResult}; the body is kept
+ * ONLY for error surfacing on non-2xx (unchanged) and as a diagnostic echo — a
+ * divergent echo on success is deliberately NOT a failure mode.
+ *
  * @param network - The active network.
  * @param txHex - The serialized transaction (hex).
- * @returns The broadcast transaction id.
+ * @returns The relay's response body (its echo of the txid) — diagnostics only.
  * @throws {ApiResponseError} With the API's error text on rejection.
  * @throws {ApiNetworkError} On transport failure.
  */
 export async function broadcastTx(network: Network, txHex: string): Promise<string> {
   const res = await fetchOnce(
-    `${apiBaseUrl(network)}/tx`,
+    `${chainApiBaseUrl(network)}/tx`,
     { method: 'POST', body: txHex, headers: { 'Content-Type': 'text/plain' } },
     DEFAULT_TIMEOUT_MS,
   );
@@ -475,7 +558,7 @@ export async function broadcastTx(network: Network, txHex: string): Promise<stri
   if (!res.ok) {
     throw new ApiResponseError(res.status, body);
   }
-  return body; // mempool.space returns the txid as plain text
+  return body; // the relay's txid echo — never authoritative (F19, see above)
 }
 
 /**
@@ -493,7 +576,7 @@ export async function getAddressTxs(
   signal?: AbortSignal,
 ): Promise<AddressTx[]> {
   const raw = await getJson<unknown>(
-    `${apiBaseUrl(network)}/address/${encodeURIComponent(address)}/txs`,
+    `${chainApiBaseUrl(network)}/address/${encodeURIComponent(address)}/txs`,
     { signal, timeoutMs: DISCOVERY_TIMEOUT_MS, retry: false },
   );
   const arr = asArray(raw, 'tx list');
@@ -559,7 +642,7 @@ export async function getTransaction(
   if (!/^[0-9a-f]{64}$/.test(txidArg)) {
     throw new ApiResponseError(400, 'Invalid txid argument (expected 64 lowercase hex chars)');
   }
-  const raw = await getJson<unknown>(`${apiBaseUrl(network)}/tx/${txidArg}`, { signal });
+  const raw = await getJson<unknown>(`${chainApiBaseUrl(network)}/tx/${txidArg}`, { signal });
   const obj = asObject(raw, 'transaction');
 
   const responseTxid = txid(obj['txid'], 'tx txid');

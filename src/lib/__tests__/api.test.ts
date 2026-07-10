@@ -15,6 +15,9 @@ import {
   getUtxos,
   getAddressTxs,
   getBtcUsdPrice,
+  broadcastTx,
+  getTransaction,
+  isRateLimitError,
   ApiNetworkError,
   ApiResponseError,
   MAX_ACCEPTED_FEE_RATE,
@@ -33,6 +36,19 @@ function mockFetchJson(body: unknown): void {
 /** Installs a fetch stub that returns raw text (for non-JSON bodies). */
 function mockFetchText(text: string): void {
   vi.stubGlobal('fetch', vi.fn(async () => new Response(text, { status: 200 })));
+}
+
+/**
+ * Installs a fetch stub that RECORDS its (url, init) arguments and returns
+ * `body` with status 200. Used by the URL-split tests to pin which host each
+ * endpoint targets.
+ */
+function captureFetch(body: string): ReturnType<typeof vi.fn> {
+  const mock = vi.fn((_url: string, _init?: RequestInit) =>
+    Promise.resolve(new Response(body, { status: 200 })),
+  );
+  vi.stubGlobal('fetch', mock);
+  return mock;
 }
 
 afterEach(() => {
@@ -145,6 +161,108 @@ describe('getBtcUsdPrice — response validation (F2)', () => {
   it('accepts a plausible price', async () => {
     mockFetchJson({ USD: 62_500 });
     await expect(getBtcUsdPrice()).resolves.toBe(62_500);
+  });
+});
+
+// --- v1.2.0: chain data → blockstream.info, fees/price → mempool.space -------
+
+describe('chain-data / fee-price URL split (v1.2.0)', () => {
+  it('chain-data endpoints hit the blockstream.info base (both networks)', async () => {
+    // Address stats — mainnet then testnet on ONE recording mock.
+    let m = captureFetch(
+      JSON.stringify({
+        chain_stats: { funded_txo_sum: 0, spent_txo_sum: 0 },
+        mempool_stats: { funded_txo_sum: 0, spent_txo_sum: 0 },
+      }),
+    );
+    await getAddressStats('mainnet', 'bc1qexample');
+    expect(String(m.mock.calls[0]?.[0])).toBe('https://blockstream.info/api/address/bc1qexample');
+    await getAddressStats('testnet', 'bc1qexample');
+    expect(String(m.mock.calls[1]?.[0])).toBe(
+      'https://blockstream.info/testnet/api/address/bc1qexample',
+    );
+
+    // UTXOs.
+    m = captureFetch('[]');
+    await getUtxos('mainnet', 'bc1qexample');
+    expect(String(m.mock.calls[0]?.[0])).toBe(
+      'https://blockstream.info/api/address/bc1qexample/utxo',
+    );
+
+    // Address txs.
+    m = captureFetch('[]');
+    await getAddressTxs('mainnet', 'bc1qexample');
+    expect(String(m.mock.calls[0]?.[0])).toBe(
+      'https://blockstream.info/api/address/bc1qexample/txs',
+    );
+
+    // Broadcast (POST) — chain data too.
+    m = captureFetch('f'.repeat(64));
+    await broadcastTx('mainnet', 'deadbeef');
+    expect(String(m.mock.calls[0]?.[0])).toBe('https://blockstream.info/api/tx');
+    expect(m.mock.calls[0]?.[1]?.method).toBe('POST');
+  });
+
+  it('fee + price endpoints STILL hit mempool.space (F1 fee path unmoved)', async () => {
+    let m = captureFetch(JSON.stringify({ fastestFee: 5, halfHourFee: 3, hourFee: 1 }));
+    await getFeeEstimates('mainnet');
+    expect(String(m.mock.calls[0]?.[0])).toBe('https://mempool.space/api/v1/fees/recommended');
+    await getFeeEstimates('testnet');
+    expect(String(m.mock.calls[1]?.[0])).toBe(
+      'https://mempool.space/testnet/api/v1/fees/recommended',
+    );
+
+    m = captureFetch(JSON.stringify({ USD: 60_000 }));
+    await getBtcUsdPrice();
+    expect(String(m.mock.calls[0]?.[0])).toBe('https://mempool.space/api/v1/prices');
+  });
+});
+
+// --- v1.2.0: HTTP 429 — the pause lives ABOVE the api layer -----------------
+
+describe('HTTP 429 (v1.2.0)', () => {
+  it('isRateLimitError is true ONLY for a 429 ApiResponseError', () => {
+    expect(isRateLimitError(new ApiResponseError(429, 'Too Many Requests'))).toBe(true);
+    expect(isRateLimitError(new ApiResponseError(503, 'busy'))).toBe(false);
+    expect(isRateLimitError(new ApiNetworkError('stalled'))).toBe(false);
+    expect(isRateLimitError(new Error('nope'))).toBe(false);
+    expect(isRateLimitError(undefined)).toBe(false);
+  });
+
+  it('a 429 on broadcast / getTransaction / fees still THROWS a typed ApiResponseError (no pause here)', async () => {
+    // The polite in-run pause is orchestrated in the discovery layer, NOT the api
+    // layer: these non-discovery-wrapped calls surface a 429 exactly as any other
+    // non-2xx, with no retry and no delay.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('Too Many Requests', { status: 429 })),
+    );
+    await expect(broadcastTx('mainnet', 'deadbeef')).rejects.toMatchObject({ status: 429 });
+    await expect(getFeeEstimates('mainnet')).rejects.toBeInstanceOf(ApiResponseError);
+    await expect(getTransaction('mainnet', 'ab'.repeat(32))).rejects.toMatchObject({ status: 429 });
+  });
+});
+
+// --- F19: broadcast error surfacing is unchanged -----------------------------
+
+describe('broadcastTx — error surfacing (F19 non-regression)', () => {
+  it('a non-2xx rejection still carries the relay status AND body text exactly as before', async () => {
+    // F19 demotes the SUCCESS body to a diagnostic echo (actions.ts uses the
+    // locally computed BuiltTx.txid); the FAILURE body is still read and
+    // surfaced verbatim — no new failure mode, no changed one.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response('sendrawtransaction RPC error: bad-txns-inputs-missingorspent', {
+            status: 400,
+          }),
+      ),
+    );
+    await expect(broadcastTx('mainnet', 'deadbeef')).rejects.toMatchObject({
+      status: 400,
+      body: 'sendrawtransaction RPC error: bad-txns-inputs-missingorspent',
+    });
   });
 });
 

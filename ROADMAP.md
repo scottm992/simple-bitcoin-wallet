@@ -3,6 +3,57 @@
 Where Simple Bitcoin Wallet could go from v1.0 (July 2026). Items are ordered
 by value-for-effort within each phase; nothing here is committed work.
 
+## v1.2.0 — 🚧 built 2026-07-10, Round-13 audited pre-ship: blockstream.info is the chain-data source
+
+> ✅ **ROUND 13 SECURITY AUDIT: RAN PRE-SHIP, 2026-07-10 — verdict SHIP, 0
+> blockers.** The audit was briefly deferred while the owner was out of credits
+> (this banner used to say "OWED"); credits were restored and the full round ran
+> on `blockstream-primary` BEFORE any merge to `main`. Findings — **both CLOSED
+> pre-merge, same day:** **F19 (Low)** — the broadcast response body was trusted
+> as the txid (fail-closed); fixed: both broadcast paths now key the F15 record
+> and the returned id on the locally-computed `BuiltTx.txid`, with the relay's
+> echo demoted to diagnostics (294 tests, F19 suite pins a lying relay end to
+> end) — and **F20 (Info)** — the convergence-honesty comments overstated the
+> poll's mid-convergence reach; corrected in source + ENGINE.md (detection is one
+> poll cycle after the next COMPLETE snapshot, not after arrival). Full report:
+> `docs/review/round1.md`, "Round 13". v1.2.0 may be treated as audited; next
+> finding number is F21.
+
+**Owner field evidence, 2026-07-10:** mempool.space now rate-limits the owner's
+IP with bare HTTP **429s** (no `Retry-After`; a token bucket ≈25–40 refilling
+≈1/s), while blockstream.info serves the same connection flawlessly (0.2–0.3s).
+The app treated a 429 as a fatal run error, so scans died and the frontier
+**regressed** ("stuck at 22 of 40"). Three changes, four commits:
+
+- **Chain data → blockstream.info** (`chainApiBaseUrl`): address stats / utxos /
+  txs / one-tx fetch / broadcast now hit blockstream (byte-identical Esplora
+  shapes, so F2 validators transfer unchanged). **Fees + USD price stay
+  mempool.space** — the F1-audited fee path is byte-identical, and blockstream has
+  a different fee shape and no price. CSP `connect-src` gains blockstream (keeps
+  mempool.space). `public/sw.js` untouched (cross-origin passthrough by design).
+- **HTTP 429 = a polite in-run PAUSE, not a dead run:** a discovery chain-data GET
+  that 429s pauses ~12s (`RATE_LIMIT_PAUSE_MS`, sized to the ≈1/s refill) and
+  retries, up to `MAX_RATE_LIMIT_PAUSES = 3` per run; the inactivity cutoff is
+  suspended for the deliberate wait, the 120s hard cap still binds. NOT the §1c
+  transport retry — a 429 is a server-priced wait, and honoring a bounded number
+  REDUCES offered load.
+- **Convergence-scoped cache TTL:** while an account is still converging (no full
+  scan completed since the cache was created/invalidated) entries no longer expire
+  by the 100s TTL, so ladder-spaced resumes converge instead of regressing; a
+  completed full scan restores the normal TTL. Every change-signal invalidation
+  still nukes the cache instantly in both modes (generation-fenced, F16).
+
+Built with `tsc` clean and the full suite green (279 → 290 tests). **Round 13
+attacked** the second-endpoint trust surface (validators confirmed byte-identical;
+a lying blockstream is display-only + broadcast-relay, F15 unbroken — the one
+crack is the broadcast-returned txid, F19 Low, fail-closed); the 429-pause
+interplay with the inactivity suspension, hard cap, abort discipline, and the F16
+generation guard (all held at deterministic interleavings; the §1c ruling:
+compliant — a bounded server-priced pause REDUCES offered load); and the
+convergence-TTL honesty argument (understate-only, honest cue throughout;
+detection is one poll cycle after COMPLETION, not after arrival — F20 Info, doc
+correction).
+
 ## v1.1.1 — ✅ shipped 2026-07-10: discovery retry loop self-throttles the API
 
 **Fixed and shipped** (security review round 9; F16/F17 found and closed; 261
@@ -101,12 +152,14 @@ network behaves byte-identically to v1.1.1.
 
 ## v1.2 — Trust hardening
 
-- **Second chain-data source** — *(being pulled forward to v1.1.2 — see the
-  v1.1.1 section above)* add an Esplora-compatible fallback (e.g.
-  blockstream.info) used when mempool.space is unreachable or throttling,
-  and optionally cross-check displayed balances between the two. Directly
-  shrinks the "trusts one endpoint for display" caveat and the throttling
-  failure mode found in field testing — which bit for real on 2026-07-09.
+- **Second chain-data source** — 🚧 **partially realized in v1.2.0 (see above):**
+  blockstream.info is now the PRIMARY chain-data source (mempool.space kept for
+  fees + price), which addresses the 429 throttling that bit for real on
+  2026-07-10. **Still future:** true FAILOVER architecture (automatic switch when
+  the primary is unreachable/throttling) and the optional cross-check of displayed
+  balances between the two — today it is a straight primary swap, not a resilient
+  multi-source layer (Round 13 audited the swap; either extension gets its own
+  review round).
 - **Smarter password strength** — a proper local estimator (zxcvbn-class,
   vendored/audited) instead of the current heuristic; still no server, still
   plain-English guidance.

@@ -63,9 +63,29 @@ the mnemonic in at call time and let it go out of scope.
 
 ---
 
-## `api.ts` — mempool.space REST client
+## `api.ts` — Esplora REST client (two hosts, v1.2.0)
 
-Every call takes `network: Network` first. Non-discovery GETs (fees / price / one-tx fetch) retry once on transport failure after a short jittered backoff (300–800 ms). **Discovery GETs (stats/utxos/txs) do NOT retry (§1c, v1.1.1)** — against a stall-throttler a per-request retry just doubles offered load; the run-level self-heal is their retry. Broadcast never retries. Discovery GETs use an 8s timeout and accept an optional `AbortSignal` so a whole discovery run can be cancelled; other calls use 15s.
+Every call takes `network: Network` first. **v1.2.0 SPLITS the base URL by
+concern (trust-model change — audited pre-ship in Round 13,
+`docs/review/round1.md`: 0 blockers, F19/F20 closed):** CHAIN DATA (address stats /
+utxos / txs / one-tx fetch / broadcast) goes to **blockstream.info** via
+`chainApiBaseUrl`, while FEES + PRICE (`getFeeEstimates` / `getBtcUsdPrice`) stay
+on **mempool.space** via `apiBaseUrl`. Blockstream's Esplora address/tx shapes are
+byte-identical to mempool.space (`chain_stats` / `mempool_stats`, same field
+names — live-verified), so every F2 ingest validator transfers unchanged;
+mempool.space is kept for fees/price because blockstream has a different fee shape
+and no price endpoint, leaving the F1-audited fee path byte-identical.
+
+Non-discovery GETs (fees / price / one-tx fetch) retry once on transport failure after a short jittered backoff (300–800 ms). **Discovery GETs (stats/utxos/txs) do NOT retry (§1c, v1.1.1)** — against a stall-throttler a per-request retry just doubles offered load; the run-level self-heal is their retry. Broadcast never retries. Discovery GETs use an 8s timeout and accept an optional `AbortSignal` so a whole discovery run can be cancelled; other calls use 15s.
+
+**HTTP 429 = a polite in-run PAUSE (v1.2.0), never a per-request retry.** A 429 is
+the server explicitly pricing a wait (a token bucket ≈1/s in field probes), so the
+discovery orchestrator honors it as a bounded pause rather than a dead run — see
+`isRateLimitError`, `RATE_LIMIT_PAUSE_MS`, and the `account.ts`/`actions.ts`
+wiring below. This is the OPPOSITE of the §1c-forbidden transport retry: honoring
+a bounded number of 429s REDUCES offered load. Only stats/utxos/txs are wrapped;
+a 429 on broadcast / getTransaction / fees / price throws exactly as any other
+non-2xx.
 
 **Types**
 - `AddressStats { confirmedSats; pendingSats; fundedSats; spentSats }` (all `bigint`)
@@ -79,12 +99,16 @@ Every call takes `network: Network` first. Non-discovery GETs (fees / price / on
 
 **Errors**: `ApiNetworkError` (`.cause`) — transport; `ApiResponseError` (`.status`, `.body`) — non-2xx **or** malformed/out-of-range response.
 
+**429 constant (v1.2.0)**: `RATE_LIMIT_PAUSE_MS = 12_000` — how long a discovery scan pauses in-run on a 429 (sized to the ≈1/s bucket refill); the per-run pause budget lives in `actions.ts` (`MAX_RATE_LIMIT_PAUSES`).
+
 **Functions**
-- `apiBaseUrl(network): string`
+- `apiBaseUrl(network): string` — mempool.space base; v1.2.0 serves ONLY fees + price (also the Activity explorer deep-link).
+- `chainApiBaseUrl(network): string` — **v1.2.0** blockstream.info base for chain data (stats / utxos / txs / one-tx / broadcast).
+- `isRateLimitError(err): boolean` — **v1.2.0** true iff `err` is an `ApiResponseError` with `status === 429`; the discovery layer's signal to pause rather than die.
 - `getAddressStats(network, address, signal?): Promise<AddressStats>`
 - `getUtxos(network, address, signal?): Promise<ApiUtxo[]>`
 - `getFeeEstimates(network): Promise<FeeEstimates>`
-- `broadcastTx(network, txHex): Promise<string>` — returns txid; surfaces API error text.
+- `broadcastTx(network, txHex): Promise<string>` — returns the RELAY'S ECHO of the txid, diagnostics only (**F19**: never authoritative — the true txid is the locally-computed `BuiltTx.txid`, which the `actions.ts` broadcast paths use for the F15 record and the returned `BroadcastResult`; a divergent echo on success is deliberately not a failure mode). Surfaces API error text on non-2xx (unchanged).
 - `getAddressTxs(network, address, signal?): Promise<AddressTx[]>`
 - `getTransaction(network, txid, signal?): Promise<ApiTransaction>` — one transaction by id (the Speed-up flow's data source; ONE request). The txid ARGUMENT is validated (64-hex) BEFORE the URL is built (status-400 `ApiResponseError`, no request made). F2 ingest validation on every consumed field: `status.confirmed` boolean; `fee` sat-range; `weight` positive integer ≤ 4M (vsize = `ceil(weight/4)`); vin/vout arrays 1–200 entries; per-vin 64-hex txid, non-negative vout, u32 `sequence`, no duplicate outpoints; sat-range values; length-capped address strings. `vin[].prevout` (absent on coinbase) and address fields (absent on nonstandard scripts) are OPTIONAL by type — the same esplora shape serves both networks (live-verified), so validation is never flaky across networks. Cross-field integrity: the response's txid must equal the request, and when every input carries a prevout, `fee` must equal inputs − outputs exactly.
   - `ApiTransaction { txid; confirmed; feeSats: bigint; weight; vsize; vin: ApiTxVin[]; vout: ApiTxVout[] }`; `ApiTxVin { txid; vout; sequence; prevout?: ApiTxPrevout }`; `ApiTxPrevout { value: bigint; address? }`; `ApiTxVout { value: bigint; address? }`
@@ -172,6 +196,16 @@ landing" from "wedged" and cuts progressing runs). **Backoff ladder (§1a/§b):*
 made progress becomes eligible again this fast, see `DiscoveryController`),
 `QUICK_RETRY_BUDGET = 5` (F18 — max quick windows grantable between complete
 snapshots; once spent, every subsequent cut walks the full ladder).
+**429 in-run pause (v1.2.0):** `MAX_RATE_LIMIT_PAUSES = 3` — per-run cap on
+server-priced HTTP-429 pauses (each waits `RATE_LIMIT_PAUSE_MS ≈ 12s`, api.ts, and
+retries). Past the cap the run is cut exactly as a stall is; while a pause is
+active the INACTIVITY cutoff is SUSPENDED (a deliberate wait is not a stall) but
+the HARD CAP still binds, so a pathological pause loop is cut at 120s. This is NOT
+the §1c transport retry — a 429 is a server-priced wait and honoring a bounded
+number REDUCES offered load. Wired via a `startDiscovery` `onRateLimitPause` hook
+(shared across both phases, so the budget is per-RUN) that grants a release
+callback or denies with `null`; `account.ts` `withRateLimitPause` does the wait +
+retry. `maxRateLimitPauses` is injectable in `startDiscovery` for tests.
 
 **Single-run pacing (Stage 2, v1.1.1).** The chain scan (`account.ts`
 `scanChain`) runs at `concurrency = 2` (down from 4) with a jittered
@@ -203,18 +237,38 @@ paced — pacing is skipped by zero-fetch, never by index-below-mark.
 localStorage / disk / across sessions**. Because it survives across runs, a run
 the deadline cut at 25/40 RESUMES and pays only the remaining ~15 instead of
 re-bursting all 40 forever; the scan converges across attempts. Two safeguards
-keep it honest: every entry carries a `SCAN_CACHE_TTL_MS` (~100s) TTL (a stale
-response is ignored and re-fetched), and **every on-chain change signal must
-call `invalidateScanCache(network?)`** — a cached "unused" answer must never
-un-detect a payment the poll just found (§7). Invalidation call sites: the cheap
-poll detecting movement (BEFORE the refresh it triggers), a successful broadcast
-(`signAndBroadcast`/`bumpAndBroadcast`), a network switch (the target network),
-and lock (all networks, no arg). `pollAccount` reads `getAddressStats` directly
-(UNCACHED) so it always sees fresh movement. Phase 2 still EVALUATES every index
-from 0 (F12) — only response reuse changes; `complete=true` only ever comes from
-a full gap-20 evaluation.
+keep it honest: entries carry a `SCAN_CACHE_TTL_MS` (~100s) TTL (a stale response
+is ignored and re-fetched — but see convergence-scoped lifetime below), and
+**every on-chain change signal must call `invalidateScanCache(network?)`** — a
+cached "unused" answer must never un-detect a payment the poll just found (§7).
+Invalidation call sites: the cheap poll detecting movement (BEFORE the refresh it
+triggers), a successful broadcast (`signAndBroadcast`/`bumpAndBroadcast`), a
+network switch (the target network), and lock (all networks, no arg).
+`pollAccount` reads `getAddressStats` directly (UNCACHED) so it always sees fresh
+movement. Phase 2 still EVALUATES every index from 0 (F12) — only response reuse
+changes; `complete=true` only ever comes from a full gap-20 evaluation.
 
-- `startDiscovery({ network, onSnapshot, onError, onProgress?, inactivityMs?, hardCapMs?, deadlineMs? }): DiscoveryHandle`
+**Convergence-scoped cache lifetime (v1.2.0 — `ScanCache.complete` /
+`markComplete()`).** The ~100s TTL applies ONLY once the account has completed a
+full scan. While still CONVERGING (no full gap-20 scan has completed since the
+cache was created or last invalidated) entries do NOT expire — the frontier only
+advances, so a ladder-spaced resume must be able to reuse a landing older than the
+TTL, or entries die faster than the ladder retries arrive and the scan REGRESSES
+(the 2026-07-10 field bug, stuck at "22 of 40"). `startDiscovery` calls
+`cache.markComplete()` where the complete phase-2 snapshot is persisted (guarded by
+the `externallyAborted` check), flipping the cache to normal-TTL mode; `clear()`
+resets it straight back to converging (so every invalidation still nukes the cache
+instantly in BOTH modes, generation-fenced F16). **Honesty bound (F20-corrected,
+Round 13):** while converging, staleness is bounded by convergence itself — the
+snapshot is flagged incomplete (honest cue up throughout) and a payment hidden by
+a stale "unused" entry is an UNDERSTATE only, never an overstate. The cheap
+uncached poll does NOT run while the snapshot is incomplete (`pollTick` takes the
+self-heal branch instead — running the 2-request poll there would add offered load
+against the very endpoint discipline this cache protects), so a payment arriving
+mid-convergence is detected within one poll cycle of the next COMPLETE snapshot,
+not of its arrival.
+
+- `startDiscovery({ network, onSnapshot, onError, onProgress?, inactivityMs?, hardCapMs?, deadlineMs?, waveDelayMs?, maxRateLimitPauses? }): DiscoveryHandle`
   — one two-phase run. **Phase 1** (first paint): fast gap-5 scan anchored at the
   cached high-water marks. **Phase 2** (correctness): extends to the full gap-20
   scan from index 0, reusing every response still fresh in the per-network
@@ -316,11 +370,15 @@ a full gap-20 evaluation.
   `[MIN_ACCEPTED_FEE_RATE, MAX_ACCEPTED_FEE_RATE]` (F1), and
   `signAndBroadcast(params): Promise<BroadcastResult>` — reads the mnemonic at
   call time, never returns it; idempotent on retry (same UTXO set + params ⇒
-  same signed tx; mempool.space treats re-broadcast of an accepted tx as
+  same signed tx; an Esplora relay treats re-broadcast of an accepted tx as
   success). `allowHighFee` bypasses only the 25% consent rule, never the hard
   rate/absolute caps (F10). After a successful broadcast it writes the F15 send
-  record (returned txid → user-confirmed recipient + exact recipient-output
-  amount). `BroadcastResult { txid; sendRecorded }` — `sendRecorded: false`
+  record, keyed by the **LOCALLY computed `built.txid`** (**F19** — never the
+  relay's echo; the txid is derivable from the signed bytes, so trusting a
+  remote echo for it would let a hostile relay mis-key the record and silently
+  void Speed-up coverage) → user-confirmed recipient + exact recipient-output
+  amount. `BroadcastResult { txid; sendRecorded }` — `txid` is that same local
+  `built.txid`; `sendRecorded: false`
   means the best-effort record write failed: the payment is unaffected but
   cannot later be sped up (`'unverified'`).
 - `prepareBump(network, txid, account, signal?): Promise<PreparedBump>` — the
@@ -351,7 +409,8 @@ a full gap-20 evaluation.
   `buildRbfBumpTx`, broadcasts. Same idempotency argument as `signAndBroadcast`
   (deterministic signatures ⇒ a retry re-broadcasts the identical replacement
   and rewrites an identical record). Writes the replacement's OWN F15 record
-  (returned txid → the verified recipient + the replacement's actual
+  (keyed by the LOCAL `built.txid`, F19 — same rule as `signAndBroadcast` — →
+  the verified recipient + the replacement's actual
   recipient-output amount, reduced for a sweep), so a bump of a bump verifies
   against the replacement's record — the chain of trust runs unbroken back to
   the user's original confirmation. The new fee rate comes from the existing
