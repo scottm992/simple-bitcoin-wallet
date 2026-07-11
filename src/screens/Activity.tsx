@@ -53,8 +53,29 @@ export function Activity(props: {
   onBumpConfirm: (prepared: PreparedBump, feeRateSatVb: number, allowHighFee: boolean) => Promise<void>;
   onBack: () => void;
   onRefresh: () => void;
+  /**
+   * A transaction to open the detail sheet for ON ARRIVAL — set when the user
+   * tapped a specific row on Home (which navigates here). One-shot: consumed
+   * via {@link onInitialTxidShown} so closing the sheet or leaving and coming
+   * back never re-opens it. Unknown txid (the list refreshed between tap and
+   * mount) degrades to the plain list.
+   */
+  initialTxid?: string | null;
+  /** Called once after mount when `initialTxid` was provided (consumed). */
+  onInitialTxidShown?: () => void;
 }): JSX.Element {
-  const [selected, setSelected] = useState<ActivityItem | null>(null);
+  const [selected, setSelected] = useState<ActivityItem | null>(
+    // Seeded from the Home tap (if any): the user asked for THIS payment's
+    // details, not the list — landing on the list instead was the bug.
+    () => props.items.find((i) => i.txid === props.initialTxid) ?? null,
+  );
+  const consumeInitial = props.onInitialTxidShown;
+  const hadInitial = props.initialTxid != null;
+  useEffect(() => {
+    if (hadInitial) consumeInitial?.();
+    // One-shot on mount by design (the seed above only runs on first render).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Build ordered groups preserving the newest-first order of items.
   const groups: { label: string; items: ActivityItem[] }[] = [];
