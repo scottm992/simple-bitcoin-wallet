@@ -2394,3 +2394,106 @@ construction. The diff is exactly the one string + its comment in
 the live-region markup are byte-untouched, so every Round-15 probe result
 stands. Gates re-run on `39e9095`: `tsc --noEmit` clean, `npm test` = **331
 passing**. **SHIP** stands. Next finding number: **F23**.
+
+---
+
+# Round 16 — Drained wallet keeps its history (display-only)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 0**
+
+Deliberately LIGHT round, PM-authored fix (independent eyes are the point), scoped to the
+single commit `29e8ec1` on `drained-wallet-history`: draining the wallet (balance to zero)
+swapped Home's activity list for the get-started nudge, hiding the just-sent payment. Fix:
+`isEmpty` in `src/screens/Home.tsx` gains one conjunct — `activity.length === 0` — so
+"empty" means NEVER USED, not merely zero balance; the `activity` derivation moved above
+`isEmpty` (same expression, hoisted only). Diff = exactly two files (`src/screens/Home.tsx`,
+`src/__tests__/Home.updating.test.tsx` +3 tests) — nothing else re-audited. Gates:
+`npm test` = **334 passing** (331 baseline + the 3 shipped), `tsc --noEmit` clean,
+`npm run build` clean, dist CSP byte-identical to Rounds 13–15 (`connect-src 'self'
+https://mempool.space https://blockstream.info; script-src 'self'; object-src 'none';
+base-uri 'self'; form-action 'none'`), no `console.*` in the diff, no new deps, `public/`
+and `index.html` untouched (no `CACHE_NAME` bump owed). Zero live API calls. Verified with
+throwaway `r16.review.test.tsx` (6 probes, executed, deleted) plus a red-check.
+
+## The monotonicity argument (why this can't regress §1e)
+
+The fix ADDS a conjunct: `isEmpty_new = isEmpty_old && activity.length === 0`. So relative
+to main, `isEmpty` can only flip true→false, never false→true — the nudge shows in a strict
+SUBSET of the states it showed in before. Any state that could flash the nudge post-fix
+already flashed it pre-fix; the change cannot mint a new flicker path. And within one
+snapshot, `activity` comes from the SAME `props.account` object the §1e gate already keys
+on (`account !== null`, untouched), so across a background refresh — which flips
+`accountStatus` while KEEPING the snapshot — every term of `isEmpty` is constant.
+`accountStatus` still appears nowhere in the expression.
+
+## Per-attack-point verdicts
+
+- **1. Edge states of the new conjunct — ALL ADJUDICATED, none reachable-and-wrong.**
+  *Drained (activity non-empty, totals zero):* the fix target — activity list stays, nudge
+  gone (shipped tests + probe, including with the F12 checking cue up; see point 4).
+  *Used-but-no-activity (usedAddresses non-empty, activity empty, totals zero):* UNREACHABLE
+  from a consistent API view — `isUsed` requires funded>0 ∨ spent>0 ∨ pending≠0; a
+  pending-only address makes `pendingSats ≠ 0` (nudge blocked by the existing pending term),
+  and a drained address has confirmed txs, which `discoverAccount` fetches for EVERY used
+  address (`getAddressTxs` over `usedDerived`, account.ts:679-685) before any snapshot is
+  returned — a failed txs fetch throws `AccountDiscoveryError` and no snapshot dispatches at
+  all. Reachable only via a transient stats/txs provider inconsistency, in which case the
+  nudge shows — EXACTLY as it did pre-fix (totals zero), so the diff changes nothing in that
+  corner; self-heals on the next poll; covered by Round 13's endpoint-trust verdict. Probed
+  to pin the unchanged behavior. No number.
+  *Account null:* `isEmpty` still requires `account !== null` — skeleton path byte-unchanged
+  (probed).
+  *Post-send clamp state (confirmed covers outgoing pending, net zero):* `pending ≠ 0n`
+  blocked the nudge pre-fix and still does; activity now also blocks it (probed).
+- **2. Phase-1 activity adjudication — PHASE 1 POPULATES ACTIVITY; no nudge flash between
+  phases for a known wallet.** Phase 1 is not a stats-only pass: it is a full
+  `discoverAccount` call at `FAST_GAP_LIMIT=5` (actions.ts:426), and `discoverAccount`
+  unconditionally fetches UTXOs AND merged activity for every used address before returning
+  (account.ts:665-685) — a phase-1 snapshot structurally cannot carry used addresses with
+  unfetched activity. For a drained wallet already seen on this device, the persisted
+  high-water marks (`persistScanMarks` on every snapshot, `getCachedHighWater` seeding every
+  run) force phase 1 to scan 0..high-water unconditionally (scanChain's `index <= highWater`
+  arm), so it finds every previously-known used address and its history — the phase-1
+  snapshot that REPLACES the on-screen account mid-refresh (`accountLoaded` swaps the whole
+  snapshot, state.ts:265-271) arrives with activity non-empty and `isEmpty` stays false
+  through the phase-1→phase-2 window. The one residual: a wallet whose used addresses ALL
+  sit past the gap-5 window with NO cached high-water (fresh device/cleared storage +
+  non-sequential address use from a foreign wallet) gets a used-nothing phase-1 snapshot →
+  nudge until phase 2 — but that snapshot also has zero totals, so pre-fix showed the nudge
+  in the identical window (the monotonicity argument): pre-existing first-load behavior, not
+  a regression, honest cue (F12) up throughout.
+- **3. §1e no-flicker survives — CONFIRMED, and the drained case now pins it.** The two
+  original §1e tests (fresh nudge holds through `loading`; funded activity holds through
+  `loading`) run unmodified in the 334; the new drained §1e test adds the third state. Probe
+  extended it across the F12 interplay: drained + INCOMPLETE snapshot with the active-scan
+  cue up, and with the backed-off tappable cue up — history stays, nudge stays away, cue
+  renders beside it (the F12 visibility gate `account !== null && !accountComplete` is
+  byte-untouched). Fresh wallet + incomplete snapshot still shows nudge + cue coexisting,
+  unchanged from main.
+- **4. Display-only — CONFIRMED by diff scope.** `git diff main..drained-wallet-history
+  --name-only` = the two files, full stop. No hunks in `src/lib/`, `src/actions.ts`,
+  `src/state.ts`, `src/App.tsx`, strings, css, `public/`, or `index.html`; no request path,
+  no state shape, no engine, no new strings. The Home.tsx hunk is one hoisted derivation +
+  one added conjunct + comments.
+
+## Red-check (the drained tests genuinely pin the pre-fix failure)
+
+Main's `Home.tsx` was checked out into the working tree (tests kept from the branch):
+exactly the two drained tests FAIL — both with the nudge copy ("Your wallet is empty —
+let's fix that") painted where "Recent activity" was asserted — and the third (fresh wallet
+still nudges) plus all 9 pre-existing tests in the file PASS. Fixed `Home.tsx` restored from
+HEAD; tree clean. The regression tests are live, not tautological.
+
+## Ship recommendation
+
+**SHIP.** The fix is exactly its one-line claim: a strictly-narrowing display condition
+whose new term is derived from the same stable snapshot the §1e gate already trusts. The
+drained wallet — the owner's field report — keeps its history through ready, loading, and
+both F12 cue states; the fresh-wallet nudge is preserved; every anomalous corner either
+cannot occur from consistent chain data or behaves byte-identically to main. Zero findings.
+
+_Round-16 throwaway tests used the `.review.test.tsx` suffix, were executed, and were
+deleted; the only file modified is this `docs/review/round1.md`, committed on
+`drained-wallet-history` (not pushed). Zero live API calls this round. Gates confirmed on
+the clean tree: `tsc --noEmit` clean, `npm test` = 334 passing, `npm run build` clean, dist
+CSP unchanged. Next finding number: **F23**._
