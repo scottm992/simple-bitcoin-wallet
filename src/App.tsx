@@ -102,6 +102,11 @@ export default function App(): JSX.Element {
   // Display unit for the balance (remembered per session).
   const [unit, setUnit] = useState<DisplayUnit>('usd');
   const [firstHomeVisit, setFirstHomeVisit] = useState(true);
+  // The payment a Home row tap asked to see: Activity opens its detail sheet
+  // for this txid on arrival, then consumes it (one-shot). Null for every
+  // other route into Activity (See all, the Sent screen) — those land on the
+  // plain list. Fixes the tap-a-row-get-the-list bug (owner report).
+  const [activityFocusTxid, setActivityFocusTxid] = useState<string | null>(null);
 
   // F6: client-side throttle on wrong-password unlock attempts. This is NOT a
   // real security boundary — a determined attacker copies the vault and brute-
@@ -689,7 +694,10 @@ export default function App(): JSX.Element {
             onReceive={() => dispatch({ type: 'navigate', screen: 'receive' })}
             onSend={() => dispatch({ type: 'navigate', screen: 'send' })}
             onSeeAll={() => dispatch({ type: 'navigate', screen: 'activity' })}
-            onOpenActivity={() => dispatch({ type: 'navigate', screen: 'activity' })}
+            onOpenActivity={(txid) => {
+              setActivityFocusTxid(txid);
+              dispatch({ type: 'navigate', screen: 'activity' });
+            }}
             onSettings={() => {
               setFirstHomeVisit(false);
               dispatch({ type: 'navigate', screen: 'settings' });
@@ -723,7 +731,10 @@ export default function App(): JSX.Element {
               onReceive={() => dispatch({ type: 'navigate', screen: 'receive' })}
               onSend={() => dispatch({ type: 'navigate', screen: 'send' })}
               onSeeAll={() => dispatch({ type: 'navigate', screen: 'activity' })}
-              onOpenActivity={() => dispatch({ type: 'navigate', screen: 'activity' })}
+              onOpenActivity={(txid) => {
+                setActivityFocusTxid(txid);
+                dispatch({ type: 'navigate', screen: 'activity' });
+              }}
               onSettings={() => dispatch({ type: 'navigate', screen: 'settings' })}
               onRefresh={() => void refreshAll()}
             />
@@ -801,6 +812,8 @@ export default function App(): JSX.Element {
             onBumpConfirm={speedUpConfirm}
             onBack={goHome}
             onRefresh={() => void refreshAll()}
+            initialTxid={activityFocusTxid}
+            onInitialTxidShown={() => setActivityFocusTxid(null)}
           />
         );
 
