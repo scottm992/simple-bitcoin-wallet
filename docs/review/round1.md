@@ -2594,3 +2594,103 @@ _Round-17 throwaway probe `r17probe.test.tsx` (6 assertions) was executed and de
 the only file modified is this `docs/review/round1.md`, committed on
 `activity-row-design` (not pushed). Zero live API calls this round. Gates confirmed on
 the clean tree. Next finding number: **F23**._
+
+---
+
+# Round 18 — Home rows open the payment detail (navigation fix)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 0**
+
+Deliberately LIGHT round, PM-authored navigation fix, scoped to the single commit
+`f409c86` on `row-opens-detail`: tapping a Home activity row landed on the bare Activity
+LIST instead of that payment's detail sheet — App's `onOpenActivity` discarded its txid
+argument (a fossil comment "Which activity txid to auto-open when navigating from Home
+(optional)" has sat above `explainerOpen` since the original implementation commit
+`1cfd966`, the never-wired feature this diff finally builds). Fix: App keeps a one-shot
+`activityFocusTxid` (set at both Home render sites, passed as `initialTxid`); Activity
+seeds its existing `selected` detail-sheet state via a useState initializer
+(`props.items.find(txid)`) and a `[]`-deps mount effect consumes the txid exactly once
+via `onInitialTxidShown`. Diff = exactly three files (`src/App.tsx`,
+`src/screens/Activity.tsx`, `src/__tests__/Activity.focus.test.tsx` +4 tests) — verified
+with `git diff main..row-opens-detail --stat`; nothing else re-audited. Gates:
+`npm test` = **343 passing** (339 baseline + the 4 shipped), `tsc --noEmit` clean,
+`npm run build` clean, dist CSP untouched (the policy lives in `vite.config.ts`,
+zero-diff), no `console.*` in the diff, no new deps, `public/` and `index.html`
+untouched (no `CACHE_NAME` bump owed). Zero live API calls. Verified with throwaway
+`probe.round18.test.tsx` (6 probes against an App-shaped harness owning the focus state,
+executed, deleted). PM live-verified the three browser flows; this round's probes stayed
+mocked per the standing rule.
+
+## Per-attack-point verdicts
+
+- **1. One-shot discipline — SOUND; no remount path can resurrect a closed sheet.**
+  Activity renders keyless at the single `case 'activity'` site inside `renderScreen()`;
+  while `state.screen === 'activity'` every re-render (background `accountLoaded`
+  swapping `items`, price/fee ticks, the consume's own `setActivityFocusTxid(null)`)
+  reconciles the same element type in place — the useState initializer cannot re-run, so
+  a closed sheet stays closed (probed: close → refresh with brand-new item objects → no
+  re-open, consume count exactly 1). Every true remount goes through a screen change,
+  and every route BACK to Activity carries a fresh intent or a consumed-null txid: Home
+  row tap (sets a new txid — re-opening is the feature), See-all and Sent's
+  "View activity" (never set it), lock (screen → unlock unmounts Activity, but the mount
+  effect consumed the txid at arrival — App itself never unmounts, and React flushes
+  pending passive effects before committing any subsequent render, so
+  unmount-before-consume is unreachable from a committed mount). Probed the worst case
+  anyway: remount while the sheet was STILL OPEN (leave-and-return without closing) —
+  focus already null, remount lands on the plain list. `<React.StrictMode>` is live in
+  main.tsx: the dev double-invoked mount effect calls consume twice — idempotent
+  (`setActivityFocusTxid(null)` twice), probed under StrictMode; production is
+  single-fire. Residual, note only, no number: `hadInitial`/`consumeInitial` capture
+  first-render values under `[]` deps, so a txid ARRIVING while Activity is already
+  mounted would neither seed nor consume — unreachable by construction (onOpenActivity
+  lives only on Home rows, and Home is unmounted while Activity shows); worth a comment
+  if the prop ever gains a second producer.
+- **2. Speed-up interplay — SEEDED OPEN IS PROVENANCE-IDENTICAL TO A CLICKED OPEN.**
+  Only the txid STRING travels from Home; the seed resolves it against the CURRENT
+  `props.items` — the same `state.account?.activity` array a clicked row's `item`
+  closure comes from (Activity.tsx:119 `setSelected(item)` maps over the identical
+  prop). A Home-snapshot ActivityItem object never reaches the sheet. Probed: items
+  refreshed between tap and mount (same txid, changed amount) → the sheet shows the
+  FRESH value; txid vanished → plain list, still consumed (shipped test). Downstream,
+  the sheet's Speed-up path is byte-unchanged: `startSpeedUp` passes
+  `props.item.txid` to `onPrepareBump` → App's `speedUpPrepare` reads the CURRENT
+  `state.account` at call time, and prepareBump's F15 chain (recipient proven via the
+  send record) sits below this diff entirely — a stale-held sheet across a refresh
+  behaves exactly as it always did for clicked opens (txid-only input, everything
+  re-derived). No new staleness class minted.
+- **3. State leak — NONE; consumption is unconditional on arrival.** The mount effect
+  keys on `initialTxid != null`, NOT on the find succeeding, so unknown, refreshed-away,
+  and even degenerate empty-string txids are all consumed (probed + shipped test).
+  See-all and Sent pass nothing; the second Home render site (the account-null guard
+  inside `case 'send'`) wires the identical handler but structurally cannot fire it —
+  Home derives rows from `props.account?.activity ?? []`, so account=null renders zero
+  rows; if it ever did fire, the behavior is byte-identical to site 1 (consistent
+  wiring confirmed). The one theoretical residual — lock landing in the sub-millisecond
+  window between the tap and Activity's mount — leaves the txid set across the lock
+  (App-level state survives; the vault and session wipe as always), and the next
+  Activity visit opens that payment's detail once and consumes it: benign
+  (display-only, the user's own last tap), practically unreachable, no number.
+- **4. Gates — ALL GREEN.** `tsc --noEmit` clean; `npm test` = 343/343 (36 files);
+  `npm run build` clean; CSP source untouched (`vite.config.ts` zero-diff, policy
+  strings byte-identical to Rounds 13-17); zero `console.*` /
+  `dangerouslySetInnerHTML` / `eval` / `innerHTML` in the diff; `git diff
+  main..row-opens-detail --stat` = exactly the three files (engine, api, actions,
+  state, strings, css, `public/`, `index.html`, `sw.js` all zero-diff — no
+  `CACHE_NAME` bump owed); browser-pane verification deliberately skipped (live chain
+  calls forbidden this round; the PM's live pass + the shipped tests + 6 probes cover
+  the three flows).
+
+## Ship recommendation
+
+**SHIP.** The fix is exactly its claim: a txid that was always meant to travel finally
+travels, as a one-shot consumed on arrival. The seed can only ever surface an item from
+the same current-snapshot array a finger-tap would have handed it; the consume fires
+before any remount can observe stale state (proven under refresh, leave-and-return,
+open-sheet remount, and StrictMode double-effects); every non-Home route into Activity
+still lands on the plain list; and the money-adjacent surface beneath the sheet — the
+F15-audited Speed-up chain — is byte-untouched. Zero findings.
+
+_Round-18 throwaway probe `probe.round18.test.tsx` (6 assertions, all passed first run)
+was executed and deleted; the only file modified is this `docs/review/round1.md`,
+committed on `row-opens-detail` (not pushed). Zero live API calls this round. Gates
+confirmed on the clean tree. Next finding number: **F23**._
