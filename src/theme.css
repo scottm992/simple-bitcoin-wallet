@@ -466,7 +466,7 @@ body {
 .act-head__see { font-size: var(--fs-small); color: var(--accent); font-weight: var(--fw-semibold); background: none; border: none; cursor: pointer; }
 .row {
   display: flex; align-items: center; gap: var(--sp-3);
-  padding: var(--sp-2) 0; width: 100%;
+  padding: var(--sp-3) 0; width: 100%;
   background: none; border: none; cursor: pointer; text-align: left;
   border-top: 1px solid var(--border);
 }
@@ -478,12 +478,25 @@ body {
 }
 .row__ico--in { background: var(--success-weak); color: var(--success); }
 .row__ico--out { background: var(--surface-inset); color: var(--text-secondary); }
-.row__main { flex: 1; }
+.row__main { flex: 1; display: flex; flex-direction: column; gap: 2px; }
 .row__title { font-size: var(--fs-callout); font-weight: var(--fw-semibold); }
 .row__sub { font-size: var(--fs-small); color: var(--text-muted); }
-.row__val { text-align: right; }
-.row__amount { font-size: var(--fs-callout); font-weight: var(--fw-bold); }
+/* Pending rows carry their status AS the sub-line (no pill in the amount
+   column): the one exceptional state stays visible without a badge shouting
+   on every settled row. */
+.row__sub--wait { color: var(--warning); font-weight: var(--fw-semibold); }
+.row__val { text-align: right; display: flex; flex-direction: column; gap: 2px; }
+.row__amount {
+  font-size: var(--fs-callout); font-weight: var(--fw-bold);
+  font-variant-numeric: tabular-nums;
+}
 .row__amount--pos { color: var(--success); }
+/* The bitcoin-native amount under the USD one: it IS a bitcoin wallet, and
+   this line keeps rows meaningful offline, when fmtUsd degrades to a dash. */
+.row__btc {
+  font-size: var(--fs-small); color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
 .row__status { font-size: 11px; }
 .row__status--ok { color: var(--success); }
 .row__status--wait { color: var(--text-muted); }
