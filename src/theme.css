@@ -238,6 +238,9 @@ body {
 .btn--secondary { background: var(--surface-inset); color: var(--text); }
 .btn--text      { background: transparent; color: var(--accent); font-weight: var(--fw-medium); }
 .btn--danger    { background: var(--danger); color: #fff; }
+/* A text-style button whose action is destructive: the danger color where a
+   filled danger button would be too loud (e.g. the last option in a sheet). */
+.btn--danger-text { background: transparent; color: var(--danger); font-weight: var(--fw-medium); }
 .btn--block     { width: 100%; }
 .btn:disabled   { opacity: .45; cursor: not-allowed; }
 

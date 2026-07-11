@@ -676,6 +676,10 @@ export default function App(): JSX.Element {
             onUnlockPassword={unlockPassword}
             onUnlockPasskey={unlockPasskey}
             onRestore={startRestore}
+            // The locked-out last resort: the SAME single deletion routine the
+            // Settings remove flow uses — never a parallel wipe path. Lands on
+            // Welcome (vaultDeleted), where create/restore both start fresh.
+            onWipe={deleteWallet}
           />
         );
 
