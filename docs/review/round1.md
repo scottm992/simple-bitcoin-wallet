@@ -2694,3 +2694,287 @@ _Round-18 throwaway probe `probe.round18.test.tsx` (6 assertions, all passed fir
 was executed and deleted; the only file modified is this `docs/review/round1.md`,
 committed on `row-opens-detail` (not pushed). Zero live API calls this round. Gates
 confirmed on the clean tree. Next finding number: **F23**._
+
+---
+
+# Round 19 — Lock-screen wipe-and-start-fresh (vault surface)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 4** (F23 Low, F24 Low, F25 Info, F26 Info)
+
+Scope: `git diff main..unlock-wipe`, one commit `c48aa37`, exactly six files
+(`src/App.tsx` +4, `src/screens/Unlock.tsx` +61/−1, `src/strings.ts` +9,
+`src/theme.css` +3, `src/__tests__/Unlock.wipe.test.tsx` new,
+`src/__tests__/Unlock.passkey.test.tsx` +2 required-prop lines) — plus its
+interaction with the deletion routine it calls (`App.deleteWallet`,
+`vault.deleteVault`). Treated as a serious round despite the small diff: a
+destructive wipe reachable from the LOCK SCREEN, i.e. without authentication.
+
+## 1. Threat-model adjudication — PASS
+
+The PM's device-holder argument holds, and the in-app reality is stronger than
+the PM stated. A device-holder already has capability-equivalent destruction
+OUTSIDE the app (clear site data; on iOS standalone, deleting the home-screen
+icon deletes the web app's container — destruction there is arguably EASIER
+than digging through browser settings, not harder), and — decisive — INSIDE
+the app on main today: Unlock → forgot → "Restore with my 12 words" →
+Restore's back button lands on **Welcome** (`App.tsx:666` navigates to
+`'welcome'` unconditionally), where "Create new wallet" → set password →
+`createVault(...)` **silently overwrites the existing vault** (its documented
+contract: "overwriting any existing vault") with zero warning about the old
+wallet. So this diff adds no new destructive capability even within the app;
+it adds the only destruction path that WARNS (blunt permanent-loss copy +
+fresh consent). Destroying the vault yields an attacker nothing (funds live
+on-chain; the 12 words are the real backup, stated bluntly) — it is
+denial-of-service against a user who lost their words, which OS affordances
+already permit. F6 interaction is moot: after the wipe there is no ciphertext
+left to guess (probe Q4: `unlockVault` throws `NoVaultError`, not
+`WrongPasswordError`), and the F6 throttle ref already resets on a mere page
+reload (accepted Round-1 scope), so the wipe grants an attacker nothing the
+refresh button didn't.
+
+## 2. Residual-artifact enumeration (probe Q1: full key walk after the wipe)
+
+| Artifact | Cleared? | Verdict |
+|---|---|---|
+| `sbw.vault.v1` — password ciphertext, salts, IVs, KDF params, passkey blob (wrapped ciphertext + credentialId + PRF/HKDF salts), network, createdAt, `lastReceiveIndex`, `lastHighWater` | **YES — atomically** (all fields live inside the one doc; `removeItem` takes everything, probe Q2) | No offline-attackable ciphertext or index fingerprint survives anywhere in web storage |
+| `sbw.sends.v1` — send log, txid → recipient + amount, up to 200/network | **NO — survives intact** (probe Q1: post-wipe localStorage == exactly `['sbw.sends.v1']`, record readable) | **F23** — privacy residue |
+| OS-side platform passkey credential (authenticator/keychain) | **NO** (WebAuthn has no reliable delete; `deleteWallet` doesn't even attempt the existing best-effort `signalUnknownCredential` helper) | **F25** — existence leak only; decrypts nothing post-wipe |
+| Service-worker Cache API (`sbw-cache-v1`) | n/a — app shell only; ALL cross-origin API traffic is passthrough by hard rule 1 (`sw.js`), so no address/balance data was ever cached | Reveals the app was visited — same as browser history; harmless |
+| In-memory: session mnemonic, scan cache, `draftWordsRef`/`restorePhraseRef`, `failedUnlocksRef` | mnemonic provably null on Unlock; scan cache cleared at the prior lock event (or empty on fresh boot); draft refs provably null on Unlock (no path back to Unlock after `startRestore` except the `'locked'` action — whose listener clears them — or a boot, which resets module memory); throttle ref irrelevant post-deletion | Clean |
+| sessionStorage / IndexedDB | never used anywhere | Clean |
+| Browser-level (password-manager entry for the vault password, history) | outside app control | Noted, not a finding |
+
+The PM's live observation "confirm deletes vault + send log" is contradicted
+by code: NOTHING in the repo removes `SEND_LOG_STORAGE_KEY` (`sendLog.ts` has
+no clear/delete export; the only `removeItem` in src is `deleteVault`'s). The
+live pass was almost certainly vacuous — a test wallet that never broadcast
+has no `sbw.sends.v1` key to observe.
+
+## 3. Findings
+
+### F23 — [SEV-Low] The send log survives "Remove this wallet from this phone"
+
+- **Where:** `src/App.tsx:433-438` (`deleteWallet` — no send-log removal);
+  `src/lib/sendLog.ts` (no clear function exists).
+- **Scenario:** After the wipe (either entry: new Unlock path or Settings),
+  `sbw.sends.v1` remains with up to 200 records per network: txid → recipient
+  address + amount. The module's "non-secret: on-chain public data" argument
+  covers the DATA, not the LINKAGE — a later device holder (phone buyer,
+  snoop, forensics) learns a wallet existed here AND gets txids that
+  deanonymize the wallet's entire on-chain cluster. The new copy sharpens the
+  broken promise: "Remove this wallet from this phone" / "start fresh".
+  Cross-wallet fund-safety is unaffected: F15 bump verification is txid-keyed,
+  and a different wallet cannot collide with a stale txid.
+- **Pre-existing** (Settings' remove flow has shipped this since F15 landed),
+  so not blocking for THIS diff — but this diff doubles the surface and its
+  copy makes the claim explicit.
+- **Fix (one line, PM):** remove `SEND_LOG_STORAGE_KEY` inside `deleteWallet`
+  (or export `clearSendLog()` from `sendLog.ts` and call it there), so both
+  entry paths inherit it. Not fixed this round per review rules.
+
+### F24 — [SEV-Low] A corrupt vault aborts the wipe BEFORE deletion — the last resort fails exactly for the user who most needs it
+
+- **Where:** `src/App.tsx:433-438` — `deleteWallet()`'s FIRST statement is
+  `disablePasskeyUnlock()`, which calls `readVault()`
+  (`src/lib/vault.ts:605-611` → `:173-181`), which THROWS `VaultCorruptError`
+  when the stored doc is invalid JSON. `deleteVaultStorage()` on the next line
+  never runs; the sheet's onClick has no catch; the sheet has already closed.
+- **Scenario:** vault present but unparseable (interrupted write, storage
+  corruption — the very state that can make a password "stop working"). User
+  taps forgot → wipe → consents → Remove wallet → nothing happens: no error
+  UI, vault intact, still locked. Probe Q3 proved the throw-before-delete on
+  the exact statement order; probe Q3b proved `deleteVault()` alone tolerates
+  the same corruption (`removeItem` never parses).
+- **New reachability in THIS diff:** on main, `deleteWallet` was only callable
+  from Settings — post-unlock, where the vault JSON is necessarily parseable.
+  The Unlock entry is the first locked-state caller, so the corrupt-vault case
+  becomes reachable for the first time. Not fund- or secret-affecting (nothing
+  is destroyed or leaked; OS clear-site-data still works), hence Low — but it
+  is the recovery flow's own failure mode, and silent.
+- **Fix (PM):** make `deleteVaultStorage()` the first statement (it cannot
+  throw), or wrap `disablePasskeyUnlock()` in try/catch — it is anyway
+  redundant on the delete path, since the passkey blob lives INSIDE the vault
+  doc that is about to be removed (probe Q2). Not fixed this round per rules.
+
+### F25 — [SEV-Info] The OS-side passkey credential outlives the wallet
+
+- **Where:** `src/App.tsx:433` (`disablePasskeyUnlock` strips only the wrapped
+  ciphertext); the platform credential created by `enablePasskeyUnlock`
+  remains in the user's authenticator (iCloud Keychain / Google Password
+  Manager) listing this origin.
+- **Scenario:** post-wipe, the dangling "wallet" passkey reveals the wallet
+  existed and clutters the user's credential list. It can decrypt nothing —
+  the wrapped ciphertext is gone, and a PRF output alone is useless.
+- **Fix (optional):** best-effort `signalUnknownCredential` (the helper
+  already exists at `vault.ts:433` for the F7 probe path) with the vault's
+  stored `credentialIdB64`, called from the delete path before the vault doc
+  is removed. Pre-existing; Info.
+
+### F26 — [SEV-Info] The unwarned sibling: create-over-vault from Welcome
+
+- **Where:** `src/App.tsx:666` (Restore's `onBack` → `'welcome'` even when a
+  vault exists) + `src/App.tsx:306-344` (`startCreate`/`submitPassword` →
+  `createVault` overwrite).
+- **Scenario:** the same unauthenticated device-holder this round scrutinizes
+  can reach Welcome → "Create new wallet" and silently OVERWRITE the existing
+  vault — no danger styling, no permanent-loss copy, no consent checkbox.
+  After this diff the app has a heavily-warned wipe path and an unwarned one
+  next to it. Pre-existing; surfaced here because it is the strongest fact in
+  the threat-model adjudication. Consider gating Welcome's create (and
+  restore) behind the same blunt sheet when `vaultExists()`.
+
+## 4. Attack-point evidence (one line each)
+
+- **Consent gates at the handler level:** probe P1 — a full synthetic
+  `pointerdown/mousedown/mouseup/click` storm dispatched at the disabled
+  confirm never reaches the onClick (the `disabled` attribute bars event
+  dispatch per HTML spec, not just styling); the shipped test already pins
+  `.click()`.
+- **No form semantics to hijack:** probe P2 — zero `<form>` elements anywhere
+  in Unlock; Enter in the sheet triggers nothing (PasswordInput's `onEnter`
+  routes only to `tryPassword`).
+- **Consent is never remembered:** probe P3 — scrim-close resets (shipped
+  tests cover cancel and reopen); `openWipe()` and `closeWipe()` BOTH clear
+  `wipeChecked`, so every entry starts unchecked.
+- **Single entry, single sheet:** probes P4/P5 — `setShowWipe(true)` exists
+  only inside `openWipe`, reachable only from the forgot sheet's third button;
+  opening the wipe sheet closes the forgot sheet (one `.scrim` in the DOM);
+  the base screen contains no wipe copy/checkbox/confirm.
+- **Double-tap safe:** probe P6 — with real event sequencing (flush between
+  discrete clicks) `onWipe` fires exactly once; and probe Q5 — even a
+  hypothetical double-fire is idempotent (`removeItem`/`lockNow`/reducer all
+  no-op on repeat). For the record: two clicks batched inside one `act()` DO
+  fire twice — an interleaving browsers do not produce, and harmless per Q5.
+- **Single-path invariant:** `onWipe={deleteWallet}` (App.tsx:682) and
+  Settings' `onDelete={deleteWallet}` (App.tsx:837) are the same function; the
+  only `deleteVault` call site in src is App.tsx:435; the diff adds no second
+  deletion implementation; both paths land on the same audited `vaultDeleted`
+  reducer (→ `initialState` + `'welcome'`).
+- **No residual unlocked session:** on the Unlock path the mnemonic is
+  provably already null (session.ts is its only home; no route reaches Unlock
+  with draft/restore refs set — see the §2 table); on the Settings path
+  `lockNow()` clears it synchronously inside the same tick, before any render
+  can observe the deleted-vault state. Note `lockNow()` early-returns when
+  already locked, so the onLock cleanup listener does NOT fire on the new path
+  — verified that everything it would clean (scan cache, discovery, draft
+  refs) is already clean at that point.
+
+## 5. Gates — ALL GREEN
+
+- `npm test` = **346 passing / 37 files** (343 baseline + the 3 shipped wipe
+  tests), re-confirmed on the clean tree after probe deletion.
+- `tsc --noEmit` clean; `npm run build` clean.
+- dist CSP byte-identical to Rounds 13–18 (`default-src 'self'; connect-src
+  'self' https://mempool.space https://blockstream.info; img-src 'self'
+  data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src
+  'none'; base-uri 'self'; form-action 'none'`).
+- Zero `console.*` in the diff; no new deps; `public/`, `index.html`,
+  `sw.js`, `vite.config.ts` zero-diff — no `CACHE_NAME` bump owed.
+- Diff limited to exactly the six named files (`git diff main..unlock-wipe
+  --name-only` verified).
+
+## Ship recommendation
+
+**SHIP.** The wipe adds no capability an unauthenticated device-holder lacked
+— in-app OR at the OS — and is the only destruction path that tells the truth
+before acting; the consent gate holds at the event-dispatch level under every
+probed bypass; the deletion routine is the same single audited path Settings
+uses and leaves no ciphertext, index, or passkey material in web storage. F23
+(send-log residue, one-line fix) and F24 (corrupt-vault abort, a reorder) are
+real but non-blocking follow-ups; F25/F26 are Info. Recommend the PM take
+F23+F24 as a fast-follow pair — both fixes live inside `deleteWallet` and land
+on both entry paths at once.
+
+_Round-19 throwaway probes `r19.review.test.tsx` (6 probes) and
+`r19b.review.test.ts` (6 probes) were executed (12/12 passing after P6 was
+corrected to model real event sequencing) and deleted; the only file modified
+is this `docs/review/round1.md`, committed on `unlock-wipe` (not pushed). Zero
+live API calls this round; browser-pane verification deliberately skipped (the
+PM's live pass + 3 shipped tests + 12 probes cover the flow). Next finding
+number: **F27**._
+
+
+## Round 19 closure — F23 / F24 re-check
+
+Fix commit `bbccdcf` (PM-authored per the one-liners policy; this closure is
+the independent check). Diff = exactly three files: `src/App.tsx` (+34/−3),
+`src/lib/sendLog.ts` (+16, the new `clearSendLog`), and the new App-level
+regression test `src/__tests__/App.wipe.test.tsx` (+80). No user-facing copy
+changed; no `console.*`; `public/`, `index.html`, `sw.js`, `vite.config.ts`
+untouched — no `CACHE_NAME` bump owed. Re-checked with throwaway
+`r19c.review.test.ts` (5 probes C1–C5, all passed first run, deleted).
+
+**F23 — CLOSED.** `clearSendLog()` (`src/lib/sendLog.ts:168-174`: best-effort
+`removeItem` inside try/catch, exported through the lib barrel) is called in
+`deleteWallet` immediately after `deleteVaultStorage()`. Probe C1: a healthy
+wipe now leaves localStorage COMPLETELY empty (full key walk == `[]`); probe
+C2: same with a corrupt vault + populated send log; probe C3: same from the
+unlocked Settings scenario — and Settings inherits the fix by identity, since
+`onWipe={deleteWallet}` (App.tsx:710) and `onDelete={deleteWallet}`
+(App.tsx:865) are still the same single function. Probe C4 pins the
+best-effort contract: a throwing `removeItem` never escapes `clearSendLog`,
+so a broken storage layer cannot re-break the wipe that F24 just fixed.
+
+**F24 — CLOSED, both halves.** (a) The half I flagged: `disablePasskeyUnlock()`
+is try/caught in `deleteWallet` (App.tsx:449-459) with the correct rationale
+comment — the wholesale vault removal takes the passkey ciphertext regardless.
+Probe C2: corrupt vault (`{corrupt%%%not-json`) + populated send log → the
+sequence completes without throwing and BOTH keys are gone. (b) The boot half
+my round MISSED, exposed by the PM's own App-level test and a genuinely
+necessary second fix: the boot effect called `getVaultNetwork()` /
+`isPasskeyEnabled()` unguarded — both parse the vault document and throw
+`VaultCorruptError` on garbage, crashing the app before Unlock could even
+render, which made the entire rescue path (and any deleteWallet-only fix)
+unreachable for exactly the corrupted-state user. Verified the committed
+catch is scoped to precisely those two calls (App.tsx:150-155); everything
+else in the effect — `applyNetworkTheme`, `vaultExists`, `isPasskeySupported`,
+the boot dispatch, `installSessionGuards`, the onLock wiring — sits OUTSIDE
+the try, so the catch cannot accidentally mask an unrelated error class.
+Probe C5 pins the scoping from the lib side: on garbage, those two calls are
+exactly the throwers, and `vaultExists()` stays true (raw-key presence), so
+boot still routes to Unlock. The only non-corruption error the wrapped pair
+can surface is a storage-access failure from `getItem`, which degrades to the
+same locked-mainnet default — the right behavior in that world too. A
+corrupt-vault boot also sets `passkeyEnabled = false`, so no Face ID
+auto-prompt fires against a vault that could never decrypt — correct. The
+shipped `App.wipe.test.tsx` drives the REAL App end to end (corrupt vault +
+populated send log → boot → Unlock → forgot → wipe sheet → consent → confirm
+→ vault key AND send-log key both gone → Welcome): the exact Round-19 F24
+scenario, pinned at the App level where `deleteWallet` lives.
+
+### F27 — [SEV-Info] A corrupt vault reads as "wrong password" (adjudicated: numbered Info, non-blocking)
+
+- **Where:** `src/App.tsx:372-391` — `unlockPassword`'s bare catch maps EVERY
+  `unlockVault` failure (including `VaultCorruptError` from corrupt JSON or
+  corrupt base64 fields) to `strings.unlock.wrongPassword`.
+- **Scenario:** the corrupted-state user can retry passwords indefinitely,
+  believing they misremember, when no password can ever work — each hopeless
+  attempt also escalating the F6 throttle. This is the deliberate trade the
+  boot-half fix documents ("fail like a wrong password; the wipe is the way
+  out"), and it is non-crashing with both real exits one tap away in the
+  forgot sheet — but the copy is misleading in a way the app can detect.
+- **Adjudication:** numbered Info (copy-honesty class, same family as F22),
+  NOT a blocker and NOT required for this merge. Optional fix: discriminate
+  `VaultCorruptError` in `unlockPassword` and show a distinct string steering
+  to the forgot sheet (the wallet data on this phone is damaged; no password
+  will unlock it; restore with your 12 words or remove and start fresh).
+
+### Open-finding dispositions (owner, this round)
+
+- **F25 — OPEN, accepted for now** (Info: OS-side passkey credential outlives
+  the wallet; existence leak only, decrypts nothing post-wipe).
+- **F26 — OPEN, deferred to ROADMAP as its own future item** (Info: the
+  unwarned create-over-vault path from Welcome). Correctly NOT bundled into
+  `bbccdcf` — it is its own surface and deserves its own round.
+
+### Gates on `bbccdcf` — ALL GREEN
+
+`npm test` = **347 passing / 38 files** (346 + the shipped `App.wipe.test.tsx`),
+re-confirmed on the clean tree after probe deletion; `tsc --noEmit` clean;
+`npm run build` clean; dist CSP byte-identical to Rounds 13–19.
+
+**SHIP stands** — both fixes are exactly their claims, the second boot-half
+fix closes a real gap my round under-scoped, and both entry paths inherit
+everything through the single audited `deleteWallet`. Next finding number:
+**F28**.
+

@@ -434,6 +434,15 @@ export const strings = {
       "Your password only unlocks this phone, so there's nothing to reset. If you can't get in, you can set the wallet up again from scratch using your 12 words. Removing and restoring won't lose any bitcoin — your money lives on the bitcoin network, not in this app.",
     forgotRestore: 'Restore with my 12 words',
     forgotRetry: 'Try password again',
+    forgotWipe: 'Remove this wallet and start fresh',
+    // The last-resort wipe sheet (owner request 2026-07-10): the heaviest
+    // consent flow in the app. Safe for someone holding their 12 words;
+    // permanent loss for someone who isn't — say so bluntly, no softening.
+    wipeHeading: 'Remove this wallet from this phone?',
+    wipeBody:
+      "This deletes the wallet from this phone only — your bitcoin lives on the bitcoin network. The ONLY way to see this wallet's money again is its 12-word recovery phrase. If you don't have those 12 words written down, any money in this wallet will be lost forever. No one — not even this app — can bring it back without them.",
+    wipeCheckbox: 'I understand: without my 12 words, the money in this wallet is lost forever.',
+    wipeConfirm: 'Remove wallet',
   },
 
   restore: {

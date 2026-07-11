@@ -4,6 +4,7 @@ import './theme.css';
 import { reducer, initialState } from './state';
 import type { PendingSend } from './state';
 import {
+  clearSendLog,
   createVault,
   deleteVault as deleteVaultStorage,
   deriveReceiveAddress,
@@ -137,14 +138,28 @@ export default function App(): JSX.Element {
 
   // ---- Boot: detect existing vault, install session guards ----------------
   useEffect(() => {
-    const network = getVaultNetwork() ?? 'mainnet';
+    // F24 (round 19, boot half): a CORRUPT vault must never crash the boot —
+    // getVaultNetwork/isPasskeyEnabled PARSE the vault document and throw
+    // VaultCorruptError on garbage. The app must still reach the Unlock
+    // screen (vaultExists keys on the raw key's presence, corrupt or not), so
+    // the forgot-password → wipe-and-start-fresh rescue stays reachable for
+    // exactly the user whose storage is broken. Password attempts against a
+    // corrupt vault fail like a wrong password; the wipe is the way out.
+    let network: Network = 'mainnet';
+    let passkeyEnabled = false;
+    try {
+      network = getVaultNetwork() ?? 'mainnet';
+      passkeyEnabled = isPasskeyEnabled();
+    } catch {
+      /* corrupt vault document — boot locked on mainnet defaults */
+    }
     applyNetworkTheme(network);
     dispatch({
       type: 'boot',
       hasVault: vaultExists(),
       network,
       passkeySupported: isPasskeySupported(),
-      passkeyEnabled: isPasskeyEnabled(),
+      passkeyEnabled,
     });
     const teardown = installSessionGuards();
     const unsub = onLock(() => {
@@ -431,8 +446,21 @@ export default function App(): JSX.Element {
   }
 
   function deleteWallet(): void {
-    disablePasskeyUnlock();
+    // F24 (round 19): a CORRUPT vault must never block the wipe.
+    // disablePasskeyUnlock READS the vault (it rewrites it sans passkey) and
+    // throws VaultCorruptError on garbage — and the lock-screen wipe is
+    // exactly the corrupted-state user's rescue path. Passkey cleanup is
+    // best-effort; the deletion below removes the whole vault document —
+    // passkey ciphertext included — regardless.
+    try {
+      disablePasskeyUnlock();
+    } catch {
+      /* corrupt vault — the deletion below still removes it wholesale */
+    }
     deleteVaultStorage();
+    // F23 (round 19): the send log maps this device to the wallet's on-chain
+    // txids; "remove this wallet from this phone" must take it too.
+    clearSendLog();
     lockNow();
     dispatch({ type: 'vaultDeleted' });
   }
@@ -676,6 +704,10 @@ export default function App(): JSX.Element {
             onUnlockPassword={unlockPassword}
             onUnlockPasskey={unlockPasskey}
             onRestore={startRestore}
+            // The locked-out last resort: the SAME single deletion routine the
+            // Settings remove flow uses — never a parallel wipe path. Lands on
+            // Welcome (vaultDeleted), where create/restore both start fresh.
+            onWipe={deleteWallet}
           />
         );
 

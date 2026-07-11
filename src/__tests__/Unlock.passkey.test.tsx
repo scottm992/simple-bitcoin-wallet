@@ -40,6 +40,7 @@ function render(props: {
         onUnlockPassword={async () => false}
         onUnlockPasskey={props.onUnlockPasskey}
         onRestore={() => {}}
+        onWipe={() => {}}
       />,
     );
   });
@@ -63,6 +64,7 @@ describe('Unlock — passkey auto-trigger (Bug B2)', () => {
           onUnlockPassword={async () => false}
           onUnlockPasskey={onUnlockPasskey}
           onRestore={() => {}}
+          onWipe={() => {}}
         />,
       );
     });

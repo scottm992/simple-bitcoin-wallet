@@ -2,7 +2,7 @@ import type { JSX } from 'react';
 import { useEffect, useRef, useState } from 'react';
 import { strings } from '../strings';
 import { Chrome } from '../components/Chrome';
-import { PasswordInput, Sheet } from '../components/ui';
+import { CheckRow, PasswordInput, Sheet } from '../components/ui';
 import type { Network } from '../lib';
 
 /**
@@ -20,11 +20,37 @@ export function Unlock(props: {
   onUnlockPassword: (password: string) => Promise<boolean>;
   onUnlockPasskey: () => Promise<boolean>;
   onRestore: () => void;
+  /**
+   * Wipes the wallet from this device and returns to Welcome — the locked-out
+   * user's last resort (owner request, 2026-07-10). MUST be wired to the SAME
+   * single deletion routine Settings' remove flow uses (App.deleteWallet) —
+   * never a parallel wipe path. Reached only through the forgot-password sheet
+   * followed by a checkbox-gated danger confirmation: safe for someone holding
+   * their 12 words, permanent loss for someone who isn't — the copy says so
+   * bluntly.
+   */
+  onWipe: () => void;
 }): JSX.Element {
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showForgot, setShowForgot] = useState(false);
+  // The wipe confirmation sheet (reached FROM the forgot sheet) and its
+  // consent checkbox. The checkbox resets every time the sheet opens or
+  // closes: consent must be given fresh, never remembered.
+  const [showWipe, setShowWipe] = useState(false);
+  const [wipeChecked, setWipeChecked] = useState(false);
+
+  function openWipe(): void {
+    setShowForgot(false);
+    setWipeChecked(false);
+    setShowWipe(true);
+  }
+
+  function closeWipe(): void {
+    setShowWipe(false);
+    setWipeChecked(false);
+  }
 
   // Face ID is offered only when it's both enabled for this vault AND the
   // device actually supports platform authenticators (feature detection).
@@ -126,6 +152,40 @@ export function Unlock(props: {
             </button>
             <button className="btn btn--text btn--block" onClick={() => setShowForgot(false)}>
               {strings.unlock.forgotRetry}
+            </button>
+            <button className="btn btn--text btn--block btn--danger-text" onClick={openWipe}>
+              {strings.unlock.forgotWipe}
+            </button>
+          </div>
+        </Sheet>
+      ) : null}
+
+      {showWipe ? (
+        // The last-resort wipe (owner request): deliberately the heaviest
+        // consent flow in the app — a second sheet, blunt permanent-loss copy,
+        // and a fresh checkbox gating a danger button. Mirrors the Settings
+        // remove flow's pattern and calls the SAME deletion routine.
+        <Sheet onScrim={closeWipe}>
+          <h2 className="sheet__title">{strings.unlock.wipeHeading}</h2>
+          <p className="sheet__body">{strings.unlock.wipeBody}</p>
+          <CheckRow
+            checked={wipeChecked}
+            onToggle={() => setWipeChecked((c) => !c)}
+            label={strings.unlock.wipeCheckbox}
+          />
+          <div className="sheet__actions">
+            <button
+              className="btn btn--danger btn--block"
+              onClick={() => {
+                closeWipe();
+                props.onWipe();
+              }}
+              disabled={!wipeChecked}
+            >
+              {strings.unlock.wipeConfirm}
+            </button>
+            <button className="btn btn--text btn--block" onClick={closeWipe}>
+              {strings.common.cancel}
             </button>
           </div>
         </Sheet>
