@@ -2893,3 +2893,88 @@ live API calls this round; browser-pane verification deliberately skipped (the
 PM's live pass + 3 shipped tests + 12 probes cover the flow). Next finding
 number: **F27**._
 
+
+## Round 19 closure — F23 / F24 re-check
+
+Fix commit `bbccdcf` (PM-authored per the one-liners policy; this closure is
+the independent check). Diff = exactly three files: `src/App.tsx` (+34/−3),
+`src/lib/sendLog.ts` (+16, the new `clearSendLog`), and the new App-level
+regression test `src/__tests__/App.wipe.test.tsx` (+80). No user-facing copy
+changed; no `console.*`; `public/`, `index.html`, `sw.js`, `vite.config.ts`
+untouched — no `CACHE_NAME` bump owed. Re-checked with throwaway
+`r19c.review.test.ts` (5 probes C1–C5, all passed first run, deleted).
+
+**F23 — CLOSED.** `clearSendLog()` (`src/lib/sendLog.ts:168-174`: best-effort
+`removeItem` inside try/catch, exported through the lib barrel) is called in
+`deleteWallet` immediately after `deleteVaultStorage()`. Probe C1: a healthy
+wipe now leaves localStorage COMPLETELY empty (full key walk == `[]`); probe
+C2: same with a corrupt vault + populated send log; probe C3: same from the
+unlocked Settings scenario — and Settings inherits the fix by identity, since
+`onWipe={deleteWallet}` (App.tsx:710) and `onDelete={deleteWallet}`
+(App.tsx:865) are still the same single function. Probe C4 pins the
+best-effort contract: a throwing `removeItem` never escapes `clearSendLog`,
+so a broken storage layer cannot re-break the wipe that F24 just fixed.
+
+**F24 — CLOSED, both halves.** (a) The half I flagged: `disablePasskeyUnlock()`
+is try/caught in `deleteWallet` (App.tsx:449-459) with the correct rationale
+comment — the wholesale vault removal takes the passkey ciphertext regardless.
+Probe C2: corrupt vault (`{corrupt%%%not-json`) + populated send log → the
+sequence completes without throwing and BOTH keys are gone. (b) The boot half
+my round MISSED, exposed by the PM's own App-level test and a genuinely
+necessary second fix: the boot effect called `getVaultNetwork()` /
+`isPasskeyEnabled()` unguarded — both parse the vault document and throw
+`VaultCorruptError` on garbage, crashing the app before Unlock could even
+render, which made the entire rescue path (and any deleteWallet-only fix)
+unreachable for exactly the corrupted-state user. Verified the committed
+catch is scoped to precisely those two calls (App.tsx:150-155); everything
+else in the effect — `applyNetworkTheme`, `vaultExists`, `isPasskeySupported`,
+the boot dispatch, `installSessionGuards`, the onLock wiring — sits OUTSIDE
+the try, so the catch cannot accidentally mask an unrelated error class.
+Probe C5 pins the scoping from the lib side: on garbage, those two calls are
+exactly the throwers, and `vaultExists()` stays true (raw-key presence), so
+boot still routes to Unlock. The only non-corruption error the wrapped pair
+can surface is a storage-access failure from `getItem`, which degrades to the
+same locked-mainnet default — the right behavior in that world too. A
+corrupt-vault boot also sets `passkeyEnabled = false`, so no Face ID
+auto-prompt fires against a vault that could never decrypt — correct. The
+shipped `App.wipe.test.tsx` drives the REAL App end to end (corrupt vault +
+populated send log → boot → Unlock → forgot → wipe sheet → consent → confirm
+→ vault key AND send-log key both gone → Welcome): the exact Round-19 F24
+scenario, pinned at the App level where `deleteWallet` lives.
+
+### F27 — [SEV-Info] A corrupt vault reads as "wrong password" (adjudicated: numbered Info, non-blocking)
+
+- **Where:** `src/App.tsx:372-391` — `unlockPassword`'s bare catch maps EVERY
+  `unlockVault` failure (including `VaultCorruptError` from corrupt JSON or
+  corrupt base64 fields) to `strings.unlock.wrongPassword`.
+- **Scenario:** the corrupted-state user can retry passwords indefinitely,
+  believing they misremember, when no password can ever work — each hopeless
+  attempt also escalating the F6 throttle. This is the deliberate trade the
+  boot-half fix documents ("fail like a wrong password; the wipe is the way
+  out"), and it is non-crashing with both real exits one tap away in the
+  forgot sheet — but the copy is misleading in a way the app can detect.
+- **Adjudication:** numbered Info (copy-honesty class, same family as F22),
+  NOT a blocker and NOT required for this merge. Optional fix: discriminate
+  `VaultCorruptError` in `unlockPassword` and show a distinct string steering
+  to the forgot sheet (the wallet data on this phone is damaged; no password
+  will unlock it; restore with your 12 words or remove and start fresh).
+
+### Open-finding dispositions (owner, this round)
+
+- **F25 — OPEN, accepted for now** (Info: OS-side passkey credential outlives
+  the wallet; existence leak only, decrypts nothing post-wipe).
+- **F26 — OPEN, deferred to ROADMAP as its own future item** (Info: the
+  unwarned create-over-vault path from Welcome). Correctly NOT bundled into
+  `bbccdcf` — it is its own surface and deserves its own round.
+
+### Gates on `bbccdcf` — ALL GREEN
+
+`npm test` = **347 passing / 38 files** (346 + the shipped `App.wipe.test.tsx`),
+re-confirmed on the clean tree after probe deletion; `tsc --noEmit` clean;
+`npm run build` clean; dist CSP byte-identical to Rounds 13–19.
+
+**SHIP stands** — both fixes are exactly their claims, the second boot-half
+fix closes a real gap my round under-scoped, and both entry paths inherit
+everything through the single audited `deleteWallet`. Next finding number:
+**F28**.
+
