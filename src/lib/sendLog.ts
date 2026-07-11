@@ -158,3 +158,19 @@ export function getSendRecord(network: Network, txid: string): SendRecord | null
     return null;
   }
 }
+
+/**
+ * Removes the entire send log (both networks). Part of the wallet-removal
+ * wipe (F23, round 19): the log maps this DEVICE to the wallet's on-chain
+ * txid cluster, so leaving it behind after "Remove this wallet from this
+ * phone" would quietly contradict the removal the user asked for. Best-effort
+ * like every other sendLog write — a storage failure must never break the
+ * wipe itself.
+ */
+export function clearSendLog(): void {
+  try {
+    localStorage.removeItem(SEND_LOG_STORAGE_KEY);
+  } catch {
+    /* storage unavailable — nothing to clear or nothing we can do */
+  }
+}
