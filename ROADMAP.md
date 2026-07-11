@@ -176,7 +176,11 @@ network behaves byte-identically to v1.1.1.
   warned, consented version of the same destruction; this unwarned sibling
   should get a `vaultExists()` gate with the same blunt 12-words-or-lost
   copy before `createVault` runs. Small, but it is vault-surface work — a
-  review round applies.
+  review round applies. Sibling item to bundle in: **F27 (round 19 closure,
+  Info)** — a CORRUPT vault currently reads as "wrong password" on Unlock
+  (unlockPassword's bare catch), inviting hopeless retries against the F6
+  throttle; discriminate `VaultCorruptError` and steer to the forgot sheet
+  (where restore and the wipe both live).
 
 - **Second chain-data source** — 🚧 **partially realized in v1.2.0 (see above):**
   blockstream.info is now the PRIMARY chain-data source (mempool.space kept for
