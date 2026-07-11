@@ -2497,3 +2497,100 @@ deleted; the only file modified is this `docs/review/round1.md`, committed on
 `drained-wallet-history` (not pushed). Zero live API calls this round. Gates confirmed on
 the clean tree: `tsc --noEmit` clean, `npm test` = 334 passing, `npm run build` clean, dist
 CSP unchanged. Next finding number: **F23**._
+
+---
+
+# Round 17 — Activity row redesign (display-only)
+
+**SHIP-BLOCKING ISSUES: 0 / new findings: 0**
+
+Deliberately LIGHT round, PM-authored design pass, scoped to the single commit `8db2bae`
+on `activity-row-design`: each activity row now shows dual amounts (USD primary + sats
+secondary), the per-row StatusPill is removed (a pending row carries "Waiting to confirm"
+as a warning-colored sub-line where the time was; settled rows show only the relative
+time), roomier padding. Diff = exactly three files (`src/components/ActivityRow.tsx`,
+`src/theme.css`, `src/__tests__/ActivityRow.test.tsx` +5 tests) — verified with
+`git diff main..activity-row-design --name-only`; nothing else re-audited. Gates:
+`npm test` = **339 passing** (334 baseline + the 5 shipped), `tsc --noEmit` clean,
+`npm run build` clean, dist CSP byte-identical to Rounds 13-16 (`connect-src 'self'
+https://mempool.space https://blockstream.info; script-src 'self'; object-src 'none';
+base-uri 'self'; form-action 'none'`), no `console.*` in the diff, no new deps,
+`public/` and `index.html` untouched (no `CACHE_NAME` bump owed). Zero live API calls.
+Verified with throwaway `r17probe.test.tsx` (6 probes, executed, deleted).
+
+## Per-attack-point verdicts
+
+- **1. Display honesty — SOUND, negative-to-formatter proven unreachable.** Both amount
+  lines derive from the single `abs` (ActivityRow.tsx:41), non-negative by construction:
+  `received = netSats >= 0n; abs = received ? netSats : -netSats`. Those lines plus the
+  `sign` derivation are diff CONTEXT — the sign convention (+ received / - sent) is
+  byte-unchanged from main; the only logic change is `status` -> `pending`. If a negative
+  ever DID reach the fiat formatter it would fail loudly, not misrender: fmtUsd delegates
+  to `satsToUsdString`, which throws RangeError on `sats < 0n` (format.ts:84-86) — probed.
+  fmtSats WOULD misrender a negative (probe: `fmtSats(-25000n)` = `-25,000 sats`), which
+  is exactly why the abs-unreachability is load-bearing — and it holds. Offline
+  (btcUsd null): fmtUsd returns the literal `$—` — its only two output paths are that
+  placeholder or the true conversion — so the row renders `+$—`/`-$—` primary with the
+  REAL sats secondary; probed including a large pending sweep (`-$—` / `2,100,000,000
+  sats`). No path fabricates a fiat number; the F21 law is respected. Edge `netSats = 0n`
+  renders as received (`+$0.00` / `0 sats`) — pre-existing convention, unchanged, probed.
+- **2. Pending visibility — SOUND; the dark-mode question resolves as N/A BY DESIGN.**
+  `strings.activity.waiting` = `Waiting to confirm` exists (strings.ts:304);
+  `.row__sub--wait` is defined (theme.css:487) as `color: var(--warning);
+  font-weight: var(--fw-semibold)`. Theme audit: theme.css contains NO dark-mode block —
+  the only theme roots in the entire stylesheet are `:root` (line 4) and
+  `:root[data-network="practice"]` (line 95), and index.html pins
+  `<meta name=color-scheme content=light>`; the app is deliberately light-only. So
+  `--warning` (#B54708, line 35) is defined in the one root that exists and practice mode
+  inherits it untouched (that block repoints only accent/focus vars) — ~6.6:1 contrast on
+  the white/`--surface-2` surfaces at 13px semibold, legible in both Live and Practice.
+  A pending row is unambiguous: warning color + semibold vs the muted time line, plus on
+  the Activity screen it additionally sits under the `Pending` date-group header
+  (dateBucket returns `Pending` for blockTime undefined — double signal); on Home the
+  sub-line is the sole marker but visually distinct. Pending keys off `confirmed`, not
+  blockTime — both mismatch corners probed: unconfirmed-with-blockTime still warns;
+  confirmed-without-blockTime shows `Just now`, never the wait style.
+- **2b. Failed-state adjudication — NOTHING LOST; `failed` was dead in rows before this
+  diff.** `ActivityItem` carries only `confirmed: boolean` (account.ts:339-346, mapped
+  from the API's AddressTx) — no failed value exists anywhere in the data model. The old
+  row computed `confirmed ? 'confirmed' : 'waiting'`, so the pill's `failed` arm was
+  unreachable from rows on main too; removing the pill drops zero reachable states. The
+  detail sheet still renders `StatusPill status={confirmed ? 'confirmed' : 'waiting'}`
+  (Activity.tsx:439) — byte-unchanged, handling exactly the two states it always handled.
+  Residual observation, no number: StatusPill's `failed` arm (ui.tsx:83), `.row__status--fail`,
+  and `strings.activity.failed` are now app-wide dead code (the detail sheet is the pill's
+  only remaining call site and never passes `failed`) — equally dead before this round,
+  harmless latent arm. The retained `.row__status--ok/--wait` classes are NOT dead: the
+  pill applies them as its color modifiers.
+- **3. Consumers — BOTH SOUND; the props contract is untouched.** ActivityRow's signature
+  (`item`, `btcUsd`, `onClick?`) is unchanged, and both call sites pass exactly that
+  (Home.tsx:181, Activity.tsx:94) — no call-site edits needed, and the 5 shipped tests
+  pin the new DOM (dual amounts, offline dash, no pill, wait sub-line, sent row without
+  positive coloring). Date-group redundancy ADJUDICATED, cosmetic, no fix: a row
+  confirmed yesterday under the `Yesterday` header repeats `Yesterday` as its sub-line —
+  redundant but truthful; the corner where they could disagree (relativeTime floors
+  rolling 24h windows, dateBucket counts calendar days, e.g. a 26-hour-old tx spanning
+  two midnights reads `Yesterday` under a dated header) is PRE-EXISTING — both functions
+  are byte-unchanged this round and rows always showed relative time under these same
+  headers. Nothing new minted.
+- **4. Gates — ALL GREEN.** `tsc --noEmit` clean; `npm test` = 339/339; `npm run build`
+  clean; dist CSP byte-identical to Rounds 13-16; zero `console.*` in the three changed
+  files; zero hunks outside them (engine, api, actions, state, strings, screens, public/,
+  index.html all zero-diff); browser-pane verification deliberately skipped — exercising
+  the row against a funded wallet means live chain calls, which this review forbids; the
+  rendered DOM is pinned by the shipped tests + probes instead.
+
+## Ship recommendation
+
+**SHIP.** The change is exactly its display-only claim: one component's markup, its
+styles, and its tests. Both amount lines flow from a single provably-non-negative value
+through formatters that fail loudly rather than lie; the offline path degrades to an
+honest dash with real sats beneath it; the one exceptional state (pending) stays visibly
+flagged in the only theme the app ships; and the removed pill gave rows nothing the data
+model could ever express beyond what the sub-line now carries. Zero findings.
+
+_Round-17 throwaway probe `r17probe.test.tsx` (6 assertions) was executed and deleted
+(one probe-harness afterEach guard was fixed mid-run; all 6 product assertions passed);
+the only file modified is this `docs/review/round1.md`, committed on
+`activity-row-design` (not pushed). Zero live API calls this round. Gates confirmed on
+the clean tree. Next finding number: **F23**._
