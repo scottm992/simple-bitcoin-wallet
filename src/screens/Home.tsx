@@ -43,14 +43,21 @@ export function Home(props: {
   // Break pending into its outgoing / incoming parts for an explicit label.
   const pendingOut = pending < 0n ? -pending : 0n;
   const pendingIn = pending > 0n ? pending : 0n;
+  const activity = props.account?.activity ?? [];
+  const recent = activity.slice(0, 3);
   // §1e: gate on whether we HAVE an account snapshot, not on accountStatus.
   // A background refresh flips accountStatus to 'loading' every ~30s; keying the
   // empty-nudge/activity layout off that made Home visibly swap between them on
   // every poll. `account !== null` is stable across a background refresh, so the
   // layout holds steady while the balance quietly updates underneath.
-  const isEmpty = props.account !== null && totalSats === 0n && pending === 0n;
-  const activity = props.account?.activity ?? [];
-  const recent = activity.slice(0, 3);
+  //
+  // "Empty" means NEVER USED, not merely zero balance: a drained wallet (all
+  // funds sent out) also totals zero, but it has history the user still needs —
+  // hiding it behind the get-started nudge made a just-sent payment look like
+  // it vanished (owner field report, 2026-07-10). The nudge is only for wallets
+  // with no transactions at all; anything with history keeps its activity list.
+  const isEmpty =
+    props.account !== null && totalSats === 0n && pending === 0n && activity.length === 0;
 
   // The "checking" cue (shown while account !== null && !accountComplete — F12
   // visibility UNCHANGED) has two honest states, chosen by whether a discovery

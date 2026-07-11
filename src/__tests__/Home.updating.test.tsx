@@ -188,3 +188,35 @@ describe('Home — no empty-nudge/activity swap during a background refresh (§1
     expect(container.textContent).not.toContain(strings.home.emptyBalanceHeading);
   });
 });
+
+describe('Home — a drained wallet keeps its history (empty means NEVER USED)', () => {
+  // Zero balance but real history: the user sent everything out. The
+  // get-started nudge would make the just-sent payment look like it vanished
+  // (owner field report, 2026-07-10) — history stays, nudge stays away.
+  const DRAINED_ACCOUNT: AccountSnapshot = {
+    ...EMPTY_ACCOUNT,
+    usedAddresses: ['bc1qreceive'],
+    activity: [
+      { txid: 'a'.repeat(64), confirmed: true, blockTime: 1_752_000_000, netSats: -50_000n },
+      { txid: 'b'.repeat(64), confirmed: true, blockTime: 1_751_000_000, netSats: 50_000n },
+    ],
+  };
+
+  it('drained wallet: shows the activity list, never the empty nudge', async () => {
+    await renderHomeStatus(DRAINED_ACCOUNT, 'ready');
+    expect(container.textContent).toContain(strings.home.recentActivity);
+    expect(container.textContent).not.toContain(strings.home.emptyBalanceHeading);
+  });
+
+  it('drained wallet: layout holds through a background refresh (§1e)', async () => {
+    await renderHomeStatus(DRAINED_ACCOUNT, 'loading');
+    expect(container.textContent).toContain(strings.home.recentActivity);
+    expect(container.textContent).not.toContain(strings.home.emptyBalanceHeading);
+  });
+
+  it('genuinely fresh wallet (no history at all) still gets the nudge', async () => {
+    await renderHomeStatus(EMPTY_ACCOUNT, 'ready');
+    expect(container.textContent).toContain(strings.home.emptyBalanceHeading);
+    expect(container.textContent).not.toContain(strings.home.recentActivity);
+  });
+});
